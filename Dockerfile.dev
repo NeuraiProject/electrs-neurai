@@ -1,0 +1,71 @@
+# Development environment for electrs-neurai.
+#
+# Usage:
+#   docker build -f Dockerfile.dev -t electrs-neurai-dev .
+#
+#   # From the repo root (NIP/software/electrs-neurai):
+#   docker run --rm -it \
+#       -v "$PWD":/workspace/electrs-neurai \
+#       -v electrs-neurai-cargo-cache:/usr/local/cargo/registry \
+#       -v electrs-neurai-target:/workspace/electrs-neurai/target \
+#       -w /workspace/electrs-neurai \
+#       electrs-neurai-dev bash
+#
+#   # One-shot checks:
+#   docker run --rm -v "$PWD":/workspace/electrs-neurai \
+#       -v electrs-neurai-cargo-cache:/usr/local/cargo/registry \
+#       -v electrs-neurai-target:/workspace/electrs-neurai/target \
+#       -w /workspace/electrs-neurai \
+#       electrs-neurai-dev cargo check
+#
+# The two named volumes preserve the cargo registry and target/ between runs,
+# so iterative `cargo check` / `cargo build` is fast.
+
+FROM debian:trixie-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    RUST_VERSION=1.85.0
+
+# System build deps:
+#   - build-essential, g++           → C/C++ toolchain for hasherkawpow-sys
+#   - cmake                          → hasherkawpow-sys build.rs invokes cmake
+#   - libclang-dev, clang            → bindgen / rocksdb-sys
+#   - librocksdb-dev                 → link against system RocksDB (faster build)
+#   - pkg-config, libssl-dev         → common crate needs
+#   - git, ca-certificates, curl     → fetching registry, rustup bootstrap
+#   - jq                             → handy for test scripts
+RUN apt-get update -qqy && \
+    apt-get install -qqy --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        clang \
+        cmake \
+        curl \
+        g++ \
+        git \
+        jq \
+        libclang-dev \
+        librocksdb-dev \
+        libssl-dev \
+        pkg-config && \
+    rm -rf /var/lib/apt/lists/*
+
+# Pin rustup + rust toolchain to the exact version electrs-neurai targets.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+        sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal --no-modify-path && \
+    rustup component add clippy rustfmt && \
+    chmod -R a+rwX ${CARGO_HOME} ${RUSTUP_HOME}
+
+# Use system RocksDB (avoids re-building the ~30 MB C++ library on every clean build).
+ENV ROCKSDB_INCLUDE_DIR=/usr/include \
+    ROCKSDB_LIB_DIR=/usr/lib
+
+# The vendored hasherkawpow-sys crate lives inside this repository at
+# /workspace/electrs-neurai/hasherkawpow-sys.
+WORKDIR /workspace/electrs-neurai
+
+# Default to an interactive shell for development; override with `cargo ...` for CI.
+CMD ["bash"]

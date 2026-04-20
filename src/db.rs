@@ -4,7 +4,10 @@ use rust_rocksdb as rocksdb;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::types::{HashPrefix, SerializedHashPrefixRow, SerializedHeaderRow};
+use crate::types::{
+    HashPrefix, SerializedAssetFundingRow, SerializedAssetHistoryRow, SerializedHashPrefixRow,
+    SerializedHeaderRow,
+};
 
 #[derive(Default)]
 pub(crate) struct WriteBatch {
@@ -13,6 +16,10 @@ pub(crate) struct WriteBatch {
     pub(crate) funding_rows: Vec<SerializedHashPrefixRow>,
     pub(crate) spending_rows: Vec<SerializedHashPrefixRow>,
     pub(crate) txid_rows: Vec<SerializedHashPrefixRow>,
+    /// `(asset_name_bytes, serialized_metadata)` — written to `asset_meta` CF.
+    pub(crate) asset_meta_rows: Vec<(Vec<u8>, Vec<u8>)>,
+    pub(crate) asset_history_rows: Vec<SerializedAssetHistoryRow>,
+    pub(crate) asset_funding_rows: Vec<SerializedAssetFundingRow>,
 }
 
 impl WriteBatch {
@@ -21,6 +28,9 @@ impl WriteBatch {
         self.funding_rows.sort_unstable();
         self.spending_rows.sort_unstable();
         self.txid_rows.sort_unstable();
+        self.asset_meta_rows.sort();
+        self.asset_history_rows.sort_unstable();
+        self.asset_funding_rows.sort_unstable();
     }
 }
 
@@ -35,8 +45,20 @@ const HEADERS_CF: &str = "headers";
 const TXID_CF: &str = "txid";
 const FUNDING_CF: &str = "funding";
 const SPENDING_CF: &str = "spending";
+const ASSET_META_CF: &str = "asset_meta";
+const ASSET_HISTORY_CF: &str = "asset_history";
+const ASSET_FUNDING_CF: &str = "asset_funding";
 
-const COLUMN_FAMILIES: &[&str] = &[CONFIG_CF, HEADERS_CF, TXID_CF, FUNDING_CF, SPENDING_CF];
+const COLUMN_FAMILIES: &[&str] = &[
+    CONFIG_CF,
+    HEADERS_CF,
+    TXID_CF,
+    FUNDING_CF,
+    SPENDING_CF,
+    ASSET_META_CF,
+    ASSET_HISTORY_CF,
+    ASSET_FUNDING_CF,
+];
 
 const CONFIG_KEY: &str = "C";
 const TIP_KEY: &[u8] = b"T";
@@ -84,7 +106,9 @@ struct Config {
     format: u64,
 }
 
-const CURRENT_FORMAT: u64 = 0;
+// Format 1: header rows are 120 bytes (Neurai variable-size header support).
+// Format 2: added asset_meta, asset_history, asset_funding column families.
+const CURRENT_FORMAT: u64 = 2;
 
 impl Default for Config {
     fn default() -> Self {
@@ -230,6 +254,24 @@ impl DBStore {
         self.db.cf_handle(HEADERS_CF).expect("missing HEADERS_CF")
     }
 
+    fn asset_meta_cf(&self) -> &rocksdb::ColumnFamily {
+        self.db
+            .cf_handle(ASSET_META_CF)
+            .expect("missing ASSET_META_CF")
+    }
+
+    fn asset_history_cf(&self) -> &rocksdb::ColumnFamily {
+        self.db
+            .cf_handle(ASSET_HISTORY_CF)
+            .expect("missing ASSET_HISTORY_CF")
+    }
+
+    fn asset_funding_cf(&self) -> &rocksdb::ColumnFamily {
+        self.db
+            .cf_handle(ASSET_FUNDING_CF)
+            .expect("missing ASSET_FUNDING_CF")
+    }
+
     pub(crate) fn iter_funding(
         &self,
         prefix: HashPrefix,
@@ -276,6 +318,31 @@ impl DBStore {
         self.iter_cf(self.headers_cf(), opts, None)
     }
 
+    pub(crate) fn iter_asset_history(
+        &self,
+        prefix: HashPrefix,
+    ) -> impl Iterator<Item = SerializedAssetHistoryRow> + '_ {
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.set_prefix_same_as_start(true);
+        self.iter_cf(self.asset_history_cf(), opts, Some(prefix))
+    }
+
+    pub(crate) fn iter_asset_funding(
+        &self,
+        prefix: HashPrefix,
+    ) -> impl Iterator<Item = SerializedAssetFundingRow> + '_ {
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.set_prefix_same_as_start(true);
+        self.iter_cf(self.asset_funding_cf(), opts, Some(prefix))
+    }
+
+    /// Point lookup of the stored metadata for an asset (by full name).
+    pub(crate) fn get_asset_meta(&self, name: &[u8]) -> Option<Vec<u8>> {
+        self.db
+            .get_cf(self.asset_meta_cf(), name)
+            .expect("get_asset_meta failed")
+    }
+
     pub(crate) fn get_tip(&self) -> Option<Vec<u8>> {
         self.db
             .get_cf(self.headers_cf(), TIP_KEY)
@@ -301,6 +368,19 @@ impl DBStore {
             db_batch.put_cf(headers_cf, key, b"");
         }
         db_batch.put_cf(headers_cf, TIP_KEY, batch.tip_row);
+
+        let asset_meta_cf = self.asset_meta_cf();
+        for (name, meta) in &batch.asset_meta_rows {
+            db_batch.put_cf(asset_meta_cf, name, meta);
+        }
+        let asset_history_cf = self.asset_history_cf();
+        for key in &batch.asset_history_rows {
+            db_batch.put_cf(asset_history_cf, key, b"");
+        }
+        let asset_funding_cf = self.asset_funding_cf();
+        for key in &batch.asset_funding_rows {
+            db_batch.put_cf(asset_funding_cf, key, b"");
+        }
 
         let mut opts = rocksdb::WriteOptions::new();
         let bulk_import = self.bulk_import.load(Ordering::Relaxed);
@@ -495,6 +575,93 @@ mod tests {
             let config = store.get_config().unwrap();
             assert_eq!(config.format, CURRENT_FORMAT);
         }
+    }
+
+    #[test]
+    fn test_asset_meta_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DBStore::open(dir.path(), None, true, 1).unwrap();
+
+        let name = b"TOKEN".to_vec();
+        let payload = vec![0x11, 0x22, 0x33, 0x44, 0x55];
+        store.write(&WriteBatch {
+            asset_meta_rows: vec![(name.clone(), payload.clone())],
+            ..Default::default()
+        });
+
+        assert_eq!(store.get_asset_meta(&name).unwrap(), payload);
+        assert!(store.get_asset_meta(b"OTHER").is_none());
+    }
+
+    #[test]
+    fn test_asset_history_prefix_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DBStore::open(dir.path(), None, true, 1).unwrap();
+
+        let a: [u8; 8] = [0xAA; 8];
+        let b: [u8; 8] = [0xBB; 8];
+
+        let mut rows = Vec::new();
+        for prefix in [a, b] {
+            for (i, h) in [100u32, 200, 300].iter().enumerate() {
+                let mut row = [0u8; 20];
+                row[..8].copy_from_slice(&prefix);
+                row[8..16].copy_from_slice(&[i as u8; 8]); // distinct txid prefixes
+                row[16..20].copy_from_slice(&h.to_le_bytes());
+                rows.push(row);
+            }
+        }
+        store.write(&WriteBatch {
+            asset_history_rows: rows,
+            ..Default::default()
+        });
+
+        let got: Vec<_> = store.iter_asset_history(a).collect();
+        assert_eq!(got.len(), 3);
+        assert!(got.iter().all(|row| &row[..8] == &a));
+
+        let got_b: Vec<_> = store.iter_asset_history(b).collect();
+        assert_eq!(got_b.len(), 3);
+        assert!(got_b.iter().all(|row| &row[..8] == &b));
+
+        // Prefix miss → empty iterator.
+        let miss: Vec<_> = store.iter_asset_history([0xCC; 8]).collect();
+        assert!(miss.is_empty());
+    }
+
+    #[test]
+    fn test_asset_funding_prefix_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DBStore::open(dir.path(), None, true, 1).unwrap();
+
+        let sh_prefix: [u8; 8] = [0x42; 8];
+        let other: [u8; 8] = [0x99; 8];
+
+        let mut row1 = [0u8; 20];
+        row1[..8].copy_from_slice(&sh_prefix);
+        row1[8..16].copy_from_slice(&[0xAB; 8]);
+        row1[16..20].copy_from_slice(&1u32.to_le_bytes());
+
+        let mut row2 = [0u8; 20];
+        row2[..8].copy_from_slice(&sh_prefix);
+        row2[8..16].copy_from_slice(&[0xCD; 8]);
+        row2[16..20].copy_from_slice(&2u32.to_le_bytes());
+
+        let mut other_row = [0u8; 20];
+        other_row[..8].copy_from_slice(&other);
+
+        store.write(&WriteBatch {
+            asset_funding_rows: vec![row1, row2, other_row],
+            ..Default::default()
+        });
+
+        let got: Vec<_> = store.iter_asset_funding(sh_prefix).collect();
+        assert_eq!(got.len(), 2);
+        let heights: Vec<u32> = got
+            .iter()
+            .map(|r| u32::from_le_bytes(r[16..20].try_into().unwrap()))
+            .collect();
+        assert!(heights.contains(&1) && heights.contains(&2));
     }
 
     #[test]

@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use bitcoin::blockdata::block::Header as BlockHeader;
 use bitcoin::consensus::Encodable;
 use bitcoin::{
     consensus::{
@@ -15,15 +14,16 @@ use bitcoin::{
         message_network, Magic,
     },
     secp256k1::{self, rand::Rng},
-    Block, BlockHash,
+    BlockHash,
 };
-use bitcoin_slices::{bsl, Parse};
 use crossbeam_channel::{bounded, select, Receiver, Sender};
 
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::neurai::block::{decode_header, header_len, verify_kawpow_header, NeuraiBlockHeader};
+use crate::neurai::NetworkParams;
 use crate::types::SerBlock;
 use crate::{
     chain::{Chain, NewHeader},
@@ -57,16 +57,15 @@ impl Request {
 pub(crate) struct Connection {
     req_send: Sender<Request>,
     blocks_recv: Receiver<SerBlock>,
-    headers_recv: Receiver<Vec<BlockHeader>>,
+    headers_recv: Receiver<Vec<NeuraiBlockHeader>>,
     new_block_recv: Receiver<()>,
-
     blocks_duration: Histogram,
+    params: &'static NetworkParams,
 }
 
 impl Connection {
     /// Get new block headers (supporting reorgs).
     /// https://en.bitcoin.it/wiki/Protocol_documentation#getheaders
-    /// Defined as `&mut self` to prevent concurrent invocations (https://github.com/romanz/electrs/pull/526#issuecomment-934685515).
     pub(crate) fn get_new_headers(&mut self, chain: &Chain) -> Result<Vec<NewHeader>> {
         self.req_send.send(Request::get_new_headers(chain))?;
         let headers = self
@@ -83,16 +82,27 @@ impl Connection {
             Some(last_height) => (last_height + 1)..,
             None => bail!("missing prev_blockhash: {}", prev_blockhash),
         };
-        Ok(headers
+        let params = self.params;
+        headers
             .into_iter()
             .zip(new_heights)
-            .map(NewHeader::from)
-            .collect())
+            .map(|(header, height)| {
+                let hash = header
+                    .block_hash(params)
+                    .context("p2p header must have computable hash")?;
+                // Re-run the KAWPOW FFI verifier here — otherwise a header with
+                // a corrupt `mix_hash` would still land in `Chain` (and in the
+                // responses to `blockchain.block.header{,s}` / `headers.subscribe`)
+                // even before the block body is downloaded.
+                if !verify_kawpow_header(&header, &hash) {
+                    bail!("header at height {height} ({hash}) failed KAWPOW mix_hash verification");
+                }
+                Ok(NewHeader::new(header, hash, height))
+            })
+            .collect()
     }
 
     /// Request and process the specified blocks (in the specified order).
-    /// See https://en.bitcoin.it/wiki/Protocol_documentation#getblocks for details.
-    /// Defined as `&mut self` to prevent concurrent invocations (https://github.com/romanz/electrs/pull/526#issuecomment-934685515).
     pub(crate) fn for_blocks<B, F>(&mut self, blockhashes: B, mut func: F) -> Result<()>
     where
         B: IntoIterator<Item = BlockHash>,
@@ -108,19 +118,32 @@ impl Connection {
                 self.req_send.send(Request::get_blocks(&blockhashes))
             })?;
 
+            let params = self.params;
             for hash in blockhashes {
                 let block = self.blocks_duration.observe_duration("response", || {
                     let block = self
                         .blocks_recv
                         .recv()
                         .with_context(|| format!("failed to get block {}", hash))?;
-                    let header = bsl::BlockHeader::parse(&block[..])
-                        .expect("core returned invalid blockheader")
-                        .parsed_owned();
+
+                    // Verify the block hash using the Neurai-appropriate algorithm.
+                    let hdr_len = header_len(&block, params)
+                        .with_context(|| format!("short block received for {}", hash))?;
+                    let neurai_hdr = decode_header(&mut &block[..hdr_len], params)
+                        .with_context(|| format!("invalid header in block {}", hash))?;
+                    let computed = neurai_hdr
+                        .block_hash(params)
+                        .with_context(|| format!("cannot compute hash for block {}", hash))?;
+                    ensure!(computed == hash, "got unexpected block");
+                    // `block_hash()` runs KAWPOW but ignores the mix_hash field of the
+                    // incoming header — re-run the FFI verifier so a corrupted mix_hash
+                    // cannot land in the index alongside an otherwise-valid hash.
                     ensure!(
-                        &header.block_hash_sha2()[..] == hash.as_byte_array(),
-                        "got unexpected block"
+                        verify_kawpow_header(&neurai_hdr, &computed),
+                        "block {} failed KAWPOW mix_hash verification",
+                        hash,
                     );
+
                     Ok(block)
                 })?;
                 self.blocks_duration
@@ -130,12 +153,16 @@ impl Connection {
         })
     }
 
-    /// Note: only a single receiver will get the notification (https://github.com/romanz/electrs/pull/526#issuecomment-934687415).
     pub(crate) fn new_block_notification(&self) -> Receiver<()> {
         self.new_block_recv.clone()
     }
 
-    pub(crate) fn connect(address: SocketAddr, metrics: &Metrics, magic: Magic) -> Result<Self> {
+    pub(crate) fn connect(
+        address: SocketAddr,
+        metrics: &Metrics,
+        params: &'static NetworkParams,
+    ) -> Result<Self> {
+        let magic = params.magic;
         let recv_conn = TcpStream::connect(address)
             .with_context(|| format!("p2p failed to connect: {:?}", address))?;
         let mut send_conn = recv_conn
@@ -182,9 +209,7 @@ impl Connection {
             let msg = match send_duration.observe_duration("wait", || tx_recv.recv()) {
                 Ok(msg) => msg,
                 Err(_) => {
-                    // p2p_loop is closed, so tx_send is disconnected
                     debug!("closing p2p_send thread: no more messages to send");
-                    // close the stream reader (p2p_recv thread may block on it)
                     if let Err(e) = send_conn.shutdown(Shutdown::Read) {
                         warn!("failed to shutdown p2p connection: {}", e)
                     }
@@ -239,7 +264,7 @@ impl Connection {
 
         let (req_send, req_recv) = bounded::<Request>(1);
         let (blocks_send, blocks_recv) = bounded::<SerBlock>(10);
-        let (headers_send, headers_recv) = bounded::<Vec<BlockHeader>>(1);
+        let (headers_send, headers_recv) = bounded::<Vec<NeuraiBlockHeader>>(1);
         let (new_block_send, new_block_recv) = bounded::<()>(0);
         let (init_send, init_recv) = bounded::<()>(0);
 
@@ -250,14 +275,14 @@ impl Connection {
                 recv(rx_recv) -> result => {
                     let raw_msg = match result {
                         Ok(raw_msg) => raw_msg,
-                        Err(_) => {  // p2p_recv is closed, so rx_send is disconnected
+                        Err(_) => {
                             debug!("closing p2p_loop thread: peer has disconnected");
-                            return Ok(()); // new_block_send is dropped, causing the server to exit
+                            return Ok(());
                         }
                     };
 
                     let label = format!("parse_{}", raw_msg.cmd.as_ref());
-                    let msg = match parse_duration.observe_duration(&label, || raw_msg.parse()) {
+                    let msg = match parse_duration.observe_duration(&label, || raw_msg.parse(params)) {
                         Ok(msg) => msg,
                         Err(err) => bail!("failed to parse {err}"),
                     };
@@ -271,15 +296,14 @@ impl Connection {
                         ParsedNetworkMessage::Inv(inventory) => {
                             debug!("peer inventory: {:?}", inventory);
                             if inventory.iter().any(|inv| matches!(inv, Inventory::Block(_))) {
-                                let _ = new_block_send.try_send(()); // best-effort notification
+                                let _ = new_block_send.try_send(());
                             }
-
                         },
                         ParsedNetworkMessage::Ping(nonce) => {
-                            tx_send.send(NetworkMessage::Pong(nonce))?; // connection keep-alive
+                            tx_send.send(NetworkMessage::Pong(nonce))?;
                         }
                         ParsedNetworkMessage::Verack => {
-                            init_send.send(())?; // peer acknowledged our version
+                            init_send.send(())?;
                         }
                         ParsedNetworkMessage::Block(block) => blocks_send.send(block)?,
                         ParsedNetworkMessage::Headers(headers) => headers_send.send(headers)?,
@@ -289,7 +313,7 @@ impl Connection {
                 recv(req_recv) -> result => {
                     let req = match result {
                         Ok(req) => req,
-                        Err(_) => {  // self is dropped, so req_send is disconnected
+                        Err(_) => {
                             debug!("closing p2p_loop thread: no more requests to handle");
                             return Ok(());
                         }
@@ -303,7 +327,7 @@ impl Connection {
             }
         });
 
-        init_recv.recv()?; // wait until `verack` is received
+        init_recv.recv()?;
 
         Ok(Connection {
             req_send,
@@ -311,6 +335,7 @@ impl Connection {
             headers_recv,
             new_block_recv,
             blocks_duration,
+            params,
         })
     }
 }
@@ -344,7 +369,7 @@ struct RawNetworkMessage {
 }
 
 impl RawNetworkMessage {
-    fn parse(self) -> Result<ParsedNetworkMessage> {
+    fn parse(self, params: &'static NetworkParams) -> Result<ParsedNetworkMessage> {
         let mut raw: &[u8] = &self.raw;
         let payload = match self.cmd.as_ref() {
             "version" => ParsedNetworkMessage::Version(Decodable::consensus_decode(&mut raw)?),
@@ -352,17 +377,19 @@ impl RawNetworkMessage {
             "inv" => ParsedNetworkMessage::Inv(Decodable::consensus_decode(&mut raw)?),
             "block" => ParsedNetworkMessage::Block(self.raw),
             "headers" => {
+                // Each entry in the p2p headers message is: serialized_header + VarInt(0)
                 let len = VarInt::consensus_decode(&mut raw)?.0;
                 let mut headers = Vec::with_capacity(len as usize);
                 for _ in 0..len {
-                    headers.push(Block::consensus_decode(&mut raw)?.header);
+                    headers.push(decode_header(&mut raw, params)?);
+                    let _tx_count = VarInt::consensus_decode(&mut raw)?; // always 0
                 }
                 ParsedNetworkMessage::Headers(headers)
             }
             "ping" => ParsedNetworkMessage::Ping(Decodable::consensus_decode(&mut raw)?),
-            "pong" => ParsedNetworkMessage::Ignored, // unused
-            "addr" => ParsedNetworkMessage::Ignored, // unused
-            "alert" => ParsedNetworkMessage::Ignored, // https://bitcoin.org/en/alert/2016-11-01-alert-retirement
+            "pong" => ParsedNetworkMessage::Ignored,
+            "addr" => ParsedNetworkMessage::Ignored,
+            "alert" => ParsedNetworkMessage::Ignored,
             _ => bail!(
                 "unsupported message: command={}, payload={:?}",
                 self.cmd,
@@ -379,7 +406,7 @@ enum ParsedNetworkMessage {
     Verack,
     Inv(Vec<Inventory>),
     Ping(u64),
-    Headers(Vec<BlockHeader>),
+    Headers(Vec<NeuraiBlockHeader>),
     Block(SerBlock),
     Ignored,
 }
@@ -390,7 +417,7 @@ impl Decodable for RawNetworkMessage {
         let cmd = Decodable::consensus_decode(d)?;
 
         let len = u32::consensus_decode(d)?;
-        let _checksum = <[u8; 4]>::consensus_decode(d)?; // assume data is correct
+        let _checksum = <[u8; 4]>::consensus_decode(d)?;
         let mut raw = vec![0u8; len as usize];
         d.read_slice(&mut raw)?;
 

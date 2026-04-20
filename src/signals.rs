@@ -61,7 +61,7 @@ impl Signal {
     pub fn new() -> Signal {
         let ids = vec![
             SIGINT, SIGTERM,
-            SIGUSR1, // allow external triggering (e.g. via bitcoind `blocknotify`)
+            SIGUSR1, // allow external triggering (e.g. via the Neurai daemon `blocknotify`)
         ];
         let (tx, rx) = unbounded();
         let result = Signal {

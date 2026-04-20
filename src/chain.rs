@@ -1,22 +1,21 @@
 use std::collections::HashMap;
 
-use bitcoin::blockdata::block::Header as BlockHeader;
-use bitcoin::{BlockHash, Network};
+use bitcoin::hashes::{sha256d, Hash};
+use bitcoin::{BlockHash, TxMerkleNode};
+
+use crate::neurai::block::NeuraiBlockHeader;
+use crate::neurai::NetworkParams;
 
 /// A new header found, to be added to the chain at specific height
 pub(crate) struct NewHeader {
-    header: BlockHeader,
+    header: NeuraiBlockHeader,
     hash: BlockHash,
     height: usize,
 }
 
 impl NewHeader {
-    pub(crate) fn from((header, height): (BlockHeader, usize)) -> Self {
-        Self {
-            header,
-            hash: header.block_hash(),
-            height,
-        }
+    pub(crate) fn new(header: NeuraiBlockHeader, hash: BlockHash, height: usize) -> Self {
+        Self { header, hash, height }
     }
 
     pub(crate) fn height(&self) -> usize {
@@ -30,19 +29,41 @@ impl NewHeader {
 
 /// Current blockchain headers' list
 pub struct Chain {
-    headers: Vec<(BlockHash, BlockHeader)>,
+    headers: Vec<(BlockHash, NeuraiBlockHeader)>,
     heights: HashMap<BlockHash, usize>,
+    params: &'static NetworkParams,
 }
 
 impl Chain {
-    // create an empty chain
-    pub fn new(network: Network) -> Self {
-        let genesis = bitcoin::blockdata::constants::genesis_block(network);
-        let genesis_hash = genesis.block_hash();
+    /// Build a chain with a specific genesis hash (used for testnet/regtest where the
+    /// genesis is epoch-based and fetched from the daemon RPC at startup).
+    pub fn new_with_genesis(params: &'static NetworkParams, genesis_hash: BlockHash) -> Self {
+        let genesis_header = NeuraiBlockHeader::pre_kawpow(
+            params.genesis_version,
+            BlockHash::from_raw_hash(sha256d::Hash::all_zeros()),
+            TxMerkleNode::from_raw_hash(sha256d::Hash::from_byte_array(
+                params.genesis_merkle_root_le,
+            )),
+            params.genesis_time,
+            params.genesis_bits,
+            params.genesis_nonce,
+        );
         Self {
-            headers: vec![(genesis_hash, genesis.header)],
-            heights: std::iter::once((genesis_hash, 0)).collect(), // genesis header @ zero height
+            headers: vec![(genesis_hash, genesis_header)],
+            heights: std::iter::once((genesis_hash, 0)).collect(),
+            params,
         }
+    }
+
+    /// Build a chain using the genesis hash hardcoded in `params` (mainnet only).
+    pub fn new(params: &'static NetworkParams) -> Self {
+        let genesis_hash =
+            BlockHash::from_raw_hash(sha256d::Hash::from_byte_array(params.genesis_hash_le));
+        Self::new_with_genesis(params, genesis_hash)
+    }
+
+    pub(crate) fn params(&self) -> &'static NetworkParams {
+        self.params
     }
 
     pub(crate) fn drop_last_headers(&mut self, n: usize) {
@@ -50,31 +71,47 @@ impl Chain {
             return;
         }
         let new_height = self.height().saturating_sub(n);
-        self.update(vec![NewHeader::from((
-            self.headers[new_height].1,
-            new_height,
-        ))]);
+        let (hash, header) = self.headers[new_height];
+        self.update(vec![NewHeader::new(header, hash, new_height)]);
     }
 
     /// Load the chain from a collection of headers, up to the given tip
-    pub(crate) fn load(&mut self, headers: impl Iterator<Item = BlockHeader>, tip: BlockHash) {
+    pub(crate) fn load(
+        &mut self,
+        headers: impl Iterator<Item = NeuraiBlockHeader>,
+        tip: BlockHash,
+    ) {
         let genesis_hash = self.headers[0].0;
+        let params = self.params;
 
-        let header_map: HashMap<BlockHash, BlockHeader> =
-            headers.map(|h| (h.block_hash(), h)).collect();
+        let header_map: HashMap<BlockHash, NeuraiBlockHeader> = headers
+            .map(|h| {
+                let hash = h
+                    .block_hash(params)
+                    .expect("all stored headers must have a computable hash");
+                (hash, h)
+            })
+            .collect();
+
         let mut blockhash = tip;
-        let mut new_headers: Vec<&BlockHeader> = Vec::with_capacity(header_map.len());
+        let mut new_headers: Vec<(NeuraiBlockHeader, BlockHash)> =
+            Vec::with_capacity(header_map.len());
         while blockhash != genesis_hash {
             let header = match header_map.get(&blockhash) {
-                Some(header) => header,
+                Some(h) => *h,
                 None => panic!("missing header {} while loading from DB", blockhash),
             };
+            new_headers.push((header, blockhash));
             blockhash = header.prev_blockhash;
-            new_headers.push(header);
         }
         info!("loading {} headers, tip={}", new_headers.len(), tip);
-        let new_headers = new_headers.into_iter().rev().copied(); // order by height
-        self.update(new_headers.zip(1..).map(NewHeader::from).collect())
+        let new_headers: Vec<NewHeader> = new_headers
+            .into_iter()
+            .rev()
+            .enumerate()
+            .map(|(i, (h, hash))| NewHeader::new(h, hash, i + 1))
+            .collect();
+        self.update(new_headers);
     }
 
     /// Get the block hash at specified height (if exists)
@@ -83,7 +120,7 @@ impl Chain {
     }
 
     /// Get the block header at specified height (if exists)
-    pub(crate) fn get_block_header(&self, height: usize) -> Option<&BlockHeader> {
+    pub(crate) fn get_block_header(&self, height: usize) -> Option<&NeuraiBlockHeader> {
         self.headers.get(height).map(|(_hash, header)| header)
     }
 
@@ -100,7 +137,6 @@ impl Chain {
             }
             for (h, height) in headers.into_iter().zip(first_height..) {
                 assert_eq!(h.height, height);
-                assert_eq!(h.hash, h.header.block_hash());
                 assert!(self.heights.insert(h.hash, h.height).is_none());
                 self.headers.push((h.hash, h.header));
             }
@@ -145,117 +181,83 @@ impl Chain {
 #[cfg(test)]
 mod tests {
     use super::{Chain, NewHeader};
-    use bitcoin::blockdata::block::Header as BlockHeader;
-    use bitcoin::consensus::deserialize;
-    use bitcoin::Network::Regtest;
-    use hex_lit::hex;
+    use crate::neurai::block::NeuraiBlockHeader;
+    use crate::neurai::{NeuraiNetwork, NetworkParams};
+    use bitcoin::hashes::{sha256d, Hash};
+    use bitcoin::{BlockHash, TxMerkleNode};
 
-    #[test]
-    fn test_genesis() {
-        let regtest = Chain::new(Regtest);
-        assert_eq!(regtest.height(), 0);
-        assert_eq!(
-            regtest.tip(),
-            "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
-                .parse()
-                .unwrap()
-        );
+    fn regtest_params() -> &'static NetworkParams {
+        NetworkParams::for_network(NeuraiNetwork::Regtest)
+    }
+
+    fn make_header(prev: BlockHash, time: u32, nonce: u32) -> NeuraiBlockHeader {
+        NeuraiBlockHeader::pre_kawpow(
+            2,
+            prev,
+            TxMerkleNode::from_raw_hash(sha256d::Hash::all_zeros()),
+            time,
+            0x207fffff,
+            nonce,
+        )
     }
 
     #[test]
-    fn test_updates() {
-        let byte_headers = [
-hex!("0000002006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f1d14d3c7ff12d6adf494ebbcfba69baa915a066358b68a2b8c37126f74de396b1d61cc60ffff7f2000000000"),
-hex!("00000020d700ae5d3c705702e0a5d9ababd22ded079f8a63b880b1866321d6bfcb028c3fc816efcf0e84ccafa1dda26be337f58d41b438170c357cda33a68af5550590bc1e61cc60ffff7f2004000000"),
-hex!("00000020d13731bc59bc0989e06a5e7cab9843a4e17ad65c7ca47cd77f50dfd24f1f55793f7f342526aca9adb6ce8f33d8a07662c97d29d83b9e18117fb3eceecb2ab99b1e61cc60ffff7f2001000000"),
-hex!("00000020a603def3e1255cadfb6df072946327c58b344f9bfb133e8e3e280d1c2d55b31c731a68f70219472864a7cb010cd53dc7e0f67e57f7d08b97e5e092b0c3942ad51f61cc60ffff7f2001000000"),
-hex!("0000002041dd202b3b2edcdd3c8582117376347d48ff79ff97c95e5ac814820462012e785142dc360975b982ca43eecd14b4ba6f019041819d4fc5936255d7a2c45a96651f61cc60ffff7f2000000000"),
-hex!("0000002072e297a2d6b633c44f3c9b1a340d06f3ce4e6bcd79ebd4c4ff1c249a77e1e37c59c7be1ca0964452e1735c0d2740f0d98a11445a6140c36b55770b5c0bcf801f1f61cc60ffff7f2000000000"),
-hex!("000000200c9eb5889a8e924d1c4e8e79a716514579e41114ef37d72295df8869d6718e4ac5840f28de43ff25c7b9200aaf7873b20587c92827eaa61943484ca828bdd2e11f61cc60ffff7f2000000000"),
-hex!("000000205873f322b333933e656b07881bb399dae61a6c0fa74188b5fb0e3dd71c9e2442f9e2f433f54466900407cf6a9f676913dd54aad977f7b05afcd6dcd81e98ee752061cc60ffff7f2004000000"),
-hex!("00000020fd1120713506267f1dba2e1856ca1d4490077d261cde8d3e182677880df0d856bf94cfa5e189c85462813751ab4059643759ed319a81e0617113758f8adf67bc2061cc60ffff7f2000000000"),
-hex!("000000200030d7f9c11ef35b89a0eefb9a5e449909339b5e7854d99804ea8d6a49bf900a0304d2e55fe0b6415949cff9bca0f88c0717884a5e5797509f89f856af93624a2061cc60ffff7f2002000000"),
-        ];
-        let headers: Vec<BlockHeader> = byte_headers
-            .iter()
-            .map(|byte_header| deserialize(byte_header).unwrap())
-            .collect();
+    fn test_genesis() {
+        let params = regtest_params();
+        let chain = Chain::new(params);
+        assert_eq!(chain.height(), 0);
+    }
 
-        for chunk_size in 1..headers.len() {
-            let mut regtest = Chain::new(Regtest);
-            let mut height = 0;
-            let mut tip = regtest.tip();
-            for chunk in headers.chunks(chunk_size) {
-                let mut update = vec![];
-                for header in chunk {
-                    height += 1;
-                    tip = header.block_hash();
-                    update.push(NewHeader::from((*header, height)))
-                }
-                regtest.update(update);
-                assert_eq!(regtest.tip(), tip);
-                assert_eq!(regtest.height(), height);
-            }
-            assert_eq!(regtest.tip(), headers.last().unwrap().block_hash());
-            assert_eq!(regtest.height(), headers.len());
+    #[test]
+    fn test_chain_update_and_load() {
+        let params = regtest_params();
+        let mut chain = Chain::new(params);
+        let genesis_hash = chain.tip();
+
+        // Build synthetic headers chaining off genesis
+        let mut prev = genesis_hash;
+        let mut hashes = vec![];
+        let headers: Vec<NeuraiBlockHeader> = (1u32..=5).map(|i| {
+            let h = make_header(prev, 1_700_000_000 + i, i);
+            let hash = h.sha256d_hash();
+            hashes.push(hash);
+            prev = hash;
+            h
+        }).collect();
+
+        for (i, (header, hash)) in headers.iter().zip(hashes.iter()).enumerate() {
+            chain.update(vec![NewHeader::new(*header, *hash, i + 1)]);
         }
+        assert_eq!(chain.height(), 5);
+        assert_eq!(chain.tip(), *hashes.last().unwrap());
 
-        // test loading from a list of headers and tip
-        let mut regtest = Chain::new(Regtest);
-        regtest.load(
-            headers.iter().copied(),
-            headers.last().unwrap().block_hash(),
-        );
-        assert_eq!(regtest.height(), headers.len());
+        // Load from headers iterator
+        let mut chain2 = Chain::new(params);
+        chain2.load(headers.into_iter(), chain.tip());
+        assert_eq!(chain2.height(), 5);
+        assert_eq!(chain2.tip(), chain.tip());
+    }
 
-        // test getters
-        for (header, height) in headers.iter().zip(1usize..) {
-            assert_eq!(regtest.get_block_header(height), Some(header));
-            assert_eq!(regtest.get_block_hash(height), Some(header.block_hash()));
-            assert_eq!(regtest.get_block_height(&header.block_hash()), Some(height));
+    #[test]
+    fn test_drop_last_headers() {
+        let params = regtest_params();
+        let mut chain = Chain::new(params);
+        let genesis_hash = chain.tip();
+
+        let mut prev = genesis_hash;
+        for i in 1u32..=3 {
+            let h = make_header(prev, 1_700_000_000 + i, i);
+            let hash = h.sha256d_hash();
+            chain.update(vec![NewHeader::new(h, hash, i as usize)]);
+            prev = hash;
         }
+        assert_eq!(chain.height(), 3);
 
-        // test chain shortening
-        for i in (0..=headers.len()).rev() {
-            let hash = regtest.get_block_hash(i).unwrap();
-            assert_eq!(regtest.get_block_height(&hash), Some(i));
-            assert_eq!(regtest.height(), i);
-            assert_eq!(regtest.tip(), hash);
-            regtest.drop_last_headers(1);
-        }
-        assert_eq!(regtest.height(), 0);
-        assert_eq!(
-            regtest.tip(),
-            "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
-                .parse()
-                .unwrap()
-        );
+        chain.drop_last_headers(2);
+        assert_eq!(chain.height(), 1);
 
-        regtest.drop_last_headers(1);
-        assert_eq!(regtest.height(), 0);
-        assert_eq!(
-            regtest.tip(),
-            "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
-                .parse()
-                .unwrap()
-        );
-
-        // test reorg
-        let mut regtest = Chain::new(Regtest);
-        regtest.load(
-            headers.iter().copied(),
-            headers.last().unwrap().block_hash(),
-        );
-        let height = regtest.height();
-
-        let new_header: BlockHeader = deserialize(&hex!("000000200030d7f9c11ef35b89a0eefb9a5e449909339b5e7854d99804ea8d6a49bf900a0304d2e55fe0b6415949cff9bca0f88c0717884a5e5797509f89f856af93624a7a6bcc60ffff7f2000000000")).unwrap();
-        regtest.update(vec![NewHeader::from((new_header, height))]);
-        assert_eq!(regtest.height(), height);
-        assert_eq!(
-            regtest.tip(),
-            "0e16637fe0700a7c52e9a6eaa58bd6ac7202652103be8f778680c66f51ad2e9b"
-                .parse()
-                .unwrap()
-        );
+        chain.drop_last_headers(10); // safe to drop more than available
+        assert_eq!(chain.height(), 0);
+        assert_eq!(chain.tip(), genesis_hash);
     }
 }

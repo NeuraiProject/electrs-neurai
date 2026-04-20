@@ -1,0 +1,72 @@
+# End-to-end regtest for electrs-neurai.
+#
+# Brings up:
+#   - neurai-daemon     in regtest mode, RPC + P2P exposed on the internal network
+#   - electrs-neurai    connecting to the daemon, Electrum RPC exposed on :60401
+#
+# Usage (from this directory):
+#
+#   docker compose -f docker-compose.yml up --build -d
+#   ./e2e.sh        # run the smoke test suite
+#   docker compose -f docker-compose.yml down -v
+#
+# The image tag for the Neurai daemon can be overridden with the
+# NEURAI_DAEMON_IMAGE env var. Defaults to the locally-built binary image.
+
+services:
+  neurai-daemon:
+    image: ${NEURAI_DAEMON_IMAGE:-neurai-linux64-bin:latest}
+    container_name: neurai-daemon-regtest
+    command:
+      - neuraid
+      - -regtest
+      - -server
+      - -listen
+      - -rpcallowip=0.0.0.0/0
+      - -rpcbind=0.0.0.0
+      - -rpcport=19201
+      - -port=19200
+      - -rpcuser=regtest
+      - -rpcpassword=regtest
+      - -fallbackfee=0.0001
+      - -printtoconsole
+    volumes:
+      - daemon-data:/root/.neurai
+    networks:
+      - regtest
+    healthcheck:
+      test: ["CMD-SHELL", "neurai-cli -regtest -rpcuser=regtest -rpcpassword=regtest getblockchaininfo >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  electrs:
+    build:
+      context: ../..
+      dockerfile: electrs-neurai/Dockerfile
+    container_name: electrs-neurai-regtest
+    depends_on:
+      neurai-daemon:
+        condition: service_healthy
+    command:
+      - --network=regtest
+      - --daemon-rpc-addr=neurai-daemon:19201
+      - --daemon-p2p-addr=neurai-daemon:19200
+      - --electrum-rpc-addr=0.0.0.0:60401
+      - --auth=regtest:regtest
+      - --db-dir=/var/lib/electrs-neurai
+      - --skip-block-download-wait
+    ports:
+      - "60401:60401"
+    volumes:
+      - electrs-data:/var/lib/electrs-neurai
+    networks:
+      - regtest
+
+volumes:
+  daemon-data:
+  electrs-data:
+
+networks:
+  regtest:
+    driver: bridge

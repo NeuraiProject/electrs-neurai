@@ -12,6 +12,7 @@ use serde::ser::{Serialize, SerializeSeq, Serializer};
 use crate::{
     daemon::Daemon,
     metrics::{Gauge, Metrics},
+    neurai::asset::{parse_asset_script, AssetData},
     signals::ExitFlag,
     types::ScriptHash,
 };
@@ -29,6 +30,11 @@ pub(crate) struct Mempool {
     entries: HashMap<Txid, Entry>,
     by_funding: BTreeSet<(ScriptHash, Txid)>,
     by_spending: BTreeSet<(OutPoint, Txid)>,
+    /// Asset-name → txids that touched it in mempool.
+    ///
+    /// Keys are the raw asset-name bytes (exactly as stored on chain), not a hash
+    /// prefix — mempool is small enough that exact names are cheap.
+    by_asset_name: HashMap<Vec<u8>, HashSet<Txid>>,
     fees: FeeHistogram,
     // stats
     vsize: Gauge,
@@ -117,6 +123,15 @@ impl MempoolSyncUpdate {
     }
 }
 
+fn asset_name_bytes(data: &AssetData) -> Vec<u8> {
+    match data {
+        AssetData::New(a) => a.name.as_bytes().to_vec(),
+        AssetData::Transfer(a) => a.name.as_bytes().to_vec(),
+        AssetData::Reissue(a) => a.name.as_bytes().to_vec(),
+        AssetData::Owner(a) => a.name.as_bytes().to_vec(),
+    }
+}
+
 // Smallest possible txid
 fn txid_min() -> Txid {
     Txid::all_zeros()
@@ -133,6 +148,7 @@ impl Mempool {
             entries: Default::default(),
             by_funding: Default::default(),
             by_spending: Default::default(),
+            by_asset_name: Default::default(),
             fees: FeeHistogram::default(),
             vsize: metrics.gauge(
                 "mempool_txs_vsize",
@@ -174,6 +190,16 @@ impl Mempool {
         self.by_spending
             .range(range)
             .map(|(_, txid)| self.get(txid).expect("missing spending mempool tx"))
+            .collect()
+    }
+
+    /// Return every mempool `Entry` that carries any output referring to the given asset name.
+    pub(crate) fn filter_by_asset_name(&self, name: &[u8]) -> Vec<&Entry> {
+        self.by_asset_name
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(|txid| self.get(txid).expect("missing asset mempool tx"))
             .collect()
     }
 
@@ -246,6 +272,13 @@ impl Mempool {
         for txo in &entry.tx.output {
             let scripthash = ScriptHash::new(&txo.script_pubkey);
             self.by_funding.insert((scripthash, entry.txid)); // may have duplicates
+            if let Some(asset) = parse_asset_script(txo.script_pubkey.as_bytes()) {
+                let name = asset_name_bytes(&asset.data);
+                self.by_asset_name
+                    .entry(name)
+                    .or_default()
+                    .insert(entry.txid);
+            }
         }
 
         self.modify_fee_histogram(entry.fee, entry.vsize as i64);
@@ -265,6 +298,15 @@ impl Mempool {
         for txo in entry.tx.output {
             let scripthash = ScriptHash::new(&txo.script_pubkey);
             self.by_funding.remove(&(scripthash, txid)); // may have misses
+            if let Some(asset) = parse_asset_script(txo.script_pubkey.as_bytes()) {
+                let name = asset_name_bytes(&asset.data);
+                if let Some(txids) = self.by_asset_name.get_mut(&name) {
+                    txids.remove(&txid);
+                    if txids.is_empty() {
+                        self.by_asset_name.remove(&name);
+                    }
+                }
+            }
         }
 
         self.modify_fee_histogram(entry.fee, -(entry.vsize as i64));
@@ -367,9 +409,20 @@ impl Serialize for FeeHistogram {
 
 #[cfg(test)]
 mod tests {
-    use super::FeeHistogram;
+    use super::{asset_name_bytes, FeeHistogram};
+    use crate::neurai::asset::{AssetData, TransferAsset};
     use bitcoin::Amount;
     use serde_json::json;
+
+    #[test]
+    fn asset_name_bytes_covers_every_variant() {
+        let transfer = AssetData::Transfer(TransferAsset {
+            name: "TOKEN".to_string(),
+            amount: 1,
+            message: None,
+        });
+        assert_eq!(asset_name_bytes(&transfer), b"TOKEN");
+    }
 
     #[test]
     fn test_histogram() {

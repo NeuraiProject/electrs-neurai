@@ -1,72 +1,121 @@
-![Logo](logo/logo.svg)
+# electrs-neurai — Electrum Server for Neurai
 
-# Electrum Server in Rust
+Electrum server for the Neurai (XNA) blockchain, adapted from
+[romanz/electrs](https://github.com/romanz/electrs). Supports Neurai's
+variable-size KAWPOW block headers, asset opcodes (`OP_XNA_ASSET`), legacy
+base58check and bech32/bech32m address formats, mainnet / testnet / regtest,
+and the standard Electrum v1.4 protocol plus `blockchain.address.*` and
+`blockchain.asset.*` extensions.
 
-[![CI](https://github.com/romanz/electrs/actions/workflows/rust.yml/badge.svg)](https://github.com/romanz/electrs/actions)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](https://github.com/romanz/electrs/compare)
-[![crates.io](https://img.shields.io/crates/v/electrs.svg)](https://crates.io/crates/electrs)
-[![gitter.im](https://badges.gitter.im/romanz/electrs.svg)](https://gitter.im/romanz/electrs)
+A private, self-hosted Electrum server lets wallets track balances,
+transaction history, and asset holdings without disclosing addresses to
+third-party servers.
 
-An efficient re-implementation of Electrum Server, inspired by [ElectrumX](https://github.com/kyuupichan/electrumx), [Electrum Personal Server](https://github.com/chris-belcher/electrum-personal-server) and [bitcoincore-indexd](https://github.com/jonasschnelli/bitcoincore-indexd).
+See [`NIP/software/ELECTRS_MIGRATION.md`](../ELECTRS_MIGRATION.md) for a
+phase-by-phase log of the adaptation from upstream electrs.
 
-The motivation behind this project is to enable a user to self host an Electrum server,
-with required hardware resources not much beyond those of a [full node](https://en.bitcoin.it/wiki/Full_node#Why_should_you_use_a_full_node_wallet).
-The server indexes the entire Bitcoin blockchain, and the resulting index enables fast queries for any given user wallet,
-allowing the user to keep real-time track of balances and transaction history using the [Electrum wallet](https://electrum.org/).
-Since it runs on the user's own machine, there is no need for the wallet to communicate with external Electrum servers,
-thus preserving the privacy of the user's addresses and balances.
-
-[BTC Prague 2024 dev/hack/day](https://btcprague.com/dev-hack-day/) slides are here: https://bit.ly/electrs
-
-
-## Usage
-
-**Please prefer to use OUR usage guide!**
-
-External guides can be out-of-date and have various problems.
-At least double-check that the guide you're using is actively maintained.
-If you can't use our guide, please ask about what you don't understand or consider using automated deployments.
-
-Note that this implementation of Electrum server is optimized for **personal/small-scale (family/friends) usage**.
-It's a bad idea to run it publicly as it'd expose you to DoS and maybe also other attacks.
-If you want to run a public server you may be interested in the [Blockstream fork of electrs](https://github.com/Blockstream/electrs)
-which is better optimized for public usage at the cost of consuming *significantly* more resources.
-
- * [Installation from source](doc/install.md)
- * [Pre-built binaries](doc/binaries.md) (No official binaries available but a beta repository is available for installation)
- * [Configuration](doc/config.md)
- * [Usage](doc/usage.md)
- * [Monitoring](doc/monitoring.md)
- * [Upgrading](doc/upgrading.md) - **contains information about important changes from older versions**
 
 ## Features
 
- * Supports Electrum protocol [v1.4](https://electrum-protocol.readthedocs.io/)
- * Maintains an index over transaction inputs and outputs, allowing fast balance queries
- * Fast synchronization of the Bitcoin blockchain (~6.5 hours for ~504GB @ August 2023) using HDD storage.
- * Low index storage overhead (~10%), relying on a local full node for transaction retrieval
- * Efficient mempool tracker (allowing better fee [estimation](https://github.com/spesmilo/electrum/blob/59c1d03f018026ac301c4e74facfc64da8ae4708/RELEASE-NOTES#L34-L46))
- * Low CPU & memory usage (after initial indexing)
- * [`txindex`](https://github.com/bitcoinbook/bitcoinbook/blob/develop/ch03_bitcoin-core.adoc#txindex) is not required for the Bitcoin node
- * Uses a single [RocksDB](https://github.com/spacejam/rust-rocksdb) database, for better consistency and crash recovery
+ * Electrum protocol [v1.4](https://electrum-protocol.readthedocs.io/)
+ * Neurai-native block header decoder — handles both 80-byte pre-KAWPOW and
+   120-byte post-KAWPOW headers on mainnet, and the 80-byte SHA256d layout
+   on testnet / regtest.
+ * Scripthash index over every output, plus dedicated RocksDB column families
+   for asset metadata, asset history and per-scripthash asset funding.
+ * Mempool tracker with per-scripthash and per-asset-name lookups.
+ * Neurai-aware address codec (base58check prefixes 53 / 127 → `N…` / `t…`,
+   bech32/bech32m HRPs `nq` / `tnq` / `rnq`).
+ * `blockchain.address.get_scripthash` and `blockchain.asset.*` RPC extensions —
+   see [doc/neurai-rpc.md](doc/neurai-rpc.md).
+ * Single RocksDB database, crash-safe, low index storage overhead.
+ * Low CPU and memory usage after the initial sync.
+ * `txindex` is **not** required on the Neurai daemon.
 
-## Altcoins
+## Quick start with Docker
 
-Altcoins are **not supported**!
-Forks of Bitcoin codebase that relax the consensus rules (hard forks) are also **not supported**.
+The repository ships with a production multi-stage `Dockerfile` and a
+regtest integration stack in `regtest/`.
 
-You may be able to find a fork of electrs that does support them, look around or make your own, just don't file issues/PRs here.
+```bash
+# Build the server image from the project root.
+cd NIP/software/electrs-neurai
+docker build -f Dockerfile -t electrs-neurai:latest .
 
-## Index database
+# Point electrs at a running Neurai daemon:
+docker run --rm -it \
+    -v "$HOME/.neurai":/home/electrs/.neurai:ro \
+    -v electrs-neurai-db:/var/lib/electrs-neurai \
+    -p 50001:50001 \
+    electrs-neurai:latest \
+        --network=neurai \
+        --daemon-rpc-addr=host.docker.internal:19001 \
+        --daemon-p2p-addr=host.docker.internal:19000 \
+        --electrum-rpc-addr=0.0.0.0:50001
+```
 
-The database schema is described [here](doc/schema.md).
+## Building from source
+
+Requirements:
+- Rust 1.85.0 (pinned; see `rust-toolchain` expectations in the Dockerfiles)
+- `cmake`, `clang`, `libclang-dev`, `librocksdb-dev`, `libssl-dev`, `pkg-config`
+- The vendored `hasherkawpow-sys` crate included at `./hasherkawpow-sys`
+
+```bash
+cd NIP/software/electrs-neurai
+cargo build --release --locked
+./target/release/electrs-neurai --network=neurai ...
+```
+
+The development container `Dockerfile.dev` sets up the toolchain and bind-mount
+layout for iterative work; see its header comment for usage.
+
+## Configuration
+
+Configuration is driven by `configure_me` via CLI flags, environment
+variables (prefix `ELECTRS_`) and a TOML config file. A template lives in
+[doc/config_example.toml](doc/config_example.toml). The authoritative option
+list is [internal/config_specification.toml](internal/config_specification.toml);
+run `electrs-neurai --help` for the generated reference.
+
+Per-network defaults:
+
+| Network  | Electrum RPC | Daemon RPC  | Daemon P2P  | DB subdir   | Address prefixes   |
+|----------|--------------|-------------|-------------|-------------|--------------------|
+| neurai   | `:50001`     | `:19001`    | `:19000`    | `neurai`    | `N…` / `nq1…`      |
+| testnet  | `:60001`     | `:19101`    | `:19100`    | `testnet`   | `t…` / `tnq1…`     |
+| regtest  | `:60401`     | `:19201`    | `:19200`    | `regtest`   | `t…` / `rnq1…`     |
+
+Testnet and regtest use an epoch-based genesis block that is fetched from the
+Neurai daemon over RPC at startup — you do not need to hardcode it in config.
+
+## Tests
+
+```bash
+# Unit + crate-internal integration tests (no daemon required):
+cargo test --locked
+
+# End-to-end against a live regtest daemon (requires a Neurai daemon image
+# that supports -regtest mode):
+cd regtest
+docker compose up --build -d
+./e2e.sh
+docker compose down -v
+```
+
+See [regtest/README.md](regtest/README.md) for prerequisites and the
+step-by-step breakdown.
+
+## Migration history
+
+The adaptation from upstream `romanz/electrs` is tracked phase-by-phase in
+[`../ELECTRS_MIGRATION.md`](../ELECTRS_MIGRATION.md).
 
 ## Contributing
 
-All contributions to this project are welcome. Please refer to the [Contributing Guidelines](CONTRIBUTING.md) for more details.
+Contributions are welcome — please refer to the
+[Contributing Guidelines](CONTRIBUTING.md).
 
-## Logo
+## License
 
-[Our logo](logo/) is generously provided by [Dominik Průša](https://github.com/DominoPrusa) under the MIT license.
-Based on the [Electrum logo](https://github.com/spesmilo/electrum/blob/master/LICENCE)
-and the [Rust language logo](https://rustfoundation.org/policy/rust-trademark-policy).
+MIT, inherited from upstream `romanz/electrs`. See [LICENSE](LICENSE).

@@ -17,6 +17,7 @@ mod index;
 mod mempool;
 mod merkle;
 mod metrics;
+mod neurai;
 mod p2p;
 mod server;
 mod signals;

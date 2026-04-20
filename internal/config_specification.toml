@@ -4,9 +4,9 @@ conf_file_param = "conf"
 conf_dir_param = "conf_dir"
 skip_default_conf_files_switch = "skip_default_conf_files"
 doc = """
-An efficient re-implementation of Electrum Server, inspired by ElectrumX, Electrum Personal Server and bitcoincore-indexd.
+Electrum server for the Neurai (XNA) blockchain, adapted from romanz/electrs.
 
-The motivation behind this project is to enable a user to run his own Electrum server, with required hardware resources not much beyond those of a full node. The server indexes the entire Bitcoin blockchain, and the resulting index enables fast queries for any given user wallet, allowing the user to keep real-time track of his balances and his transaction history using the Electrum wallet. Since it runs on the user's own machine, there is no need for the wallet to communicate with external Electrum servers, thus preserving the privacy of the user's addresses and balances."""
+Indexes the full Neurai blockchain (including assets and KAWPOW block headers) so wallets can keep real-time track of balances, transaction history, and asset holdings without disclosing addresses to external Electrum servers."""
 
 [[switch]]
 name = "verbose"
@@ -43,7 +43,7 @@ default = "1"
 [[param]]
 name = "daemon_dir"
 type = "std::path::PathBuf"
-doc = "Data directory of Bitcoind (default: ~/.bitcoin/)"
+doc = "Data directory of Neurai daemon (default: ~/.neurai/)"
 default = "crate::config::default_daemon_dir()"
 
 [[param]]
@@ -57,51 +57,51 @@ env_var = false
 [[param]]
 name = "cookie_file"
 type = "std::path::PathBuf"
-doc = "JSONRPC authentication cookie file (default: ~/.bitcoin/.cookie)"
+doc = "JSONRPC authentication cookie file (default: ~/.neurai/.cookie)"
 # This is safe to configure on command line.
 
 [[param]]
 name = "network"
-type = "crate::config::BitcoinNetwork"
-convert_into = "::bitcoin::Network"
-doc = "Select Bitcoin network type ('bitcoin', 'testnet', 'testnet4', 'regtest' or 'signet')"
+type = "crate::config::ConfiguredNetwork"
+convert_into = "crate::neurai::NeuraiNetwork"
+doc = "Select Neurai network type ('neurai', 'testnet' or 'regtest')"
 default = "Default::default()"
 
 [[param]]
 name = "electrum_rpc_addr"
 type = "crate::config::ResolvAddr"
-doc = "Electrum server JSONRPC 'addr:port' to listen on (default: '127.0.0.1:50001' for mainnet, '127.0.0.1:60001' for testnet, '127.0.0.1:60401' for regtest and '127.0.0.1:60601' for signet)"
+doc = "Electrum server JSONRPC 'addr:port' to listen on (default: '127.0.0.1:50001' for neurai mainnet, '127.0.0.1:60001' for testnet, '127.0.0.1:60401' for regtest)"
 
 [[param]]
 name = "daemon_rpc_addr"
 type = "crate::config::ResolvAddr"
-doc = "Bitcoin daemon JSONRPC 'addr:port' to connect (default: 127.0.0.1:8332 for mainnet, 127.0.0.1:18332 for testnet, 127.0.0.1:18443 for regtest and 127.0.0.1:18554 for signet)"
+doc = "Neurai daemon JSONRPC 'addr:port' to connect (default: 127.0.0.1:19001 for mainnet, 127.0.0.1:19101 for testnet, 127.0.0.1:19201 for regtest)"
 [[param]]
 name = "daemon_p2p_addr"
 type = "crate::config::ResolvAddr"
-doc = "Bitcoin daemon p2p 'addr:port' to connect (default: 127.0.0.1:8333 for mainnet, 127.0.0.1:18333 for testnet, 127.0.0.1:18444 for regtest and 127.0.0.1:38333 for signet)"
+doc = "Neurai daemon p2p 'addr:port' to connect (default: 127.0.0.1:19000 for mainnet, 127.0.0.1:19100 for testnet, 127.0.0.1:19200 for regtest)"
 
 [[param]]
 name = "monitoring_addr"
 type = "crate::config::ResolvAddr"
-doc = "Prometheus monitoring 'addr:port' to listen on (default: 127.0.0.1:4224 for mainnet, 127.0.0.1:14224 for testnet, 127.0.0.1:24224 for regtest and 127.0.0.1:34224 for signet)"
+doc = "Prometheus monitoring 'addr:port' to listen on (default: 127.0.0.1:4224 for mainnet, 127.0.0.1:14224 for testnet, 127.0.0.1:24224 for regtest)"
 
 [[param]]
 name = "wait_duration_secs"
 type = "u64"
-doc = "Duration to wait between bitcoind polling"
+doc = "Duration to wait between Neurai daemon polling"
 default = "10"
 
 [[param]]
 name = "jsonrpc_timeout_secs"
 type = "u64"
-doc = "Duration to wait until bitcoind JSON-RPC timeouts (must be greater than wait_duration_secs)."
+doc = "Duration to wait until Neurai daemon JSON-RPC timeouts (must be greater than wait_duration_secs)."
 default = "15"
 
 [[param]]
 name = "index_batch_size"
 type = "usize"
-doc = "Number of blocks to get in a single p2p protocol request from bitcoind"
+doc = "Number of blocks to get in a single p2p protocol request from the Neurai daemon"
 default = "10"
 
 [[switch]]
@@ -140,14 +140,9 @@ default = "0"
 name = "server_banner"
 type = "String"
 doc = "The banner to be shown in the Electrum console"
-default = "concat!(\"Welcome to electrs \", env!(\"CARGO_PKG_VERSION\"), \" (Electrum Rust Server)!\").to_owned()"
+default = "concat!(\"Welcome to electrs-neurai \", env!(\"CARGO_PKG_VERSION\"), \" (Electrum server for Neurai)!\").to_owned()"
 
 [[param]]
 name = "log_filters"
 type = "String"
 doc = "Logging filters, overriding `RUST_LOG` environment variable (see https://docs.rs/env_logger/ for details)"
-
-[[param]]
-name = "magic"
-type = "String"
-doc = "network magic for custom network in hex format, as found in Bitcoin Core logs"

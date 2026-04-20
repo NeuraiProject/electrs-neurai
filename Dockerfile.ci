@@ -1,45 +1,45 @@
-# Important: This file is provided for demonstration purposes and may NOT be suitable for production use.
-# The maintainers of electrs are not deeply familiar with Docker, so you should DYOR.
-# If you are not familiar with Docker either it's probably be safer to NOT use it.
+# CI image for electrs-neurai: builds the binary and runs the test suite.
+#
+# Neurai does not publish prebuilt daemon binaries like Bitcoin Core does, so
+# end-to-end integration tests against a live daemon live in Phase 9 (regtest)
+# and rely on a separately-built Neurai daemon image. This file covers only
+# the Rust side: compilation + unit tests.
+#
+# Build from the project root:
+#
+#   cd NIP/software/electrs-neurai
+#   docker build -f Dockerfile.ci -t electrs-neurai-ci .
 
 FROM debian:trixie-slim AS base
-RUN apt-get update -qqy
-RUN apt-get install -qqy librocksdb-dev wget
 
-### Electrum Rust Server ###
-FROM base AS electrs-build
-RUN apt-get install -qqy cargo build-essential libclang-dev
+ENV DEBIAN_FRONTEND=noninteractive \
+    RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    RUST_VERSION=1.85.0 \
+    ROCKSDB_INCLUDE_DIR=/usr/include \
+    ROCKSDB_LIB_DIR=/usr/lib
 
-# Install electrs
-WORKDIR /build/electrs
+RUN apt-get update -qqy && \
+    apt-get install -qqy --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        clang \
+        cmake \
+        curl \
+        g++ \
+        libclang-dev \
+        librocksdb-dev \
+        libssl-dev \
+        pkg-config && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+        sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal --no-modify-path && \
+    rustup component add clippy rustfmt
+
+WORKDIR /workspace/electrs-neurai
 COPY . .
-ENV ROCKSDB_INCLUDE_DIR=/usr/include
-ENV ROCKSDB_LIB_DIR=/usr/lib
-RUN cargo install --locked --path .
 
-### Bitcoin Core ###
-FROM base AS bitcoin-build
-# Download
-WORKDIR /build/bitcoin
-RUN wget -q https://bitcoincore.org/bin/bitcoin-core-31.0/test.rc2/bitcoin-31.0rc2-x86_64-linux-gnu.tar.gz
-RUN tar xvf bitcoin-31.0rc2-x86_64-linux-gnu.tar.gz
-RUN mv -v bitcoin-31.0rc2/bin/bitcoind .
-RUN mv -v bitcoin-31.0rc2/bin/bitcoin-cli .
-
-FROM base AS result
-# Copy the binaries
-COPY --from=electrs-build /root/.cargo/bin/electrs /usr/bin/electrs
-COPY --from=bitcoin-build /build/bitcoin/bitcoind /build/bitcoin/bitcoin-cli /usr/bin/
-RUN bitcoind -version && bitcoin-cli -version
-
-### Electrum ###
-# Clone latest Electrum wallet and a few test tools
-WORKDIR /build/
-RUN apt-get install -qqy git libsecp256k1-2 python3-cryptography python3-setuptools python3-venv python3-pip jq curl
-RUN git clone --recurse-submodules https://github.com/spesmilo/electrum/ && cd electrum/ && git log -1
-RUN python3 -m venv --system-site-packages venv && \
-    ELECTRUM_ECC_DONT_COMPILE=1 venv/bin/pip install -e electrum/ && \
-	ln /build/venv/bin/electrum /usr/bin/electrum
-
-RUN electrum version --offline
-WORKDIR /
+RUN cargo build --locked --bin electrs-neurai
+RUN cargo test  --locked

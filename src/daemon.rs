@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 
-use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::{consensus::deserialize, hashes::hex::FromHex};
 use bitcoin::{Amount, BlockHash, Transaction, Txid};
 use bitcoincore_rpc::{json, jsonrpc, Auth, Client, RpcApi};
@@ -17,6 +16,7 @@ use crate::{
     chain::{Chain, NewHeader},
     config::Config,
     metrics::Metrics,
+    neurai::NetworkParams,
     p2p::Connection,
     signals::ExitFlag,
     types::SerBlock,
@@ -31,7 +31,7 @@ fn rpc_poll(client: &mut Client, skip_block_download_wait: bool) -> PollResult {
     match client.get_blockchain_info() {
         Ok(info) => {
             if skip_block_download_wait {
-                // bitcoind RPC is available, don't wait for block download to finish
+                // Neurai daemon RPC is available, don't wait for block download to finish
                 return PollResult::Done(Ok(()));
             }
             let left_blocks = info.headers - info.blocks;
@@ -62,19 +62,20 @@ fn rpc_poll(client: &mut Client, skip_block_download_wait: bool) -> PollResult {
 }
 
 fn read_cookie(path: &Path) -> Result<(String, String)> {
-    // Load username and password from bitcoind cookie file:
-    // * https://github.com/bitcoin/bitcoin/pull/6388/commits/71cbeaad9a929ba6a7b62d9b37a09b214ae00c1a
-    // * https://bitcoin.stackexchange.com/questions/46782/rpc-cookie-authentication
-    let mut file = File::open(path)
-        .with_context(|| format!("failed to open bitcoind cookie file: {}", path.display()))?;
+    // Load username and password from the Neurai daemon cookie file (same format as
+    // bitcoind's RPC cookie — USER:PASSWORD, one line).
+    let mut file = File::open(path).with_context(|| {
+        format!("failed to open Neurai daemon cookie file: {}", path.display())
+    })?;
     let mut contents = String::new();
-    file.read_to_string(&mut contents)
-        .with_context(|| format!("failed to read bitcoind cookie from {}", path.display()))?;
+    file.read_to_string(&mut contents).with_context(|| {
+        format!("failed to read Neurai daemon cookie from {}", path.display())
+    })?;
 
     let parts: Vec<&str> = contents.splitn(2, ':').collect();
     ensure!(
         parts.len() == 2,
-        "failed to parse bitcoind cookie - missing ':' separator"
+        "failed to parse Neurai daemon cookie - missing ':' separator"
     );
     Ok((parts[0].to_owned(), parts[1].to_owned()))
 }
@@ -115,10 +116,10 @@ impl Daemon {
         loop {
             exit_flag
                 .poll()
-                .context("bitcoin RPC polling interrupted")?;
+                .context("Neurai daemon RPC polling interrupted")?;
             match rpc_poll(&mut rpc, config.skip_block_download_wait) {
                 PollResult::Done(result) => {
-                    result.context("bitcoind RPC polling failed")?;
+                    result.context("Neurai daemon RPC polling failed")?;
                     break; // on success, finish polling
                 }
                 PollResult::Retry => {
@@ -129,20 +130,21 @@ impl Daemon {
 
         let network_info = rpc.get_network_info()?;
         if network_info.version < 21_00_00 {
-            bail!("electrs requires bitcoind 0.21+");
+            bail!("electrs-neurai requires a Neurai daemon with protocol version 0.21+");
         }
         if !network_info.network_active {
-            bail!("electrs requires active bitcoind p2p network");
+            bail!("electrs-neurai requires an active Neurai daemon p2p network");
         }
         let info = rpc.get_blockchain_info()?;
         if info.pruned {
-            bail!("electrs requires non-pruned bitcoind node");
+            bail!("electrs-neurai requires a non-pruned Neurai daemon");
         }
 
+        let params = NetworkParams::for_network(config.network);
         let p2p = Mutex::new(Connection::connect(
             config.daemon_p2p_addr,
             metrics,
-            config.magic,
+            params,
         )?);
         Ok(Self { p2p, rpc })
     }
@@ -171,13 +173,6 @@ impl Daemon {
         self.rpc
             .send_raw_transaction(tx)
             .context("failed to broadcast transaction")
-    }
-
-    pub(crate) fn submitpackage(&self, txs: &[Transaction]) -> Result<Value> {
-        let package: Vec<String> = txs.iter().map(serialize_hex).collect();
-        self.rpc
-            .call("submitpackage", &[json!(package)])
-            .context("failed to submitpackage package")
     }
 
     pub(crate) fn get_transaction_info(
@@ -302,6 +297,14 @@ impl Daemon {
 
     pub(crate) fn new_block_notification(&self) -> Receiver<()> {
         self.p2p.lock().new_block_notification()
+    }
+
+    /// Fetch the genesis block hash (height 0) from the daemon RPC.
+    /// Used for testnet/regtest where the genesis is epoch-based.
+    pub(crate) fn get_genesis_hash(&self) -> Result<BlockHash> {
+        self.rpc
+            .get_block_hash(0)
+            .context("failed to get genesis block hash")
     }
 }
 

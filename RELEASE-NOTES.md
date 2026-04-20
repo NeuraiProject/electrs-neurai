@@ -1,3 +1,68 @@
+# electrs-neurai 0.1.0 — initial Neurai release
+
+First release of the Neurai adaptation of
+[romanz/electrs](https://github.com/romanz/electrs) (upstream base: 0.11.1).
+The migration log in `../ELECTRS_MIGRATION.md` has the per-phase breakdown;
+the highlights:
+
+**Neurai-specific core**
+
+* Per-network constants (`NeuraiNetwork::{Mainnet, Testnet, Regtest}`) mirroring
+  `src/chainparams.cpp` — P2P/RPC/Electrum ports, magic bytes, bech32 HRPs,
+  base58 prefixes, KAWPOW activation time.
+* `NeuraiBlockHeader` supporting both 80-byte pre-KAWPOW and 120-byte
+  post-KAWPOW layouts; KAWPOW hashing wired through the sibling
+  `hasherkawpow-sys` FFI crate.
+* `neurai_to_bsl_block` helper that safely bridges variable-size Neurai blocks
+  into `bitcoin_slices::bsl::Block::visit` for transaction iteration.
+* Dynamic testnet / regtest genesis — fetched from the daemon at startup
+  rather than hard-coded.
+
+**Addresses**
+
+* Native base58check codec for legacy `N…` / `t…` addresses.
+* bech32 / bech32m codec for SegWit witness programs (`nq1…` / `tnq1…` /
+  `rnq1…`), paving the way for post-quantum witness versions.
+* New RPC: `blockchain.address.get_scripthash`.
+
+**Assets**
+
+* Full parser for Neurai asset outputs: `OP_XNA_ASSET` (`0xc0`) with the
+  `"rvn"` magic prefix and all four `AssetType` variants (`q`, `t`, `r`, `o`),
+  over both P2PKH and OP_1+`<32-byte>` base scripts.
+* RocksDB column families `asset_meta`, `asset_history`, `asset_funding`
+  for issuance metadata, per-asset tx history, and per-scripthash asset
+  holdings. Format version bumped to `2`; existing DBs auto-reindex.
+* New RPC: `blockchain.asset.get_meta`, `blockchain.asset.get_history`
+  (confirmed + mempool entries).
+* Mempool is asset-aware: `Mempool::by_asset_name` and
+  `filter_by_asset_name`.
+
+**Ops**
+
+* Production `Dockerfile` (multi-stage: rustup builder → debian:trixie-slim
+  runtime with `librocksdb9.10`, `libssl3`, dedicated `electrs` user).
+* `Dockerfile.dev` for iterative Rust development.
+* `Dockerfile.ci` for build + test in CI.
+* `regtest/` Docker Compose harness with a 7-step end-to-end smoke test
+  (`regtest/e2e.sh`).
+* `doc/neurai-rpc.md` documents every Neurai-specific RPC extension.
+
+**Removed from upstream**
+
+* `submitpackage` / `blockchain.transaction.broadcast_package` (Neurai does
+  not expose a `submitpackage` RPC).
+* Dead `Config.magic` / `Config.bitcoin_network` fields.
+* `bitcoin_network_for` helper (no longer needed — everything flows through
+  `NetworkParams`).
+
+---
+
+## Upstream history (for reference)
+
+The sections below are the unmodified release notes from upstream electrs up
+to the fork point. They are kept for traceability.
+
 # 0.11.1 (Feb 22 2026)
 
 * Update `transaction.id_from_pos` response for API compliance.

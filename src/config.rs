@@ -1,5 +1,3 @@
-use bitcoin::p2p::Magic;
-use bitcoin::Network;
 use bitcoincore_rpc::Auth;
 use dirs_next::home_dir;
 
@@ -9,6 +7,8 @@ use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::path::PathBuf;
 use std::str::FromStr;
+
+use crate::neurai::{NeuraiNetwork, NetworkParams};
 
 use std::env::consts::{ARCH, OS};
 use std::time::Duration;
@@ -88,35 +88,32 @@ impl ResolvAddr {
     }
 }
 
-/// This newtype implements `ParseArg` for `Network`.
+/// Thin newtype that parses a `NeuraiNetwork` from the command line / config file.
 #[derive(Deserialize)]
-pub struct BitcoinNetwork(Network);
+pub struct ConfiguredNetwork(NeuraiNetwork);
 
-impl Default for BitcoinNetwork {
+impl Default for ConfiguredNetwork {
     fn default() -> Self {
-        BitcoinNetwork(Network::Bitcoin)
+        ConfiguredNetwork(NeuraiNetwork::default())
     }
 }
 
-impl FromStr for BitcoinNetwork {
-    type Err = <Network as FromStr>::Err;
+impl FromStr for ConfiguredNetwork {
+    type Err = String;
 
     fn from_str(string: &str) -> std::result::Result<Self, Self::Err> {
-        Network::from_str(string).map(BitcoinNetwork)
+        NeuraiNetwork::from_str(string).map(ConfiguredNetwork)
     }
 }
 
-impl ::configure_me::parse_arg::ParseArgFromStr for BitcoinNetwork {
+impl ::configure_me::parse_arg::ParseArgFromStr for ConfiguredNetwork {
     fn describe_type<W: fmt::Write>(mut writer: W) -> fmt::Result {
-        write!(
-            writer,
-            "either 'bitcoin', 'testnet', 'testnet4', 'regtest' or 'signet'"
-        )
+        write!(writer, "either 'neurai', 'testnet' or 'regtest'")
     }
 }
 
-impl From<BitcoinNetwork> for Network {
-    fn from(network: BitcoinNetwork) -> Network {
+impl From<ConfiguredNetwork> for NeuraiNetwork {
+    fn from(network: ConfiguredNetwork) -> NeuraiNetwork {
         network.0
     }
 }
@@ -125,7 +122,7 @@ impl From<BitcoinNetwork> for Network {
 #[derive(Debug)]
 pub struct Config {
     // See below for the documentation of each field:
-    pub network: Network,
+    pub network: NeuraiNetwork,
     pub db_path: PathBuf,
     pub db_log_dir: Option<PathBuf>,
     pub db_parallelism: u8,
@@ -145,7 +142,6 @@ pub struct Config {
     pub skip_block_download_wait: bool,
     pub disable_electrum_rpc: bool,
     pub server_banner: String,
-    pub magic: Magic,
 }
 
 pub struct SensitiveAuth(pub Auth);
@@ -169,13 +165,13 @@ impl fmt::Debug for SensitiveAuth {
     }
 }
 
-/// Returns default daemon directory
+/// Returns default daemon directory (`~/.neurai/`).
 fn default_daemon_dir() -> PathBuf {
     let mut home = home_dir().unwrap_or_else(|| {
         eprintln!("Error: unknown home directory");
         std::process::exit(1)
     });
-    home.push(".bitcoin");
+    home.push(".neurai");
     home
 }
 
@@ -198,55 +194,15 @@ impl Config {
             internal::prelude::Config::including_optional_config_files(default_config_files())
                 .unwrap_or_exit();
 
-        let db_subdir = match config.network {
-            Network::Bitcoin => "bitcoin",
-            Network::Testnet => "testnet",
-            Network::Testnet4 => "testnet4",
-            Network::Regtest => "regtest",
-            Network::Signet => "signet",
-        };
+        let network: NeuraiNetwork = config.network.into();
+        let params = NetworkParams::for_network(network);
 
-        config.db_dir.push(db_subdir);
+        config.db_dir.push(params.db_subdir);
 
-        let default_daemon_rpc_port = match config.network {
-            Network::Bitcoin => 8332,
-            Network::Testnet => 18332,
-            Network::Testnet4 => 48332,
-            Network::Regtest => 18443,
-            Network::Signet => 38332,
-        };
-        let default_daemon_p2p_port = match config.network {
-            Network::Bitcoin => 8333,
-            Network::Testnet => 18333,
-            Network::Testnet4 => 48333,
-            Network::Regtest => 18444,
-            Network::Signet => 38333,
-        };
-        let default_electrum_port = match config.network {
-            Network::Bitcoin => 50001,
-            Network::Testnet => 60001,
-            Network::Testnet4 => 40001,
-            Network::Regtest => 60401,
-            Network::Signet => 60601,
-        };
-        let default_monitoring_port = match config.network {
-            Network::Bitcoin => 4224,
-            Network::Testnet => 14224,
-            Network::Testnet4 => 44224,
-            Network::Regtest => 24224,
-            Network::Signet => 34224,
-        };
-
-        let magic = match config.magic {
-            Some(magic_hex) => magic_hex.parse().unwrap_or_else(|error| {
-                eprintln!(
-                    "Error: magic '{}' is not a valid hex string: {}",
-                    magic_hex, error
-                );
-                std::process::exit(1);
-            }),
-            None => config.network.magic(),
-        };
+        let default_daemon_rpc_port = params.default_rpc_port;
+        let default_daemon_p2p_port = params.default_p2p_port;
+        let default_electrum_port = params.default_electrum_port;
+        let default_monitoring_port = params.default_monitoring_port;
 
         let daemon_rpc_addr: SocketAddr = config.daemon_rpc_addr.map_or(
             (DEFAULT_SERVER_ADDRESS, default_daemon_rpc_port).into(),
@@ -272,12 +228,8 @@ impl Config {
             ResolvAddr::resolve_or_exit,
         );
 
-        match config.network {
-            Network::Bitcoin => (),
-            Network::Testnet => config.daemon_dir.push("testnet3"),
-            Network::Testnet4 => config.daemon_dir.push("testnet4"),
-            Network::Regtest => config.daemon_dir.push("regtest"),
-            Network::Signet => config.daemon_dir.push("signet"),
+        if let Some(subdir) = params.daemon_dir_subdir {
+            config.daemon_dir.push(subdir);
         }
 
         let mut deprecated_options_used = false;
@@ -338,7 +290,7 @@ impl Config {
         }
 
         let config = Config {
-            network: config.network,
+            network,
             db_path: config.db_dir,
             db_log_dir: config.db_log_dir,
             db_parallelism: config.db_parallelism,
@@ -358,7 +310,6 @@ impl Config {
             skip_block_download_wait: config.skip_block_download_wait,
             disable_electrum_rpc: config.disable_electrum_rpc,
             server_banner: config.server_banner,
-            magic,
         };
         eprintln!(
             "Starting electrs {} on {} {} with {:?}",

@@ -79,29 +79,6 @@ impl From<&TxGetArgs> for (Txid, bool) {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum BroadcastArgs {
-    Package((Vec<String>,)),
-    PackageVerbose((Vec<String>, bool)),
-}
-
-impl BroadcastArgs {
-    fn txs(&self) -> &[String] {
-        match self {
-            BroadcastArgs::Package((txs,)) => txs,
-            BroadcastArgs::PackageVerbose((txs, _)) => txs,
-        }
-    }
-
-    fn verbose(&self) -> bool {
-        match self {
-            BroadcastArgs::Package(_) => false,
-            BroadcastArgs::PackageVerbose((_, verbose)) => *verbose,
-        }
-    }
-}
-
 enum StandardError {
     ParseError,
     InvalidRequest,
@@ -164,9 +141,27 @@ impl Rpc {
             metrics::default_duration_buckets(),
         );
 
-        let tracker = Tracker::new(config, metrics)?;
         let signal = Signal::new();
-        let daemon = Daemon::connect(config, signal.exit_flag(), tracker.metrics())?;
+
+        // Connect the daemon first so we can fetch the genesis hash for networks
+        // where it is epoch-based (testnet, regtest).
+        let daemon = Daemon::connect(config, signal.exit_flag(), &metrics)?;
+
+        let genesis_hash = {
+            use crate::neurai::NetworkParams;
+            use bitcoin::hashes::{sha256d, Hash};
+            let params = NetworkParams::for_network(config.network);
+            if params.genesis_hash_le == [0u8; 32] {
+                // Dynamic genesis (testnet / regtest): fetch from daemon.
+                daemon.get_genesis_hash()?
+            } else {
+                BlockHash::from_raw_hash(
+                    sha256d::Hash::from_byte_array(params.genesis_hash_le),
+                )
+            }
+        };
+
+        let tracker = Tracker::new(config, metrics, genesis_hash)?;
         let cache = Cache::new(tracker.metrics());
         Ok(Self {
             tracker,
@@ -382,39 +377,77 @@ impl Rpc {
         Ok(status)
     }
 
+    fn address_get_scripthash(&self, (addr,): &(String,)) -> Result<Value> {
+        use crate::neurai::address::address_to_script;
+        let script = address_to_script(addr, self.tracker.chain().params())?;
+        Ok(json!(ScriptHash::new(&script)))
+    }
+
+    fn asset_get_meta(&self, (name,): &(String,)) -> Result<Value> {
+        use crate::types::AssetMetaEvent;
+        let meta = match self.tracker.get_asset_metadata(name.as_bytes()) {
+            Some(m) => m,
+            None => return Ok(Value::Null),
+        };
+        let event = match meta.event {
+            AssetMetaEvent::New => "new",
+            AssetMetaEvent::Reissue => "reissue",
+        };
+        let (ipfs_type, ipfs_hash) = match meta.ipfs_marker {
+            0x12 => (Some("ipfs"), Some(meta.ipfs_hash.to_lower_hex_string())),
+            0x54 => (Some("txid"), Some(meta.ipfs_hash.to_lower_hex_string())),
+            _ => (None, None),
+        };
+        Ok(json!({
+            "name": name,
+            "event": event,
+            "issuance_txid": meta.issuance_txid,
+            "issuance_height": meta.issuance_height,
+            "amount": meta.amount,
+            "units": meta.units,
+            "reissuable": meta.reissuable,
+            "ipfs_hash": ipfs_hash,
+            "ipfs_type": ipfs_type,
+        }))
+    }
+
+    fn asset_get_history(&self, (name,): &(String,)) -> Result<Value> {
+        let history = self.tracker.get_asset_history(name.as_bytes());
+        let mut items: Vec<Value> = history
+            .confirmed
+            .into_iter()
+            .map(|entry| {
+                // The stored prefix is `txid.as_byte_array()[..8]` — the *first*
+                // 8 bytes in consensus (wire / little-endian) order. Electrum
+                // clients display txids in the reversed (big-endian) order, so
+                // we reverse the prefix before hex-encoding: the emitted string
+                // is now the *last* 16 hex characters of the txid as displayed,
+                // which clients can match with `tx_hash.ends_with(tx_prefix)`.
+                let mut disp = entry.tx_prefix;
+                disp.reverse();
+                json!({
+                    "height": entry.height,
+                    "block_hash": entry.block_hash,
+                    "tx_prefix": disp.to_lower_hex_string(),
+                })
+            })
+            .collect();
+        for entry in history.mempool {
+            // Electrum height convention: 0 = unconfirmed / confirmed inputs only,
+            // -1 = unconfirmed with unconfirmed inputs.
+            let height: i64 = if entry.has_unconfirmed_inputs { -1 } else { 0 };
+            items.push(json!({
+                "height": height,
+                "tx_hash": entry.txid,
+                "fee": entry.fee.to_sat(),
+            }));
+        }
+        Ok(json!(items))
+    }
+
     fn transaction_broadcast(&self, (tx_hex,): &(String,)) -> Result<Value> {
         let txid = self.daemon.broadcast(&tx_from_hex(tx_hex)?)?;
         Ok(json!(txid))
-    }
-
-    fn transaction_broadcast_package(&self, args: &BroadcastArgs) -> Result<Value> {
-        let txs: Vec<Transaction> = args
-            .txs()
-            .iter()
-            .map(|s| tx_from_hex(s))
-            .collect::<Result<_>>()?;
-        let response = self.daemon.submitpackage(&txs)?;
-        if args.verbose() {
-            return Ok(response);
-        }
-        let build_result = || -> Option<Value> {
-            let success = response.get("package_msg")? == &json!("success");
-
-            let mut errors = vec![];
-            for tx in response.get("tx-results")?.as_object()?.values() {
-                let tx_obj = tx.as_object()?;
-                if let Some(error) = tx_obj.get("error") {
-                    let txid = tx_obj.get("txid");
-                    errors.push(json!({"error": error, "txid": txid}));
-                }
-            }
-            Some(if errors.is_empty() {
-                json!({"success": success})
-            } else {
-                json!({"success": success, "errors": errors})
-            })
-        };
-        build_result().ok_or(anyhow!("Unexpected `submitpackage` response"))
     }
 
     fn transaction_get(&self, args: &TxGetArgs) -> Result<Value> {
@@ -601,6 +634,9 @@ impl Rpc {
                 };
             }
             let result = match &call.params {
+                Params::AddressGetScripthash(args) => self.address_get_scripthash(args),
+                Params::AssetGetMeta(args) => self.asset_get_meta(args),
+                Params::AssetGetHistory(args) => self.asset_get_history(args),
                 Params::Banner => Ok(json!(self.banner)),
                 Params::BlockHeader(args) => self.block_header(*args),
                 Params::BlockHeaders(args) => self.block_headers(*args),
@@ -618,9 +654,6 @@ impl Rpc {
                 Params::ScriptHashSubscribe(args) => self.scripthash_subscribe(client, args),
                 Params::ScriptHashUnsubscribe(args) => self.scripthash_unsubscribe(client, args),
                 Params::TransactionBroadcast(args) => self.transaction_broadcast(args),
-                Params::TransactionBroadcastPackage(args) => {
-                    self.transaction_broadcast_package(args)
-                }
                 Params::TransactionGet(args) => self.transaction_get(args),
                 Params::TransactionGetMerkle(args) => self.transaction_get_merkle(args),
                 Params::TransactionFromPosition(args) => self.transaction_from_pos(*args),
@@ -633,11 +666,13 @@ impl Rpc {
 
 #[derive(Deserialize)]
 enum Params {
+    AddressGetScripthash((String,)),
+    AssetGetMeta((String,)),
+    AssetGetHistory((String,)),
     Banner,
     BlockHeader((usize,)),
     BlockHeaders((usize, usize)),
     TransactionBroadcast((String,)),
-    TransactionBroadcastPackage(BroadcastArgs),
     Donation,
     EstimateFee((u16,)),
     Features,
@@ -660,6 +695,11 @@ enum Params {
 impl Params {
     fn parse(method: &str, params: Value) -> std::result::Result<Params, StandardError> {
         Ok(match method {
+            "blockchain.address.get_scripthash" => {
+                Params::AddressGetScripthash(convert(params)?)
+            }
+            "blockchain.asset.get_meta" => Params::AssetGetMeta(convert(params)?),
+            "blockchain.asset.get_history" => Params::AssetGetHistory(convert(params)?),
             "blockchain.block.header" => Params::BlockHeader(convert(params)?),
             "blockchain.block.headers" => Params::BlockHeaders(convert(params)?),
             "blockchain.estimatefee" => Params::EstimateFee(convert(params)?),
@@ -671,9 +711,6 @@ impl Params {
             "blockchain.scripthash.subscribe" => Params::ScriptHashSubscribe(convert(params)?),
             "blockchain.scripthash.unsubscribe" => Params::ScriptHashUnsubscribe(convert(params)?),
             "blockchain.transaction.broadcast" => Params::TransactionBroadcast(convert(params)?),
-            "blockchain.transaction.broadcast_package" => {
-                Params::TransactionBroadcastPackage(convert(params)?)
-            }
             "blockchain.transaction.get" => Params::TransactionGet(convert(params)?),
             "blockchain.transaction.get_merkle" => Params::TransactionGetMerkle(convert(params)?),
             "blockchain.transaction.id_from_pos" => {
