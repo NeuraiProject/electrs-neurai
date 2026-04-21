@@ -1,11 +1,37 @@
-.*
-_*
-contrib
-db*
-dist
-doc
-Dockerfile
-examples
-scripts
-target
-tests
+# VCS
+.git/
+
+# Rust build artifacts
+target/
+hasherkawpow-sys/target/
+
+# Local databases & runtime data
+db*/
+data/
+*.dat
+
+# Local config / secrets
+electrs.toml
+.env
+
+# Logs
+*.log
+
+# Editor / IDE
+*.sublime*
+*~
+.idea/
+.vscode/
+
+# Python bytecode (from contrib/ scripts)
+*.pyc
+
+# Docs / examples / dev assets — not needed inside the image
+doc/
+examples/
+scripts/
+contrib/
+docker/
+
+# Dockerfiles themselves
+Dockerfile*

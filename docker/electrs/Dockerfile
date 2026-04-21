@@ -1,20 +1,13 @@
-# Production image for electrs-neurai.
+# Build electrs-neurai from a GitHub checkout.
 #
-# Build from the project root:
-#
-#   cd NIP/software/electrs-neurai
-#   docker build -f Dockerfile -t electrs-neurai:latest .
-#
-# Runtime ports (mainnet defaults):
-#   50001/tcp  Electrum RPC
-#   4224/tcp   Prometheus metrics  (when --features metrics)
-#
-# Volumes (typical layout):
-#   -v electrs-neurai-db:/var/lib/electrs-neurai
-#   -v ~/.neurai:/home/electrs/.neurai:ro   # cookie file / daemon dir
+# Override the source by passing build args:
+#   docker build --build-arg REPO_REF=v1.2.3 -t electrs-neurai .
 
 # ─── build stage ──────────────────────────────────────────────────────────────
 FROM debian:trixie-slim AS builder
+
+ARG REPO_URL=https://github.com/NeuraiProject/electrs-neurai.git
+ARG REPO_REF=master
 
 ENV DEBIAN_FRONTEND=noninteractive \
     RUSTUP_HOME=/usr/local/rustup \
@@ -32,6 +25,7 @@ RUN apt-get update -qqy && \
         cmake \
         curl \
         g++ \
+        git \
         libclang-dev \
         librocksdb-dev \
         libssl-dev \
@@ -41,8 +35,11 @@ RUN apt-get update -qqy && \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal --no-modify-path
 
+WORKDIR /workspace
+
+RUN git clone --branch ${REPO_REF} --single-branch ${REPO_URL} electrs-neurai
+
 WORKDIR /workspace/electrs-neurai
-COPY . .
 
 RUN cargo build --release --locked --bin electrs && \
     strip target/release/electrs

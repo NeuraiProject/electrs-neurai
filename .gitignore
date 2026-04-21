@@ -1,16 +1,27 @@
-target
-/db*/
-_*/
+# Rust build artifacts
+target/
+
+# Local databases & runtime data
+db*/
+data/
+*.dat
+
+# Local config / secrets
+electrs.toml
+.env
+
+# Logs
 *.log
+
+# Editor / IDE
 *.sublime*
 *~
+.idea/
+.vscode/
+
+# Python bytecode (from contrib/ scripts)
 *.pyc
-.env
-*.dat
-electrs.toml
-data/
+
+# Test fixtures fetched at runtime
 tests/bitcoin-*
 tests/bin
-.idea/
-*.txt
-*.json

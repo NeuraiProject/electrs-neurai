@@ -1,0 +1,5 @@
+# electrs-neurai secrets for the docker-compose stack.
+# Only `auth` lives here because it cannot be passed via CLI args or env vars.
+# Everything else (network, addresses, db_dir, ...) is set in docker-compose.yml.
+
+auth = "neurai:changeme"

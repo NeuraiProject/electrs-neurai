@@ -1,0 +1,154 @@
+services:
+  neuraid:
+    build:
+      context: ./node
+      dockerfile: Dockerfile
+      args:
+        BRANCH: DePIN-Test
+    image: neuraiproject/neuraid:testnet-1.0.0
+    container_name: neurai-testnet-node
+    restart: unless-stopped
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+    environment:
+      # ── Network ──────────────────────────────────────────────────────────
+      NEURAI_TESTNET: "1"
+      # NEURAI_LISTEN: 1 to accept inbound P2P connections
+      NEURAI_LISTEN: "0"
+      NEURAI_REST: "1"
+
+      # ── RPC ──────────────────────────────────────────────────────────────
+      NEURAI_RPC_USER: "neurai"
+      NEURAI_RPC_PASSWORD: "changeme"
+      # NEURAI_RPC_ALLOW_IP: restrict in production (e.g. 127.0.0.1/32)
+      NEURAI_RPC_ALLOW_IP: "0.0.0.0/0"
+      NEURAI_RPC_PORT: "19101"
+      NEURAI_RPC_TIMEOUT: "240"
+      NEURAI_RPC_WORKQUEUE: "64"
+      NEURAI_RPC_THREADS: "8"
+
+      # ── Wallet ───────────────────────────────────────────────────────────
+      # NEURAI_DISABLE_WALLET: 1=disabled | 0=enabled
+      NEURAI_DISABLE_WALLET: "1"
+
+      # ── Indexes ──────────────────────────────────────────────────────────
+      NEURAI_TXINDEX: "1"
+      NEURAI_ASSETINDEX: "1"
+      NEURAI_ADDRESSINDEX: "1"
+      NEURAI_TIMESTAMPINDEX: "1"
+      NEURAI_SPENTINDEX: "1"
+      NEURAI_PUBKEYINDEX: "1"
+
+      # ── Data ─────────────────────────────────────────────────────────────
+      NEURAI_DATADIR: "/data"
+
+    volumes:
+      - neurai_data:/data
+
+    ports:
+      - "19100:19100"   # testnet P2P
+      - "19101:19101"   # testnet RPC
+
+    networks:
+      - neurai_net
+
+    healthcheck:
+      test: ["CMD", "neurai-cli", "-datadir=/data", "getblockchaininfo"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  electrs:
+    build:
+      context: ./electrs
+      dockerfile: Dockerfile
+      args:
+        REPO_URL: https://github.com/NeuraiProject/electrs-neurai.git
+        REPO_REF: master
+    image: neuraiproject/electrs-neurai:testnet-1.0.0
+    container_name: neurai-testnet-electrs
+    restart: unless-stopped
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+    # `auth` (RPC user:password) lives in ./electrs/config.toml because it
+    # cannot be passed via CLI args or env vars. All other settings are
+    # supplied via `command:` below to override the image's default CMD.
+    volumes:
+      - electrs_data:/var/lib/electrs-neurai
+      - ./electrs/config.toml:/etc/electrs/config.toml:ro
+
+    command:
+      - "--network"
+      - "testnet"
+      - "--db-dir"
+      - "/var/lib/electrs-neurai"
+      - "--daemon-rpc-addr"
+      - "neuraid:19101"
+      - "--daemon-p2p-addr"
+      - "neuraid:19100"
+      - "--electrum-rpc-addr"
+      - "0.0.0.0:60001"
+      - "--log-filters"
+      - "INFO"
+
+    ports:
+      - "60001:60001"   # Electrum testnet RPC
+
+    networks:
+      - neurai_net
+
+    depends_on:
+      neuraid:
+        condition: service_healthy
+
+  electrs-tls:
+    build:
+      context: ./electrs-tls
+      dockerfile: Dockerfile
+    image: neuraiproject/electrs-neurai-tls:1.0.0
+    container_name: neurai-testnet-electrs-tls
+    restart: unless-stopped
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+    # Mount your own cert.pem / key.pem at /etc/electrs-tls to skip the
+    # self-signed cert auto-generated on first start.
+    volumes:
+      - electrs_tls_certs:/etc/electrs-tls
+
+    ports:
+      - "50002:50002"   # ssl://  (Electrum native + TLS)
+      - "50004:50004"   # wss://  (Electrum WebSocket + TLS, for browser wallets)
+
+    networks:
+      - neurai_net
+
+    depends_on:
+      - electrs
+
+volumes:
+  neurai_data:
+    driver: local
+  electrs_data:
+    driver: local
+  electrs_tls_certs:
+    driver: local
+
+networks:
+  neurai_net:
+    driver: bridge
