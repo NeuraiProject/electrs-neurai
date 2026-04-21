@@ -27,14 +27,29 @@ enum PollResult {
     Retry,
 }
 
+/// Minimal view over `getblockchaininfo` — only the fields electrs actually needs.
+///
+/// Neurai's daemon still follows the pre-Bitcoin-0.19 RPC shape (`softforks` is an array
+/// and `initialblockdownload` may be missing), so deserializing into
+/// `bitcoincore_rpc::json::GetBlockchainInfoResult` fails. We ignore the incompatible
+/// fields and fall back to `false` for a missing IBD flag.
+#[derive(Debug, serde::Deserialize)]
+struct BlockchainInfo {
+    blocks: u64,
+    headers: u64,
+    #[serde(rename = "initialblockdownload", default)]
+    initial_block_download: bool,
+    pruned: bool,
+}
+
 fn rpc_poll(client: &mut Client, skip_block_download_wait: bool) -> PollResult {
-    match client.get_blockchain_info() {
+    match client.call::<BlockchainInfo>("getblockchaininfo", &[]) {
         Ok(info) => {
             if skip_block_download_wait {
                 // Neurai daemon RPC is available, don't wait for block download to finish
                 return PollResult::Done(Ok(()));
             }
-            let left_blocks = info.headers - info.blocks;
+            let left_blocks = info.headers.saturating_sub(info.blocks);
             if info.initial_block_download || left_blocks > 0 {
                 info!(
                     "waiting for {} blocks to download{}",
@@ -135,7 +150,7 @@ impl Daemon {
         if !network_info.network_active {
             bail!("electrs-neurai requires an active Neurai daemon p2p network");
         }
-        let info = rpc.get_blockchain_info()?;
+        let info = rpc.call::<BlockchainInfo>("getblockchaininfo", &[])?;
         if info.pruned {
             bail!("electrs-neurai requires a non-pruned Neurai daemon");
         }

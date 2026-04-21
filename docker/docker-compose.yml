@@ -6,7 +6,7 @@ services:
       args:
         BRANCH: DePIN-Test
     image: neuraiproject/neuraid:testnet-1.0.0
-    container_name: neurai-testnet-node
+    container_name: neurai-electrs-testnet-node
     restart: unless-stopped
 
     logging:
