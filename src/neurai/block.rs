@@ -143,27 +143,59 @@ fn kawpow_input_hash(header: &NeuraiBlockHeader, height: u32) -> [u8; 32] {
     *h.as_byte_array()
 }
 
-/// Compute the KAWPOW final hash of a post-activation header, matching
-/// `KAWPOWHash_OnlyMix(*this)` in Neurai core.
-fn hash_kawpow_header(header: &NeuraiBlockHeader, k: KawpowFields) -> BlockHash {
-    let input = kawpow_input_hash(header, k.height);
-    let (_mix, hash) = hasherkawpow_sys::hash_kawpow(&input, &k.nonce64, k.height as i32);
-    BlockHash::from_raw_hash(sha256d::Hash::from_byte_array(hash))
+/// Reverse 32 bytes in place — converts between Bitcoin-family "internal little-endian"
+/// storage and the "display big-endian" byte order the progpow FFI expects.
+///
+/// Neurai core passes hashes through `.GetHex()` + `to_hash256(...)` before calling
+/// `progpow::hash_no_verify` / `verify`, which effectively reverses the bytes; we have
+/// to do the same thing to reach the same hash output from the FFI.
+fn reverse32(b: &[u8; 32]) -> [u8; 32] {
+    let mut r = *b;
+    r.reverse();
+    r
 }
 
-/// Verify that the header's declared `mix_hash` and computed block hash are consistent
-/// with KAWPOW. Returns `true` for non-KAWPOW headers (nothing to verify).
-pub fn verify_kawpow_header(header: &NeuraiBlockHeader, claimed_hash: &BlockHash) -> bool {
+/// Compute the KAWPOW final hash of a post-activation header, matching
+/// `KAWPOWHash_OnlyMix(*this)` in Neurai core.
+///
+/// Uses `kawpow_hash_no_verify`, which derives the final hash from the mix stored in
+/// the header instead of re-running ProgPoW to recompute the mix. This is what
+/// `CBlockHeader::GetHash()` in Neurai does for the on-chain block hash — using
+/// the full `hash_kawpow` would produce a different (and wrong) value unless we
+/// verified and re-hashed ourselves.
+fn hash_kawpow_header(header: &NeuraiBlockHeader, k: KawpowFields) -> BlockHash {
+    let input_le = kawpow_input_hash(header, k.height);
+    // Neurai does `to_hash256(uint256.GetHex())` before calling progpow, which reverses
+    // the bytes between internal LE and the BE layout progpow reads. Mirror that here.
+    let input_be = reverse32(&input_le);
+    let mix_be = reverse32(&k.mix_hash);
+    let hash_be = hasherkawpow_sys::kawpow_hash_no_verify(
+        &input_be,
+        &k.nonce64,
+        k.height as i32,
+        &mix_be,
+    );
+    // Reverse back: BlockHash stores bytes in internal LE order.
+    BlockHash::from_raw_hash(sha256d::Hash::from_byte_array(reverse32(&hash_be)))
+}
+
+/// Verify that the header's declared `mix_hash` is the one ProgPoW would compute for
+/// this (header, nonce, height). Returns `true` for non-KAWPOW headers (nothing to
+/// verify). The `claimed_hash` argument is accepted for symmetry with legacy callers
+/// but isn't part of the check — the mix is what authenticates the PoW.
+pub fn verify_kawpow_header(header: &NeuraiBlockHeader, _claimed_hash: &BlockHash) -> bool {
     let Some(k) = header.kawpow else {
         return true;
     };
-    let input = kawpow_input_hash(header, k.height);
+    let input_be = reverse32(&kawpow_input_hash(header, k.height));
+    let mix_be = reverse32(&k.mix_hash);
+    let mut hash_out = [0u8; 32];
     hasherkawpow_sys::verify_kawpow(
-        &input,
+        &input_be,
         &k.nonce64,
         k.height as i32,
-        &k.mix_hash,
-        claimed_hash.as_raw_hash().as_byte_array(),
+        &mix_be,
+        &mut hash_out,
     )
 }
 

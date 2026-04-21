@@ -38,16 +38,16 @@ unsafe extern "C" {
         header_hash_bytes: *const u8,
         nonce64_ptr: *const u64,
         block_height: i32,
-        mix_out_bytes: *const u8,
-        hash_out_bytes: *const u8,
+        mix_out_bytes: *mut u8,
+        hash_out_bytes: *mut u8,
     );
 
     fn verify(
         header_hash_bytes: *const u8,
         nonce64_ptr: *const u64,
         block_height: i32,
-        mix_out_bytes: *const u8,
-        hash_out_bytes: *const u8,
+        mix_hash_bytes: *const u8,
+        hash_out_bytes: *mut u8,
     ) -> bool;
 }
 
@@ -97,6 +97,46 @@ pub fn hash_kawpow(header_hash: &[u8; 32], nonce: &u64, block_height: i32) -> ([
     (mix_out, hash_out)
 }
 
+/// Compute the KawPow final hash **from an existing `mix_hash`** (no PoW verification).
+///
+/// This is the "hash_no_verify" variant of ProgPoW: it reuses the mix digest stored
+/// in the block header instead of recomputing it from scratch. In the Neurai / Ravencoin
+/// codebase this is what `CBlockHeader::GetHash()` (via `KAWPOWHash_OnlyMix`) returns,
+/// so it's the on-chain block hash.
+///
+/// # Arguments
+///
+/// * `header_hash` — 32 bytes of `SHA256d(version || prev || merkle || nTime || nBits || nHeight)`.
+/// * `nonce` — the 64-bit header nonce (`nNonce64`).
+/// * `block_height` — the header's `nHeight` field.
+/// * `mix_hash` — the 32-byte mix digest stored in the header.
+///
+/// # Returns
+///
+/// The 32-byte final hash (internal little-endian byte order, like every other
+/// Bitcoin-family hash).
+pub fn kawpow_hash_no_verify(
+    header_hash: &[u8; 32],
+    nonce: &u64,
+    block_height: i32,
+    mix_hash: &[u8; 32],
+) -> [u8; 32] {
+    let mut hash_out = [0u8; 32];
+    unsafe {
+        // The C `verify` helper writes `hash_out` from (state2, mix_hash) before
+        // comparing the recomputed mix; discarding the bool gives us exactly the
+        // "no_verify" semantics. See src/ethash/progpow.cpp::verify.
+        let _ = verify(
+            header_hash.as_ptr(),
+            nonce,
+            block_height,
+            mix_hash.as_ptr(),
+            hash_out.as_mut_ptr(),
+        );
+    }
+    hash_out
+}
+
 /// Verifies a KawPow hash result.
 ///
 /// # Arguments
@@ -136,21 +176,18 @@ pub fn verify_kawpow(
     header_hash: &[u8; 32],
     nonce: &u64,
     block_height: i32,
-    mix_out: &[u8; 32],
-    hash_out: &[u8; 32],
+    mix_hash: &[u8; 32],
+    hash_out: &mut [u8; 32],
 ) -> bool {
-    let valid;
     unsafe {
-        valid = verify(
+        verify(
             header_hash.as_ptr(),
             nonce,
             block_height,
-            mix_out.as_ptr(),
-            hash_out.as_ptr(),
-        );
+            mix_hash.as_ptr(),
+            hash_out.as_mut_ptr(),
+        )
     }
-
-    valid
 }
 
 #[cfg(test)]
@@ -220,14 +257,15 @@ mod tests {
         let expected_hash = "0000000718ba5143286c46f44eee668fdf59b8eba810df21e4e2f4ec9538fc20";
 
         let header_hash_arr: [u8; 32] = header_hash.try_into().unwrap();
-        let (mix, hash) = hash_kawpow(&header_hash_arr, &nonce, block_height);
+        let (mix, _hash) = hash_kawpow(&header_hash_arr, &nonce, block_height);
+        let mut hash_out = [0u8; 32];
 
-        let valid = verify_kawpow(&header_hash_arr, &nonce, block_height, &mix, &hash);
+        let valid = verify_kawpow(&header_hash_arr, &nonce, block_height, &mix, &mut hash_out);
         assert!(valid, "Verification failed");
         assert_eq!(
-            bytes_to_hex(&hash),
+            bytes_to_hex(&hash_out),
             expected_hash,
-            "Verified hash output does not match original hash"
+            "Verify-populated hash output does not match the mined hash"
         );
     }
 
@@ -240,16 +278,35 @@ mod tests {
 
         let header_hash_arr: [u8; 32] = header_hash.try_into().unwrap();
         let (mix, _hash) = hash_kawpow(&header_hash_arr, &nonce, block_height);
-        let hash_out_arr: [u8; 32] = [0u8; 32];
+        let mut hash_out = [0u8; 32];
 
         let iterations = 1000;
         let start = Instant::now();
         for _ in 0..iterations {
-            let valid = verify_kawpow(&header_hash_arr, &nonce, block_height, &mix, &hash_out_arr);
+            let valid =
+                verify_kawpow(&header_hash_arr, &nonce, block_height, &mix, &mut hash_out);
             assert!(valid, "Verification failed");
         }
         let elapsed = start.elapsed().as_millis();
         let verify_ps = (iterations as f64) / (elapsed as f64) * 1000.0;
         println!("verify/sec = {}", verify_ps);
+    }
+
+    #[test]
+    fn test_kawpow_hash_no_verify_matches_hash_kawpow() {
+        // Given a mined (mix, hash) pair, `kawpow_hash_no_verify` with the correct mix
+        // must produce the same final hash as `hash_kawpow`. This is the OnlyMix path
+        // that Neurai's `CBlockHeader::GetHash()` uses on-chain.
+        let header_hash =
+            hex_to_bytes("63543d3913fe56e6720c5e61e8d208d05582875822628f483279a3e8d9c9a8b3");
+        let nonce = hex_to_le_u64("88a23b0033eb959b");
+        let block_height = 262523i32;
+        let header_hash_arr: [u8; 32] = header_hash.try_into().unwrap();
+
+        let (mix, hash) = hash_kawpow(&header_hash_arr, &nonce, block_height);
+        let no_verify_hash =
+            kawpow_hash_no_verify(&header_hash_arr, &nonce, block_height, &mix);
+
+        assert_eq!(no_verify_hash, hash);
     }
 }
