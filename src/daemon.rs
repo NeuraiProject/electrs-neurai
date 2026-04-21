@@ -27,6 +27,20 @@ enum PollResult {
     Retry,
 }
 
+/// Minimal view over `getmempoolinfo`. Neurai's response omits fields that
+/// `bitcoincore_rpc::json::GetMempoolInfoResult` requires (`loaded`, `total_fee`,
+/// `minrelaytxfee`, `unbroadcastcount`), so we deserialize only what electrs reads.
+/// Missing `loaded` defaults to `true` — the daemon answered, so the mempool is loaded.
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct MempoolInfo {
+    #[serde(default = "default_true")]
+    pub loaded: Option<bool>,
+}
+
+fn default_true() -> Option<bool> {
+    Some(true)
+}
+
 /// Minimal view over `getblockchaininfo` — only the fields electrs actually needs.
 ///
 /// Neurai's daemon still follows the pre-Bitcoin-0.19 RPC shape (`softforks` is an array
@@ -236,9 +250,9 @@ impl Daemon {
             .tx)
     }
 
-    pub(crate) fn get_mempool_info(&self) -> Result<json::GetMempoolInfoResult> {
+    pub(crate) fn get_mempool_info(&self) -> Result<MempoolInfo> {
         self.rpc
-            .get_mempool_info()
+            .call::<MempoolInfo>("getmempoolinfo", &[])
             .context("failed to get mempool info")
     }
 

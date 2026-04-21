@@ -349,13 +349,15 @@ fn build_version_message() -> NetworkMessage {
 
     let services = p2p::ServiceFlags::NONE;
 
-    // Neurai's P2P handshake rejects peers advertising a protocol version below 70025
-    // ("Version must be 70025 or greater"), so we can't use rust-bitcoin's default
-    // `p2p::PROTOCOL_VERSION` (70001). All messages we exchange after the handshake
-    // (version/verack/getheaders/getdata/inv/block/tx/ping/pong) are protocol-version
-    // agnostic for our use case.
+    // Neurai's P2P handshake runs three cascaded version checks (see
+    // src/net_processing.cpp in the daemon):
+    //   1. nVersion < MIN_PEER_PROTO_VERSION (70025)            → always
+    //   2. nVersion < MESSAGING_RESTRICTED_ASSETS_VERSION (70026) → if Rip5 active
+    //   3. nVersion < KAWPOW_VERSION (70027)                    → if transfer scripts deployed
+    // All three softforks are active on mainnet and testnet. Match the daemon's own
+    // PROTOCOL_VERSION (70028) to satisfy them with margin.
     NetworkMessage::Version(message_network::VersionMessage {
-        version: 70025,
+        version: 70028,
         services,
         timestamp,
         receiver: address::Address::new(&addr, services),
@@ -392,9 +394,40 @@ impl RawNetworkMessage {
                 ParsedNetworkMessage::Headers(headers)
             }
             "ping" => ParsedNetworkMessage::Ping(Decodable::consensus_decode(&mut raw)?),
-            "pong" => ParsedNetworkMessage::Ignored,
-            "addr" => ParsedNetworkMessage::Ignored,
-            "alert" => ParsedNetworkMessage::Ignored,
+            // Optional negotiation / informational messages we don't need to act on.
+            // electrs is a passive consumer (it asks for headers/blocks and reads inv),
+            // so things like compact-block params, fee filters, peer-list gossip, or
+            // the daemon's hints about how it wants to be talked to are all safe to drop.
+            "pong"
+            | "addr"
+            | "addrv2"
+            | "sendaddrv2"
+            | "alert"
+            | "sendheaders"
+            | "sendcmpct"
+            | "cmpctblock"
+            | "blocktxn"
+            | "getblocktxn"
+            | "feefilter"
+            | "wtxidrelay"
+            | "notfound"
+            | "getheaders"
+            | "getdata"
+            | "getaddr"
+            | "mempool"
+            | "filterload"
+            | "filteradd"
+            | "filterclear"
+            | "merkleblock" => ParsedNetworkMessage::Ignored,
+            // The daemon sends `reject` for protocol errors (e.g. obsolete-version
+            // disconnects). Don't crash the loop on these — log and move on.
+            "reject" => {
+                warn!(
+                    "received reject from Neurai daemon: payload={:?}",
+                    self.raw
+                );
+                ParsedNetworkMessage::Ignored
+            }
             _ => bail!(
                 "unsupported message: command={}, payload={:?}",
                 self.cmd,
