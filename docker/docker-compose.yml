@@ -18,8 +18,8 @@ services:
     environment:
       # ── Network ──────────────────────────────────────────────────────────
       NEURAI_TESTNET: "1"
-      # NEURAI_LISTEN: 1 to accept inbound P2P connections
-      NEURAI_LISTEN: "0"
+      # NEURAI_LISTEN must be 1: electrs needs P2P to bulk-download blocks from the daemon.
+      NEURAI_LISTEN: "1"
       NEURAI_REST: "1"
 
       # ── RPC ──────────────────────────────────────────────────────────────
