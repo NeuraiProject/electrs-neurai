@@ -349,8 +349,13 @@ fn build_version_message() -> NetworkMessage {
 
     let services = p2p::ServiceFlags::NONE;
 
+    // Neurai's P2P handshake rejects peers advertising a protocol version below 70025
+    // ("Version must be 70025 or greater"), so we can't use rust-bitcoin's default
+    // `p2p::PROTOCOL_VERSION` (70001). All messages we exchange after the handshake
+    // (version/verack/getheaders/getdata/inv/block/tx/ping/pong) are protocol-version
+    // agnostic for our use case.
     NetworkMessage::Version(message_network::VersionMessage {
-        version: p2p::PROTOCOL_VERSION,
+        version: 70025,
         services,
         timestamp,
         receiver: address::Address::new(&addr, services),
