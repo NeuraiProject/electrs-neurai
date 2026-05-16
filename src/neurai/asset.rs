@@ -25,6 +25,8 @@ use anyhow::{bail, Context, Result};
 
 pub const OP_XNA_ASSET: u8 = 0xc0;
 pub const OP_DROP: u8 = 0x75;
+pub const OP_RESERVED: u8 = 0x50;
+pub const OP_1: u8 = 0x51;
 
 /// ASCII "rvn", retained from Ravencoin for protocol compatibility.
 pub const ASSET_MAGIC: [u8; 3] = *b"rvn";
@@ -33,6 +35,21 @@ pub const TYPE_NEW: u8 = b'q'; // 0x71 — new asset issuance
 pub const TYPE_TRANSFER: u8 = b't'; // 0x74 — asset transfer
 pub const TYPE_REISSUE: u8 = b'r'; // 0x72 — reissue
 pub const TYPE_OWNER: u8 = b'o'; // 0x6f — owner (!-suffix) asset
+
+// ─── name-prefix indicators ───────────────────────────────────────────────────
+
+/// Restricted-asset name prefix (`$ABC`).
+pub const RESTRICTED_PREFIX: u8 = b'$';
+/// Qualifier-asset name prefix (`#ABC` or `#ABC/#XYZ`).
+pub const QUALIFIER_PREFIX: u8 = b'#';
+/// DePIN / Soulbound asset name prefix (`&ABC`). Testnet/regtest-only in the
+/// daemon until a future mainnet activation height.
+pub const DEPIN_PREFIX: u8 = b'&';
+pub const OWNER_SUFFIX: u8 = b'!';
+pub const UNIQUE_SEPARATOR: u8 = b'#';
+pub const MSG_CHANNEL_SEPARATOR: u8 = b'~';
+pub const VOTE_SEPARATOR: u8 = b'^';
+pub const SUB_SEPARATOR: u8 = b'/';
 
 /// Markers preceding a 32-byte reference in asset payloads.
 const IPFS_MARKER: u8 = 0x12; // IPFS SHA2-256 content hash
@@ -159,8 +176,249 @@ fn is_p2pkh_base(bytes: &[u8]) -> bool {
 
 fn is_op1_32_base(bytes: &[u8]) -> bool {
     bytes.len() >= 34
-        && bytes[0] == 0x51   // OP_1
+        && bytes[0] == OP_1
         && bytes[1] == 0x20   // push 32 bytes
+}
+
+// ─── unspendable null-asset scripts (OP_XNA_ASSET at front) ───────────────────
+
+/// Address (or AuthScript commitment) being tagged/freed by a null-asset
+/// script. Mirrors the daemon's `CTxDestination` minus AuthScript-vs-script-hash
+/// disambiguation, which the indexer doesn't need.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedDestination {
+    /// Legacy 20-byte hash (P2PKH key-id or P2SH script-id).
+    Legacy([u8; 20]),
+    /// NIP-025 AuthScript v1 32-byte commitment.
+    AuthScript([u8; 32]),
+}
+
+/// Parsed unspendable null-asset metadata script.
+///
+/// These outputs start with `OP_XNA_ASSET` and carry asset-system metadata
+/// (qualifier tagging, restricted-asset freezing, verifier strings). They are
+/// unspendable — the daemon treats them as such in `CScript::IsUnspendable`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NullAssetScript {
+    /// Tag/untag a destination with a qualifier, freeze/unfreeze a restricted
+    /// asset at a destination, or assign DePIN ownership.
+    AddressTag {
+        destination: TaggedDestination,
+        asset_name: String,
+        flag: i8,
+    },
+    /// Globally freeze/unfreeze a restricted asset.
+    GlobalRestriction {
+        asset_name: String,
+        flag: i8,
+    },
+    /// Set/replace the verifier string for a restricted asset.
+    Verifier {
+        verifier_string: String,
+    },
+}
+
+/// Returns `true` if the script is an unspendable null-asset script —
+/// i.e. its first byte is `OP_XNA_ASSET`. Mirrors the daemon's
+/// `CScript::IsUnspendable` check for OP_XNA_ASSET-prefixed scripts.
+pub fn is_null_asset_script(bytes: &[u8]) -> bool {
+    matches!(bytes.first(), Some(&OP_XNA_ASSET))
+}
+
+/// Parse a null-asset script. Returns `None` if the script is not a
+/// well-formed null-asset script.
+///
+/// Recognised shapes:
+/// ```text
+/// AddressTag (legacy):    OP_XNA_ASSET 0x14 <20-byte hash>      <push><asset_name varstr><flag i8>
+/// AddressTag (AuthScript): OP_XNA_ASSET OP_1 0x20 <32-byte cmt>  <push><asset_name varstr><flag i8>
+/// GlobalRestriction:      OP_XNA_ASSET OP_RESERVED OP_RESERVED  <push><asset_name varstr><flag i8>
+/// Verifier:               OP_XNA_ASSET OP_RESERVED              <push><verifier varstr>
+/// ```
+pub fn parse_null_asset_script(bytes: &[u8]) -> Option<NullAssetScript> {
+    if !is_null_asset_script(bytes) {
+        return None;
+    }
+
+    // Global restriction: OP_XNA_ASSET OP_RESERVED OP_RESERVED <push><data>
+    if bytes.len() > 3 && bytes[1] == OP_RESERVED && bytes[2] == OP_RESERVED {
+        let inner = read_push(&bytes[3..])?;
+        let (asset_name, flag) = read_name_and_flag(inner)?;
+        return Some(NullAssetScript::GlobalRestriction { asset_name, flag });
+    }
+
+    // Verifier: OP_XNA_ASSET OP_RESERVED <push><data>   (byte 2 must NOT be OP_RESERVED)
+    if bytes.len() > 2 && bytes[1] == OP_RESERVED {
+        let inner = read_push(&bytes[2..])?;
+        let verifier_string = read_varstr(inner)?;
+        return Some(NullAssetScript::Verifier { verifier_string });
+    }
+
+    // AuthScript address tag: OP_XNA_ASSET OP_1 0x20 <32 bytes> <push><data>
+    if bytes.len() > 35 && bytes[1] == OP_1 && bytes[2] == 0x20 {
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&bytes[3..35]);
+        let inner = read_push(&bytes[35..])?;
+        let (asset_name, flag) = read_name_and_flag(inner)?;
+        return Some(NullAssetScript::AddressTag {
+            destination: TaggedDestination::AuthScript(hash),
+            asset_name,
+            flag,
+        });
+    }
+
+    // Legacy address tag: OP_XNA_ASSET 0x14 <20 bytes> <push><data>
+    if bytes.len() > 22 && bytes[1] == 0x14 {
+        let mut hash = [0u8; 20];
+        hash.copy_from_slice(&bytes[2..22]);
+        let inner = read_push(&bytes[22..])?;
+        let (asset_name, flag) = read_name_and_flag(inner)?;
+        return Some(NullAssetScript::AddressTag {
+            destination: TaggedDestination::Legacy(hash),
+            asset_name,
+            flag,
+        });
+    }
+
+    None
+}
+
+// ─── asset-name classification ────────────────────────────────────────────────
+
+/// Coarse category of an asset name, mirroring the daemon's `AssetType` enum.
+///
+/// This is a lightweight prefix/separator-based classifier — full validation
+/// (character set, length limits, double-punctuation) is the daemon's job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AssetCategory {
+    Root,
+    Sub,
+    Owner,
+    Unique,
+    MsgChannel,
+    Vote,
+    Qualifier,
+    SubQualifier,
+    Restricted,
+    Depin,
+    SubDepin,
+}
+
+/// Classify an asset name by its prefix/separator characters.
+///
+/// Returns `None` for empty names. DePIN names are returned regardless of
+/// network gating — use [`is_category_active`] to check whether the daemon
+/// would actually accept them at a given height.
+pub fn classify_asset_name(name: &str) -> Option<AssetCategory> {
+    if name.is_empty() {
+        return None;
+    }
+    let first = name.as_bytes()[0];
+    let last = *name.as_bytes().last().unwrap();
+    let has_slash = name.as_bytes().contains(&SUB_SEPARATOR);
+
+    Some(match first {
+        QUALIFIER_PREFIX => {
+            if has_slash {
+                AssetCategory::SubQualifier
+            } else {
+                AssetCategory::Qualifier
+            }
+        }
+        RESTRICTED_PREFIX => AssetCategory::Restricted,
+        DEPIN_PREFIX => {
+            if has_slash {
+                AssetCategory::SubDepin
+            } else {
+                AssetCategory::Depin
+            }
+        }
+        _ => {
+            if last == OWNER_SUFFIX {
+                AssetCategory::Owner
+            } else if name.as_bytes().contains(&UNIQUE_SEPARATOR) {
+                AssetCategory::Unique
+            } else if name.as_bytes().contains(&MSG_CHANNEL_SEPARATOR) {
+                AssetCategory::MsgChannel
+            } else if name.as_bytes().contains(&VOTE_SEPARATOR) {
+                AssetCategory::Vote
+            } else if has_slash {
+                AssetCategory::Sub
+            } else {
+                AssetCategory::Root
+            }
+        }
+    })
+}
+
+/// Returns `true` if the asset category is enabled at `height` for the network
+/// described by `depin_activation`. Only DePIN categories are network-gated;
+/// every other category is always active.
+pub fn is_category_active(
+    cat: AssetCategory,
+    depin_activation: Option<u32>,
+    height: u32,
+) -> bool {
+    match cat {
+        AssetCategory::Depin | AssetCategory::SubDepin => match depin_activation {
+            Some(h) => height >= h,
+            None => false,
+        },
+        _ => true,
+    }
+}
+
+// ─── helpers for null-asset parsing ───────────────────────────────────────────
+
+/// Read a single push opcode (direct-push `0x01..=0x4b` or `OP_PUSHDATA1..4`)
+/// and return the pushed bytes.
+fn read_push(bytes: &[u8]) -> Option<&[u8]> {
+    let op = *bytes.first()?;
+    match op {
+        1..=0x4b => {
+            let n = op as usize;
+            let rest = &bytes[1..];
+            if rest.len() < n { return None; }
+            Some(&rest[..n])
+        }
+        0x4c => {
+            // OP_PUSHDATA1: next 1 byte is length
+            let rest = &bytes[1..];
+            let n = *rest.first()? as usize;
+            let rest = &rest[1..];
+            if rest.len() < n { return None; }
+            Some(&rest[..n])
+        }
+        0x4d => {
+            // OP_PUSHDATA2: next 2 bytes LE are length
+            if bytes.len() < 3 { return None; }
+            let n = u16::from_le_bytes([bytes[1], bytes[2]]) as usize;
+            let rest = &bytes[3..];
+            if rest.len() < n { return None; }
+            Some(&rest[..n])
+        }
+        _ => None,
+    }
+}
+
+/// Read a `<varstr asset_name><i8 flag>` blob, exactly as `CNullAssetTxData`
+/// serializes itself.
+fn read_name_and_flag(mut data: &[u8]) -> Option<(String, i8)> {
+    let name = read_string(&mut data).ok()?;
+    if data.len() != 1 {
+        return None;
+    }
+    Some((name, data[0] as i8))
+}
+
+/// Read just a varstr (compact-size length + UTF-8 bytes), used for the
+/// verifier-string null-asset payload.
+fn read_varstr(mut data: &[u8]) -> Option<String> {
+    let s = read_string(&mut data).ok()?;
+    if !data.is_empty() {
+        return None;
+    }
+    Some(s)
 }
 
 // ─── type-specific parsers ────────────────────────────────────────────────────
@@ -545,5 +803,240 @@ mod tests {
         body.extend_from_slice(&1i64.to_le_bytes());
         let script = wrap_p2pkh(b'z', &body); // 'z' is not a known type
         assert!(parse_asset_script(&script).is_none());
+    }
+
+    // ─── classify_asset_name ──────────────────────────────────────────────────
+
+    #[test]
+    fn classify_basic_names() {
+        assert_eq!(classify_asset_name("TOKEN"), Some(AssetCategory::Root));
+        assert_eq!(classify_asset_name("ROOT/SUB"), Some(AssetCategory::Sub));
+        assert_eq!(classify_asset_name("TOKEN!"), Some(AssetCategory::Owner));
+        assert_eq!(classify_asset_name("ROOT#TAG"), Some(AssetCategory::Unique));
+        assert_eq!(classify_asset_name("ROOT~CHAN"), Some(AssetCategory::MsgChannel));
+        assert_eq!(classify_asset_name("ROOT^VOTE"), Some(AssetCategory::Vote));
+    }
+
+    #[test]
+    fn classify_qualifier_and_subqualifier() {
+        assert_eq!(classify_asset_name("#KYC"), Some(AssetCategory::Qualifier));
+        assert_eq!(classify_asset_name("#KYC/#REGION"), Some(AssetCategory::SubQualifier));
+    }
+
+    #[test]
+    fn classify_restricted() {
+        assert_eq!(classify_asset_name("$RESTRICTED"), Some(AssetCategory::Restricted));
+    }
+
+    #[test]
+    fn classify_depin_and_subdepin() {
+        assert_eq!(classify_asset_name("&NODE"), Some(AssetCategory::Depin));
+        assert_eq!(classify_asset_name("&NODE/SENSOR"), Some(AssetCategory::SubDepin));
+    }
+
+    #[test]
+    fn classify_empty_is_none() {
+        assert_eq!(classify_asset_name(""), None);
+    }
+
+    // ─── is_category_active ───────────────────────────────────────────────────
+
+    #[test]
+    fn depin_inactive_on_mainnet_until_activation_set() {
+        // Mainnet: activation = None → DePIN never active.
+        assert!(!is_category_active(AssetCategory::Depin, None, 0));
+        assert!(!is_category_active(AssetCategory::Depin, None, 1_000_000));
+        assert!(!is_category_active(AssetCategory::SubDepin, None, 1_000_000));
+    }
+
+    #[test]
+    fn depin_active_on_testnet_from_genesis() {
+        // Testnet/regtest: activation = Some(0) → active from height 0.
+        assert!(is_category_active(AssetCategory::Depin, Some(0), 0));
+        assert!(is_category_active(AssetCategory::SubDepin, Some(0), 0));
+    }
+
+    #[test]
+    fn depin_activates_at_fork_height() {
+        // Once a mainnet fork height is set, DePIN becomes active only
+        // at or after that height.
+        assert!(!is_category_active(AssetCategory::Depin, Some(500_000), 499_999));
+        assert!(is_category_active(AssetCategory::Depin, Some(500_000), 500_000));
+        assert!(is_category_active(AssetCategory::Depin, Some(500_000), 500_001));
+    }
+
+    #[test]
+    fn non_depin_categories_unaffected_by_gating() {
+        // All non-DePIN categories are always active regardless of the gate.
+        for cat in [
+            AssetCategory::Root,
+            AssetCategory::Sub,
+            AssetCategory::Owner,
+            AssetCategory::Unique,
+            AssetCategory::MsgChannel,
+            AssetCategory::Vote,
+            AssetCategory::Qualifier,
+            AssetCategory::SubQualifier,
+            AssetCategory::Restricted,
+        ] {
+            assert!(is_category_active(cat, None, 0));
+            assert!(is_category_active(cat, Some(0), 0));
+        }
+    }
+
+    // ─── null-asset scripts ───────────────────────────────────────────────────
+
+    /// Encode a string with bitcoin's compact-size length prefix.
+    /// All test strings stay under 0xfd, so a single-byte length suffices.
+    fn varstr(s: &str) -> Vec<u8> {
+        assert!(s.len() < 0xfd);
+        let mut out = Vec::with_capacity(s.len() + 1);
+        out.push(s.len() as u8);
+        out.extend_from_slice(s.as_bytes());
+        out
+    }
+
+    fn push_blob(blob: &[u8]) -> Vec<u8> {
+        assert!(blob.len() <= 0x4b, "tests stay in direct-push range");
+        let mut out = Vec::with_capacity(blob.len() + 1);
+        out.push(blob.len() as u8);
+        out.extend_from_slice(blob);
+        out
+    }
+
+    #[test]
+    fn is_null_asset_script_detects_op_xna_prefix() {
+        assert!(is_null_asset_script(&[OP_XNA_ASSET, 0x14]));
+        assert!(is_null_asset_script(&[OP_XNA_ASSET]));
+        assert!(!is_null_asset_script(&[0x76, 0xa9]));
+        assert!(!is_null_asset_script(&[]));
+    }
+
+    #[test]
+    fn parse_null_legacy_address_tag() {
+        let hash = [0x42u8; 20];
+        let mut inner = varstr("#KYC");
+        inner.push(1u8); // flag = 1 (add)
+
+        let mut script = vec![OP_XNA_ASSET, 0x14];
+        script.extend_from_slice(&hash);
+        script.extend_from_slice(&push_blob(&inner));
+
+        let parsed = parse_null_asset_script(&script).expect("parse");
+        match parsed {
+            NullAssetScript::AddressTag {
+                destination: TaggedDestination::Legacy(h),
+                asset_name,
+                flag,
+            } => {
+                assert_eq!(h, hash);
+                assert_eq!(asset_name, "#KYC");
+                assert_eq!(flag, 1);
+            }
+            other => panic!("expected legacy AddressTag, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_null_authscript_address_tag() {
+        let commitment = [0x77u8; 32];
+        let mut inner = varstr("$RESTRICT");
+        inner.push((-1i8) as u8); // freeze flag
+
+        let mut script = vec![OP_XNA_ASSET, OP_1, 0x20];
+        script.extend_from_slice(&commitment);
+        script.extend_from_slice(&push_blob(&inner));
+
+        let parsed = parse_null_asset_script(&script).expect("parse");
+        match parsed {
+            NullAssetScript::AddressTag {
+                destination: TaggedDestination::AuthScript(c),
+                asset_name,
+                flag,
+            } => {
+                assert_eq!(c, commitment);
+                assert_eq!(asset_name, "$RESTRICT");
+                assert_eq!(flag, -1);
+            }
+            other => panic!("expected AuthScript AddressTag, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_null_global_restriction() {
+        let mut inner = varstr("$GLOB");
+        inner.push(1u8);
+
+        let mut script = vec![OP_XNA_ASSET, OP_RESERVED, OP_RESERVED];
+        script.extend_from_slice(&push_blob(&inner));
+
+        let parsed = parse_null_asset_script(&script).expect("parse");
+        match parsed {
+            NullAssetScript::GlobalRestriction { asset_name, flag } => {
+                assert_eq!(asset_name, "$GLOB");
+                assert_eq!(flag, 1);
+            }
+            other => panic!("expected GlobalRestriction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_null_verifier() {
+        let inner = varstr("#KYC&#REGION_EU");
+        let mut script = vec![OP_XNA_ASSET, OP_RESERVED];
+        script.extend_from_slice(&push_blob(&inner));
+
+        let parsed = parse_null_asset_script(&script).expect("parse");
+        match parsed {
+            NullAssetScript::Verifier { verifier_string } => {
+                assert_eq!(verifier_string, "#KYC&#REGION_EU");
+            }
+            other => panic!("expected Verifier, got {other:?}"),
+        }
+    }
+
+    /// Verifier (1 OP_RESERVED) and GlobalRestriction (2 OP_RESERVED) must not
+    /// be confused: a leading `c0 50 50` is global, `c0 50 <something else>`
+    /// is a verifier.
+    #[test]
+    fn verifier_vs_global_restriction_disambiguation() {
+        // Two OP_RESERVED → GlobalRestriction
+        let mut inner = varstr("$X");
+        inner.push(0u8);
+        let mut script = vec![OP_XNA_ASSET, OP_RESERVED, OP_RESERVED];
+        script.extend_from_slice(&push_blob(&inner));
+        assert!(matches!(
+            parse_null_asset_script(&script),
+            Some(NullAssetScript::GlobalRestriction { .. })
+        ));
+
+        // One OP_RESERVED then a push → Verifier
+        let inner = varstr("verifier");
+        let mut script = vec![OP_XNA_ASSET, OP_RESERVED];
+        script.extend_from_slice(&push_blob(&inner));
+        assert!(matches!(
+            parse_null_asset_script(&script),
+            Some(NullAssetScript::Verifier { .. })
+        ));
+    }
+
+    #[test]
+    fn non_xna_script_not_null_asset() {
+        // P2PKH script must not be confused with a null-asset.
+        assert!(parse_null_asset_script(&p2pkh_prefix()).is_none());
+    }
+
+    #[test]
+    fn null_asset_with_trailing_garbage_rejected() {
+        // Extra byte after `flag` must be rejected — read_name_and_flag enforces
+        // that the inner blob ends after the flag byte.
+        let hash = [0u8; 20];
+        let mut inner = varstr("#X");
+        inner.push(1u8);
+        inner.push(0xff); // garbage
+        let mut script = vec![OP_XNA_ASSET, 0x14];
+        script.extend_from_slice(&hash);
+        script.extend_from_slice(&push_blob(&inner));
+        assert!(parse_null_asset_script(&script).is_none());
     }
 }

@@ -6,7 +6,7 @@ use bitcoin_slices::{bsl, Visit, Visitor};
 use std::ops::ControlFlow;
 use std::thread;
 
-use crate::neurai::asset::{parse_asset_script, AssetData, AssetOutput, IpfsRef};
+use crate::neurai::asset::{is_null_asset_script, parse_asset_script, AssetData, AssetOutput, IpfsRef};
 use crate::neurai::block::neurai_to_bsl_block;
 use crate::neurai::NetworkParams;
 use crate::{
@@ -400,7 +400,12 @@ fn index_single_block(
         fn visit_tx_out(&mut self, _vout: usize, tx_out: &bsl::TxOut) -> ControlFlow<()> {
             let script_bytes = tx_out.script_pubkey();
             let script = bitcoin::Script::from_bytes(script_bytes);
-            if !script.is_op_return() {
+            // Skip unspendable outputs:
+            //   * OP_RETURN data carriers,
+            //   * Null-asset scripts (OP_XNA_ASSET-prefixed: address tagging,
+            //     freeze/unfreeze, global restrictions, verifier strings) —
+            //     mirrors `CScript::IsUnspendable` in the daemon.
+            if !script.is_op_return() && !is_null_asset_script(script_bytes) {
                 let scripthash = ScriptHash::new(script);
                 self.batch
                     .funding_rows

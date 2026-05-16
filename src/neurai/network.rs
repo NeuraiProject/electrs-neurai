@@ -62,6 +62,14 @@ pub struct NetworkParams {
     pub block_hash_algo: BlockHashAlgo,
     pub pq_witness_enabled: bool,
     pub asset_activation_height: u32,
+    /// Height at which DePIN / Soulbound (`&`-prefixed) asset names become
+    /// valid. Mirrors the daemon's network-gated DEPIN feature.
+    ///
+    /// * `Some(h)` — activates at height `h` (`Some(0)` = active from genesis).
+    /// * `None`    — not scheduled; treat `&`-names as invalid.
+    ///
+    /// Mainnet stays `None` until a fork height is announced.
+    pub depin_assets_activation_height: Option<u32>,
     pub daemon_dir_subdir: Option<&'static str>,
     pub db_subdir: &'static str,
     /// Known block hash (raw, little-endian internal byte order) of the genesis block.
@@ -138,6 +146,8 @@ static MAINNET: LazyLock<NetworkParams> = LazyLock::new(|| NetworkParams {
     block_hash_algo: BlockHashAlgo::X16rThenKawpow,
     pq_witness_enabled: false,
     asset_activation_height: 10,
+    // Mainnet fork height for DePIN assets not announced yet — keep disabled.
+    depin_assets_activation_height: None,
     daemon_dir_subdir: None,
     db_subdir: "neurai",
     genesis_hash_le: hex_be_to_le(
@@ -165,6 +175,7 @@ static TESTNET: LazyLock<NetworkParams> = LazyLock::new(|| NetworkParams {
     block_hash_algo: BlockHashAlgo::Sha256d,
     pq_witness_enabled: true,
     asset_activation_height: 1,
+    depin_assets_activation_height: Some(0),
     daemon_dir_subdir: Some("testnet"),
     db_subdir: "testnet",
     // Testnet genesis is epoch-dependent and auto-mined at daemon start; hash is obtained
@@ -192,6 +203,7 @@ static REGTEST: LazyLock<NetworkParams> = LazyLock::new(|| NetworkParams {
     block_hash_algo: BlockHashAlgo::Sha256d,
     pq_witness_enabled: true,
     asset_activation_height: 1,
+    depin_assets_activation_height: Some(0),
     daemon_dir_subdir: Some("regtest"),
     db_subdir: "regtest",
     // Regtest genesis is auto-mined; filled in at runtime via RPC.
