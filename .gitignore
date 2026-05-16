@@ -25,3 +25,4 @@ electrs.toml
 # Test fixtures fetched at runtime
 tests/bitcoin-*
 tests/bin
+tmp
