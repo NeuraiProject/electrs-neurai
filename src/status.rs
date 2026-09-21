@@ -2,13 +2,16 @@ use anyhow::Result;
 use bitcoin::{
     consensus::serialize,
     hashes::{sha256, Hash, HashEngine},
-    Amount, BlockHash, OutPoint, SignedAmount, Transaction, Txid,
+    Amount, BlockHash, OutPoint, Transaction, Txid,
 };
 use bitcoin_slices::{bsl, Visit, Visitor};
 use rayon::prelude::*;
-use serde::ser::{Serialize, Serializer};
+use serde::ser::{Serialize, SerializeStruct, Serializer};
 
-use crate::neurai::{block::neurai_to_bsl_block, NetworkParams};
+use crate::neurai::{
+    asset::{effective_script, parse_asset_script, AssetData},
+    block::neurai_to_bsl_block, NetworkParams,
+};
 
 use std::convert::TryFrom;
 use std::{
@@ -32,10 +35,47 @@ struct TxEntry {
     spent: Vec<OutPoint>,   // relevant spent outpoints
 }
 
-// Funded outputs of a transaction
+// Funded outputs of a transaction.
+//
+// `value` is always the XNA satoshi value from the txout (the dust value on
+// asset-wrapped outputs, the full native amount otherwise). `asset` carries
+// the parsed asset payload when present — used by commit 4 onward to compute
+// per-asset balance and unspent.
 struct TxOutput {
     index: u32,
     value: Amount,
+    #[allow(dead_code)] // read by per-asset Balance/UnspentEntry in commit 4
+    asset: Option<AssetTxOutput>,
+}
+
+/// Asset metadata attached to a `TxOutput`. `amount` is in the asset's own
+/// minimum units (mirrors the daemon: `OWNER_ASSET_AMOUNT = 1 * COIN`, transfer
+/// amounts already in min-units).
+//
+// Fields are read by per-asset balance/unspent logic in commit 4. Silenced
+// here so the intermediate commit builds without dead_code warnings.
+#[derive(Clone)]
+#[allow(dead_code)]
+struct AssetTxOutput {
+    name: String,
+    amount: u64,
+}
+
+/// Extract `(name, amount_in_min_units)` from a parsed asset output.
+/// Returns `None` if the amount is invalid (negative or doesn't fit `u64`).
+/// We intentionally do NOT normalize with `abs()` — a negative amount is a
+/// data corruption signal, not something to mask.
+fn asset_tx_output_of(data: &AssetData) -> Option<AssetTxOutput> {
+    let (name, amount_i64) = match data {
+        AssetData::New(a) => (a.name.clone(), a.amount),
+        AssetData::Transfer(a) => (a.name.clone(), a.amount),
+        AssetData::Reissue(a) => (a.name.clone(), a.amount),
+        // Owner tokens have no `amount` field in the script — the daemon's
+        // OWNER_ASSET_AMOUNT (= 1 * COIN = 100_000_000) is implicit.
+        AssetData::Owner(a) => (a.name.clone(), 100_000_000_i64),
+    };
+    let amount = u64::try_from(amount_i64).ok()?;
+    Some(AssetTxOutput { name, amount })
 }
 
 impl TxEntry {
@@ -142,31 +182,99 @@ pub struct ScriptHashStatus {
     statushash: Option<StatusHash>,              // computed from history
 }
 
-/// Specific scripthash balance
-/// https://electrum-protocol.readthedocs.io/en/latest/protocol-methods.html#blockchain-scripthash-get-balance
-#[derive(Default, Eq, PartialEq, Serialize)]
-pub(crate) struct Balance {
-    #[serde(with = "bitcoin::amount::serde::as_sat", rename = "confirmed")]
-    confirmed_balance: Amount,
-    #[serde(with = "bitcoin::amount::serde::as_sat", rename = "unconfirmed")]
-    mempool_delta: SignedAmount,
+/// Key used in per-asset balance maps. `"rvn"` is the conventional name for
+/// native XNA balance — kept from the Ravencoin fork at protocol level
+/// (also matches the `ASSET_MAGIC = b"rvn"` in the asset wire format).
+pub(crate) const NATIVE_ASSET_KEY: &str = "rvn";
+
+/// Per-asset balance entry. Both fields are in the asset's own minimum units
+/// (sats for XNA, `OWNER_ASSET_AMOUNT`-style units for assets). Widened to
+/// `i128` because asset amounts are `i64` and the unconfirmed delta is the
+/// signed difference of two `i64` sums — which can overflow `i64`.
+#[derive(Default, Clone, Copy, Eq, PartialEq, Debug)]
+pub(crate) struct AssetBalance {
+    pub confirmed: i128,
+    pub unconfirmed: i128,
 }
 
-/// A single unspent transaction output entry
+/// Specific scripthash balance, grouped by asset (key `"rvn"` for native).
+///
+/// Serializes with the *legacy single-asset* shape (`{"confirmed": N,
+/// "unconfirmed": M}` from the `"rvn"` entry) for backward compatibility with
+/// pre-asset clients. Commit 5 introduces the `asset` request parameter that
+/// switches to the multi-asset map shape (`{"rvn": {...}, "TOKEN": {...}}`).
+///
+/// https://electrum-protocol.readthedocs.io/en/latest/protocol-methods.html#blockchain-scripthash-get-balance
+#[derive(Default, Eq, PartialEq, Debug)]
+pub(crate) struct Balance {
+    pub by_asset: BTreeMap<String, AssetBalance>,
+}
+
+impl Balance {
+    /// Native (XNA) entry, or zeroes if no native UTXOs exist.
+    pub fn native(&self) -> AssetBalance {
+        self.by_asset
+            .get(NATIVE_ASSET_KEY)
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+impl Serialize for Balance {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Legacy wire shape: emit just the native entry. The multi-asset shape
+        // is built explicitly by the Electrum handler when the caller passes
+        // `asset=True` / list (commit 5).
+        let native = self.native();
+        let mut state = serializer.serialize_struct("Balance", 2)?;
+        state.serialize_field("confirmed", &(native.confirmed as i64))?;
+        state.serialize_field("unconfirmed", &(native.unconfirmed as i64))?;
+        state.end()
+    }
+}
+
+/// A single unspent transaction output entry.
+///
+/// Wire shape (ElectrumX-neurai compatible):
+/// - native: `{"tx_hash":..., "tx_pos":..., "height":..., "value":<xna_sats>, "asset": null}`
+/// - asset:  `{"tx_hash":..., "tx_pos":..., "height":..., "value":<asset_units>, "asset": "TOKEN"}`
+///
+/// `asset` is *always* serialized — `null` for native — so wallets can
+/// distinguish the two cases without ambiguity.
+///
 /// https://electrum-protocol.readthedocs.io/en/latest/protocol-methods.html#blockchain-scripthash-listunspent
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub(crate) struct UnspentEntry {
     height: usize, // 0 = mempool entry
     tx_hash: Txid,
     tx_pos: u32,
-    #[serde(with = "bitcoin::amount::serde::as_sat")]
-    value: Amount,
+    /// XNA satoshis when `asset.is_none()`, asset min-units when `asset.is_some()`.
+    value: u64,
+    /// `None` for native UTXOs, asset name for asset-wrapped UTXOs.
+    /// Always serialized (no `skip_serializing_if`) — matches ElectrumX shape.
+    asset: Option<String>,
+}
+
+impl UnspentEntry {
+    /// Asset name for this UTXO, or `None` if it's a native XNA UTXO.
+    pub fn asset(&self) -> Option<&str> {
+        self.asset.as_deref()
+    }
+}
+
+#[derive(Default)]
+struct OutputInfo {
+    height: usize,
+    /// XNA sats for native, asset min-units for asset outputs.
+    value: u64,
+    /// `None` for native, `Some(name)` for asset outputs.
+    asset: Option<String>,
 }
 
 #[derive(Default)]
 struct Unspent {
-    // mapping an outpoint to its value & confirmation height
-    outpoints: HashMap<OutPoint, (Amount, usize)>,
+    // mapping an outpoint to its (value, height, asset) tuple
+    outpoints: HashMap<OutPoint, OutputInfo>,
     balance: Balance,
 }
 
@@ -182,34 +290,58 @@ impl Unspent {
             .confirmed_entries(chain)
             .for_each(|e| unspent.remove(e));
 
-        unspent.balance.confirmed_balance = unspent.balance();
-        // Now, do the same over the mempool (first add funding outputs, and then remove spent ones)
+        let confirmed = unspent.balance_by_asset();
+        // Apply mempool effects (first fundings, then spends).
         status.mempool.iter().for_each(|e| unspent.insert(e, 0)); // mempool height = 0
         status.mempool.iter().for_each(|e| unspent.remove(e));
 
-        unspent.balance.mempool_delta = unspent.balance().to_signed().unwrap()
-            - unspent.balance.confirmed_balance.to_signed().unwrap();
+        let total = unspent.balance_by_asset();
 
+        // Build per-asset confirmed + unconfirmed-delta map. Keys union of
+        // both maps so we capture assets that exist only confirmed (negative
+        // delta if spent in mempool) or only in mempool (zero confirmed).
+        let keys: std::collections::BTreeSet<&String> =
+            confirmed.keys().chain(total.keys()).collect();
+        let mut by_asset: BTreeMap<String, AssetBalance> = BTreeMap::new();
+        for key in keys {
+            let c = *confirmed.get(key).unwrap_or(&0);
+            let t = *total.get(key).unwrap_or(&0);
+            by_asset.insert(
+                key.clone(),
+                AssetBalance {
+                    confirmed: c,
+                    unconfirmed: t - c,
+                },
+            );
+        }
+        unspent.balance = Balance { by_asset };
         unspent
     }
 
     fn into_entries(self) -> Vec<UnspentEntry> {
         self.outpoints
             .into_iter()
-            .map(|(outpoint, (value, height))| UnspentEntry {
-                height,
+            .map(|(outpoint, info)| UnspentEntry {
+                height: info.height,
                 tx_hash: outpoint.txid,
                 tx_pos: outpoint.vout,
-                value,
+                value: info.value,
+                asset: info.asset,
             })
             .collect()
     }
 
-    /// Total amount of unspent outputs
-    fn balance(&self) -> Amount {
-        self.outpoints
-            .values()
-            .fold(Amount::default(), |acc, v| acc + v.0)
+    /// Sum of unspent values grouped by asset (key `"rvn"` for native).
+    fn balance_by_asset(&self) -> BTreeMap<String, i128> {
+        let mut map: BTreeMap<String, i128> = BTreeMap::new();
+        for info in self.outpoints.values() {
+            let key = info
+                .asset
+                .clone()
+                .unwrap_or_else(|| NATIVE_ASSET_KEY.to_string());
+            *map.entry(key).or_insert(0_i128) += info.value as i128;
+        }
+        map
     }
 
     fn insert(&mut self, entry: &TxEntry, height: usize) {
@@ -218,7 +350,24 @@ impl Unspent {
                 txid: entry.txid,
                 vout: output.index,
             };
-            self.outpoints.insert(outpoint, (output.value, height));
+            // Asset-wrapped output: value = asset min-units, asset = Some(name).
+            // The XNA dust on an asset output is intentionally dropped — the
+            // dust is locked with the asset and not separately spendable
+            // (matches ElectrumX-neurai).
+            // Native output: value = XNA sats, asset = None.
+            let info = match &output.asset {
+                Some(a) => OutputInfo {
+                    height,
+                    value: a.amount,
+                    asset: Some(a.name.clone()),
+                },
+                None => OutputInfo {
+                    height,
+                    value: output.value.to_sat(),
+                    asset: None,
+                },
+            };
+            self.outpoints.insert(outpoint, info);
         }
     }
 
@@ -476,10 +625,16 @@ fn filter_outputs(tx: &Transaction, scripthash: ScriptHash) -> Vec<TxOutput> {
     let outputs = tx.output.iter().zip(0u32..);
     outputs
         .filter_map(move |(txo, vout)| {
-            if ScriptHash::new(&txo.script_pubkey) == scripthash {
+            // Match against the effective scripthash so asset-wrapped outputs
+            // (whose full-script hash differs from the bare-address hash) are
+            // attributed to the subscriber's bare address. See `effective_script`.
+            let bytes = txo.script_pubkey.as_bytes();
+            if ScriptHash::hash(effective_script(bytes)) == scripthash {
+                let asset = parse_asset_script(bytes).and_then(|a| asset_tx_output_of(&a.data));
                 Some(TxOutput {
                     index: vout,
                     value: txo.value,
+                    asset,
                 })
             } else {
                 None
@@ -563,11 +718,16 @@ fn filter_block_txs_outputs(
             ControlFlow::Continue(())
         }
         fn visit_tx_out(&mut self, vout: usize, tx_out: &bsl::TxOut) -> ControlFlow<()> {
-            let current = ScriptHash::hash(tx_out.script_pubkey());
+            // Use the effective scripthash (base script for asset-wrapped
+            // outputs) so the subscriber's bare-address hash matches.
+            let bytes = tx_out.script_pubkey();
+            let current = ScriptHash::hash(effective_script(bytes));
             if current == self.scripthash {
+                let asset = parse_asset_script(bytes).and_then(|a| asset_tx_output_of(&a.data));
                 self.buffer.push(TxOutput {
                     index: vout as u32,
                     value: Amount::from_sat(tx_out.value()),
+                    asset,
                 })
             }
             ControlFlow::Continue(())
@@ -724,5 +884,161 @@ mod tests {
         );
         assert_eq!(result.pos, 7);
         assert_eq!(result.result[0], outpoint);
+    }
+
+    // ─── asset_tx_output_of ─────────────────────────────────────────────────
+
+    #[test]
+    fn asset_tx_output_of_transfer_positive() {
+        use crate::neurai::asset::{AssetData, TransferAsset};
+
+        let data = AssetData::Transfer(TransferAsset {
+            name: "TOKEN".into(),
+            amount: 5_000_000_000,
+            message: None,
+        });
+        let out = super::asset_tx_output_of(&data).expect("positive amount accepted");
+        assert_eq!(out.name, "TOKEN");
+        assert_eq!(out.amount, 5_000_000_000);
+    }
+
+    #[test]
+    fn asset_tx_output_of_negative_amount_rejected() {
+        use crate::neurai::asset::{AssetData, TransferAsset};
+
+        // A negative amount is a data-corruption signal — must produce None,
+        // NOT be normalized with abs(). This preserves the anomaly instead of
+        // silently treating a corrupt asset as a positive balance.
+        let data = AssetData::Transfer(TransferAsset {
+            name: "TOKEN".into(),
+            amount: -1,
+            message: None,
+        });
+        assert!(super::asset_tx_output_of(&data).is_none());
+    }
+
+    #[test]
+    fn asset_tx_output_of_owner_uses_implicit_amount() {
+        use crate::neurai::asset::{AssetData, OwnerAsset};
+
+        let data = AssetData::Owner(OwnerAsset {
+            name: "TOKEN!".into(),
+        });
+        let out = super::asset_tx_output_of(&data).expect("owner token always valid");
+        assert_eq!(out.name, "TOKEN!");
+        // OWNER_ASSET_AMOUNT = 1 * COIN = 100_000_000 (mirrors src/assets/assets.h:36)
+        assert_eq!(out.amount, 100_000_000);
+    }
+
+    // ─── Balance / UnspentEntry wire shape ────────────────────────────────────
+
+    #[test]
+    fn balance_legacy_wire_shape_native_only() {
+        use super::{AssetBalance, Balance, NATIVE_ASSET_KEY};
+        use std::collections::BTreeMap;
+
+        let mut by_asset = BTreeMap::new();
+        by_asset.insert(
+            NATIVE_ASSET_KEY.to_string(),
+            AssetBalance {
+                confirmed: 12_345,
+                unconfirmed: -200,
+            },
+        );
+        by_asset.insert(
+            "TOKEN".to_string(),
+            AssetBalance {
+                confirmed: 99_999,
+                unconfirmed: 0,
+            },
+        );
+        let balance = Balance { by_asset };
+
+        // Legacy single-asset wire shape: only the native (rvn) entry is exposed
+        // by Balance::serialize. Multi-asset shape is built explicitly in the
+        // electrum handler when the caller asks for it (commit 5).
+        assert_eq!(
+            json!(balance),
+            json!({"confirmed": 12_345, "unconfirmed": -200})
+        );
+    }
+
+    #[test]
+    fn balance_legacy_wire_shape_empty() {
+        // No UTXOs anywhere → zero balance, never missing fields.
+        let balance = super::Balance::default();
+        assert_eq!(json!(balance), json!({"confirmed": 0, "unconfirmed": 0}));
+    }
+
+    #[test]
+    fn unspent_entry_serializes_asset_always_present_null_for_native() {
+        use super::UnspentEntry;
+
+        let entry_native = UnspentEntry {
+            height: 100,
+            tx_hash: "0000000000000000000000000000000000000000000000000000000000000001"
+                .parse()
+                .unwrap(),
+            tx_pos: 0,
+            value: 1_000_000,
+            asset: None,
+        };
+        // Native: `asset` is `null` and `value` is XNA sats.
+        assert_eq!(
+            json!(entry_native),
+            json!({
+                "height": 100,
+                "tx_hash": "0000000000000000000000000000000000000000000000000000000000000001",
+                "tx_pos": 0,
+                "value": 1_000_000,
+                "asset": null,
+            })
+        );
+
+        let entry_asset = UnspentEntry {
+            height: 100,
+            tx_hash: "0000000000000000000000000000000000000000000000000000000000000002"
+                .parse()
+                .unwrap(),
+            tx_pos: 1,
+            value: 5_000,
+            asset: Some("TOKEN".into()),
+        };
+        // Asset: `asset` is the name, `value` is in the asset's own min-units.
+        assert_eq!(
+            json!(entry_asset),
+            json!({
+                "height": 100,
+                "tx_hash": "0000000000000000000000000000000000000000000000000000000000000002",
+                "tx_pos": 1,
+                "value": 5_000,
+                "asset": "TOKEN",
+            })
+        );
+    }
+
+    #[test]
+    fn asset_tx_output_of_new_and_reissue() {
+        use crate::neurai::asset::{AssetData, NewAsset, ReissueAsset};
+
+        let new = AssetData::New(NewAsset {
+            name: "MYCOIN".into(),
+            amount: 21_000_000 * 100_000_000,
+            units: 8,
+            reissuable: true,
+            ipfs: None,
+        });
+        let out = super::asset_tx_output_of(&new).unwrap();
+        assert_eq!(out.amount, 21_000_000 * 100_000_000);
+
+        let reissue = AssetData::Reissue(ReissueAsset {
+            name: "MYCOIN".into(),
+            amount: 1_000,
+            units: 8,
+            reissuable: false,
+            ipfs: None,
+        });
+        let out = super::asset_tx_output_of(&reissue).unwrap();
+        assert_eq!(out.amount, 1_000);
     }
 }

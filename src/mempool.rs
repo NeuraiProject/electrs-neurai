@@ -270,9 +270,18 @@ impl Mempool {
             self.by_spending.insert((txi.previous_output, entry.txid));
         }
         for txo in &entry.tx.output {
-            let scripthash = ScriptHash::new(&txo.script_pubkey);
+            // For asset-wrapped outputs, hash the base script (P2PKH/AuthScript
+            // before OP_XNA_ASSET) so the mempool index keys match the
+            // scripthash a wallet subscribes to. See `effective_script` in
+            // neurai/asset.rs.
+            let bytes = txo.script_pubkey.as_bytes();
+            let asset = parse_asset_script(bytes);
+            let scripthash = match &asset {
+                Some(a) => ScriptHash::hash(&a.base_script),
+                None => ScriptHash::hash(bytes),
+            };
             self.by_funding.insert((scripthash, entry.txid)); // may have duplicates
-            if let Some(asset) = parse_asset_script(txo.script_pubkey.as_bytes()) {
+            if let Some(asset) = asset {
                 let name = asset_name_bytes(&asset.data);
                 self.by_asset_name
                     .entry(name)
@@ -296,9 +305,14 @@ impl Mempool {
             self.by_spending.remove(&(txi.previous_output, txid));
         }
         for txo in entry.tx.output {
-            let scripthash = ScriptHash::new(&txo.script_pubkey);
+            let bytes = txo.script_pubkey.as_bytes();
+            let asset = parse_asset_script(bytes);
+            let scripthash = match &asset {
+                Some(a) => ScriptHash::hash(&a.base_script),
+                None => ScriptHash::hash(bytes),
+            };
             self.by_funding.remove(&(scripthash, txid)); // may have misses
-            if let Some(asset) = parse_asset_script(txo.script_pubkey.as_bytes()) {
+            if let Some(asset) = asset {
                 let name = asset_name_bytes(&asset.data);
                 if let Some(txids) = self.by_asset_name.get_mut(&name) {
                     txids.remove(&txid);

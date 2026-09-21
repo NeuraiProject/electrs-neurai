@@ -6,7 +6,9 @@ use bitcoin_slices::{bsl, Visit, Visitor};
 use std::ops::ControlFlow;
 use std::thread;
 
-use crate::neurai::asset::{is_null_asset_script, parse_asset_script, AssetData, AssetOutput, IpfsRef};
+use crate::neurai::asset::{
+    is_null_asset_script, parse_asset_script, AssetData, AssetOutput, IpfsRef,
+};
 use crate::neurai::block::neurai_to_bsl_block;
 use crate::neurai::NetworkParams;
 use crate::{
@@ -406,11 +408,20 @@ fn index_single_block(
             //     freeze/unfreeze, global restrictions, verifier strings) —
             //     mirrors `CScript::IsUnspendable` in the daemon.
             if !script.is_op_return() && !is_null_asset_script(script_bytes) {
-                let scripthash = ScriptHash::new(script);
+                // Asset-wrapped outputs must hash on the *base* script (the
+                // P2PKH or AuthScript prefix before OP_XNA_ASSET) so that a
+                // wallet subscribed to the bare address sees the asset
+                // transfer. Compute the scripthash from the base when present,
+                // and reuse the parsed AssetOutput for the asset event.
+                let asset = parse_asset_script(script_bytes);
+                let scripthash = match &asset {
+                    Some(a) => ScriptHash::hash(&a.base_script),
+                    None => ScriptHash::hash(script_bytes),
+                };
                 self.batch
                     .funding_rows
                     .push(ScriptHashRow::row(scripthash, self.height).to_db_row());
-                if let Some(asset) = parse_asset_script(script_bytes) {
+                if let Some(asset) = asset {
                     self.index_asset_output(scripthash, asset);
                 }
             }

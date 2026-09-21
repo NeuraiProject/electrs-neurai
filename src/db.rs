@@ -108,7 +108,12 @@ struct Config {
 
 // Format 1: header rows are 120 bytes (Neurai variable-size header support).
 // Format 2: added asset_meta, asset_history, asset_funding column families.
-const CURRENT_FORMAT: u64 = 2;
+// Format 3: scripthashes for asset-wrapped outputs now hash the *base* script
+//           (P2PKH / AuthScript before OP_XNA_ASSET), matching the scripthash
+//           a wallet computes from the bare address. Pre-format-3 funding rows
+//           were keyed by the full-script hash and are unrecoverable; a full
+//           reindex is required.
+const CURRENT_FORMAT: u64 = 3;
 
 impl Default for Config {
     fn default() -> Self {

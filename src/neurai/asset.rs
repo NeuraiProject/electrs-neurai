@@ -225,6 +225,27 @@ pub fn is_null_asset_script(bytes: &[u8]) -> bool {
     matches!(bytes.first(), Some(&OP_XNA_ASSET))
 }
 
+/// Return the *effective* script slice used for scripthash computation.
+///
+/// For asset-wrapped outputs (`<base_script> OP_XNA_ASSET <payload> OP_DROP`)
+/// returns `&bytes[..base_script_len]`, so the scripthash matches the one a
+/// wallet would compute from the bare address (P2PKH or AuthScript v1).
+/// For everything else — including non-asset outputs and unspendable
+/// null-asset scripts — returns `bytes` unchanged.
+///
+/// This makes `blockchain.scripthash.subscribe` on a bare address see asset
+/// transfers to that address, instead of silently missing them because the
+/// asset-wrapped output hashes to a different scripthash.
+pub fn effective_script(bytes: &[u8]) -> &[u8] {
+    match parse_asset_script(bytes) {
+        Some(asset) => {
+            let base_len = asset.base_script.len();
+            &bytes[..base_len]
+        }
+        None => bytes,
+    }
+}
+
 /// Parse a null-asset script. Returns `None` if the script is not a
 /// well-formed null-asset script.
 ///
@@ -1024,6 +1045,103 @@ mod tests {
     fn non_xna_script_not_null_asset() {
         // P2PKH script must not be confused with a null-asset.
         assert!(parse_null_asset_script(&p2pkh_prefix()).is_none());
+    }
+
+    // ─── effective_script ─────────────────────────────────────────────────────
+
+    #[test]
+    fn effective_script_non_asset_passes_through() {
+        let p2pkh = p2pkh_prefix();
+        assert_eq!(effective_script(&p2pkh), p2pkh.as_slice());
+
+        let authscript = op1_32_prefix();
+        assert_eq!(effective_script(&authscript), authscript.as_slice());
+
+        // Random bytes (not a valid script) — also pass through unchanged.
+        let junk = vec![0x01, 0x02, 0x03, 0x04];
+        assert_eq!(effective_script(&junk), junk.as_slice());
+
+        // Empty input passes through.
+        assert_eq!(effective_script(&[]), &[] as &[u8]);
+    }
+
+    #[test]
+    fn effective_script_strips_p2pkh_asset_wrapper() {
+        // Build a valid P2PKH + OP_XNA_ASSET transfer wrapper.
+        let mut body = Vec::new();
+        body.push(4u8);
+        body.extend_from_slice(b"COIN");
+        body.extend_from_slice(&1i64.to_le_bytes());
+        let wrapped = wrap_p2pkh(TYPE_TRANSFER, &body);
+
+        // effective_script should return only the P2PKH base (25 bytes).
+        let effective = effective_script(&wrapped);
+        assert_eq!(effective, p2pkh_prefix().as_slice());
+        assert_eq!(effective.len(), 25);
+    }
+
+    #[test]
+    fn effective_script_strips_authscript_asset_wrapper() {
+        // Build a valid AuthScript (OP_1 + 0x20 + 32 bytes) + asset wrapper.
+        let mut body = Vec::new();
+        body.push(3u8);
+        body.extend_from_slice(b"NEU");
+        body.extend_from_slice(&1i64.to_le_bytes());
+        let mut payload = Vec::from(ASSET_MAGIC);
+        payload.push(TYPE_TRANSFER);
+        payload.extend_from_slice(&body);
+        let mut wrapped = op1_32_prefix();
+        wrapped.push(OP_XNA_ASSET);
+        wrapped.push(payload.len() as u8);
+        wrapped.extend_from_slice(&payload);
+        wrapped.push(OP_DROP);
+
+        let effective = effective_script(&wrapped);
+        assert_eq!(effective, op1_32_prefix().as_slice());
+        assert_eq!(effective.len(), 34);
+    }
+
+    /// Core Fase-0 invariant: a wallet subscribed to `SHA256(bare_address_script)`
+    /// must see asset transfers to that address, because the effective scripthash
+    /// of an asset-wrapped output is the scripthash of its base script.
+    #[test]
+    fn effective_script_invariant_scripthash() {
+        use bitcoin::hashes::{sha256, Hash};
+
+        // Build a P2PKH + asset transfer.
+        let mut body = Vec::new();
+        body.push(4u8);
+        body.extend_from_slice(b"COIN");
+        body.extend_from_slice(&1i64.to_le_bytes());
+        let wrapped = wrap_p2pkh(TYPE_TRANSFER, &body);
+
+        let bare_hash = sha256::Hash::hash(&p2pkh_prefix());
+        let wrapped_full_hash = sha256::Hash::hash(&wrapped);
+        let wrapped_effective_hash = sha256::Hash::hash(effective_script(&wrapped));
+
+        assert_ne!(
+            bare_hash, wrapped_full_hash,
+            "sanity: full-script hash should differ from base-script hash"
+        );
+        assert_eq!(
+            bare_hash, wrapped_effective_hash,
+            "effective scripthash of an asset-wrapped output must equal the bare-address scripthash"
+        );
+    }
+
+    #[test]
+    fn effective_script_does_not_strip_null_asset() {
+        // Null-asset scripts (OP_XNA_ASSET at byte 0) are NOT asset-wrapped
+        // outputs — they are unspendable metadata. effective_script returns
+        // them unchanged.
+        let mut inner = vec![3u8];
+        inner.extend_from_slice(b"#KY");
+        inner.push(1u8);
+        let mut script = vec![OP_XNA_ASSET, 0x14];
+        script.extend_from_slice(&[0u8; 20]);
+        script.push(inner.len() as u8);
+        script.extend_from_slice(&inner);
+        assert_eq!(effective_script(&script), script.as_slice());
     }
 
     #[test]

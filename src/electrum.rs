@@ -10,7 +10,7 @@ use rayon::prelude::*;
 use serde_derive::Deserialize;
 use serde_json::{self, json, Value};
 
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::{hash_map::Entry, BTreeSet, HashMap};
 use std::fmt;
 use std::iter::FromIterator;
 use std::net::SocketAddr;
@@ -23,7 +23,7 @@ use crate::{
     merkle::Proof,
     metrics::{self, Histogram, Metrics},
     signals::Signal,
-    status::ScriptHashStatus,
+    status::{Balance, ScriptHashStatus, UnspentEntry, NATIVE_ASSET_KEY},
     tracker::Tracker,
     types::ScriptHash,
 };
@@ -118,6 +118,181 @@ impl RpcError {
             }
         }
     }
+}
+
+/// Optional `asset` parameter for `scripthash.get_balance` / `scripthash.listunspent`.
+///
+/// Wire forms (ElectrumX-neurai compatible):
+/// * `false`, `null`, or absent  → `NativeOnly`
+/// * `true`                       → `All`
+/// * string `"TOKEN"`             → `One("TOKEN")`
+/// * array `[null, "TOKEN_A"]`    → `Many { include_native: true, assets: {"TOKEN_A"} }`
+///   * Inside the array, `null` means native; strings are asset names.
+///   * `bool` is NOT a valid array element (only valid as the whole parameter).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AssetFilter {
+    NativeOnly,
+    All,
+    One(String),
+    Many {
+        include_native: bool,
+        assets: BTreeSet<String>,
+    },
+}
+
+impl Default for AssetFilter {
+    fn default() -> Self {
+        AssetFilter::NativeOnly
+    }
+}
+
+impl AssetFilter {
+    fn from_json(v: &Value) -> std::result::Result<Self, String> {
+        match v {
+            Value::Null => Ok(AssetFilter::NativeOnly),
+            Value::Bool(false) => Ok(AssetFilter::NativeOnly),
+            Value::Bool(true) => Ok(AssetFilter::All),
+            Value::String(s) => Ok(AssetFilter::One(s.clone())),
+            Value::Array(arr) => {
+                let mut include_native = false;
+                let mut assets = BTreeSet::new();
+                for elem in arr {
+                    match elem {
+                        Value::Null => include_native = true,
+                        Value::String(s) => {
+                            assets.insert(s.clone());
+                        }
+                        // bool / number / nested arrays / objects are NOT
+                        // valid array elements per the ElectrumX-neurai wire.
+                        other => {
+                            return Err(format!(
+                                "asset-filter array element must be null or string, got {other}"
+                            ));
+                        }
+                    }
+                }
+                Ok(AssetFilter::Many {
+                    include_native,
+                    assets,
+                })
+            }
+            other => Err(format!(
+                "asset filter must be bool, string, array, or null; got {other}"
+            )),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AssetFilter {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let v = Value::deserialize(deserializer)?;
+        Self::from_json(&v).map_err(serde::de::Error::custom)
+    }
+}
+
+/// `(scripthash, asset?)` arg shape, accepted by `scripthash.get_balance` and
+/// `scripthash.listunspent`. The optional second element is parsed via
+/// [`AssetFilter::from_json`] and defaults to `NativeOnly` when absent.
+#[derive(Debug)]
+pub(crate) struct ScriptHashWithAsset {
+    pub scripthash: ScriptHash,
+    pub asset: AssetFilter,
+}
+
+impl<'de> serde::Deserialize<'de> for ScriptHashWithAsset {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let arr = Vec::<Value>::deserialize(deserializer)?;
+        if arr.is_empty() || arr.len() > 2 {
+            return Err(serde::de::Error::custom(format!(
+                "expected [scripthash] or [scripthash, asset], got {} elements",
+                arr.len()
+            )));
+        }
+        let scripthash: ScriptHash =
+            serde_json::from_value(arr[0].clone()).map_err(serde::de::Error::custom)?;
+        let asset = if arr.len() == 2 {
+            AssetFilter::from_json(&arr[1]).map_err(serde::de::Error::custom)?
+        } else {
+            AssetFilter::NativeOnly
+        };
+        Ok(ScriptHashWithAsset { scripthash, asset })
+    }
+}
+
+/// Format a `Balance` as JSON shaped by the requested `AssetFilter`.
+///
+/// * `NativeOnly` / `One(_)` → legacy single-asset shape `{"confirmed": N, "unconfirmed": M}`
+/// * `All` / `Many { .. }`   → multi-asset map `{"rvn": {...}, "TOKEN": {...}}`
+fn balance_to_json(balance: &Balance, filter: &AssetFilter) -> Value {
+    fn entry(b: crate::status::AssetBalance) -> Value {
+        // Cast i128 → i64 for the wire. Asset amounts in Neurai are i64 from
+        // the daemon, so the only way to overflow is a runtime bug; if it
+        // happens we cap to i64::MAX to surface obviously broken numbers
+        // rather than silently wrapping.
+        let to_i64 = |x: i128| -> i64 {
+            i64::try_from(x).unwrap_or_else(|_| {
+                if x.is_negative() {
+                    i64::MIN
+                } else {
+                    i64::MAX
+                }
+            })
+        };
+        json!({"confirmed": to_i64(b.confirmed), "unconfirmed": to_i64(b.unconfirmed)})
+    }
+    match filter {
+        AssetFilter::NativeOnly => entry(balance.native()),
+        AssetFilter::One(name) => entry(balance.by_asset.get(name).copied().unwrap_or_default()),
+        AssetFilter::All => {
+            let mut map = serde_json::Map::new();
+            for (k, v) in &balance.by_asset {
+                map.insert(k.clone(), entry(*v));
+            }
+            Value::Object(map)
+        }
+        AssetFilter::Many {
+            include_native,
+            assets,
+        } => {
+            let mut map = serde_json::Map::new();
+            if *include_native {
+                map.insert(NATIVE_ASSET_KEY.to_string(), entry(balance.native()));
+            }
+            for name in assets {
+                map.insert(
+                    name.clone(),
+                    entry(balance.by_asset.get(name).copied().unwrap_or_default()),
+                );
+            }
+            Value::Object(map)
+        }
+    }
+}
+
+/// Filter a `Vec<UnspentEntry>` by `AssetFilter` and serialize to JSON.
+fn unspent_to_json(entries: Vec<UnspentEntry>, filter: &AssetFilter) -> Value {
+    let filtered: Vec<UnspentEntry> = entries
+        .into_iter()
+        .filter(|e| match filter {
+            AssetFilter::NativeOnly => e.asset().is_none(),
+            AssetFilter::All => true,
+            AssetFilter::One(n) => e.asset() == Some(n.as_str()),
+            AssetFilter::Many {
+                include_native,
+                assets,
+            } => match e.asset() {
+                None => *include_native,
+                Some(name) => assets.contains(name),
+            },
+        })
+        .collect();
+    json!(filtered)
 }
 
 /// Electrum RPC handler
@@ -270,8 +445,12 @@ impl Rpc {
     fn scripthash_get_balance(
         &self,
         client: &Client,
-        (scripthash,): &(ScriptHash,),
+        args: &ScriptHashWithAsset,
     ) -> Result<Value> {
+        let ScriptHashWithAsset { scripthash, asset } = args;
+        // Subscription state is independent of the asset filter — the filter
+        // is applied to the per-asset Balance map at serialization time, both
+        // for already-subscribed and freshly-built status.
         let balance = match client.scripthashes.get(scripthash) {
             Some(status) => self.tracker.get_balance(status),
             None => {
@@ -282,7 +461,7 @@ impl Rpc {
                 self.tracker.get_balance(&self.new_status(*scripthash)?)
             }
         };
-        Ok(json!(balance))
+        Ok(balance_to_json(&balance, asset))
     }
 
     fn scripthash_get_history(
@@ -306,8 +485,9 @@ impl Rpc {
     fn scripthash_list_unspent(
         &self,
         client: &Client,
-        (scripthash,): &(ScriptHash,),
+        args: &ScriptHashWithAsset,
     ) -> Result<Value> {
+        let ScriptHashWithAsset { scripthash, asset } = args;
         let unspent_entries = match client.scripthashes.get(scripthash) {
             Some(status) => self.tracker.get_unspent(status),
             None => {
@@ -318,7 +498,7 @@ impl Rpc {
                 self.tracker.get_unspent(&self.new_status(*scripthash)?)
             }
         };
-        Ok(json!(unspent_entries))
+        Ok(unspent_to_json(unspent_entries, asset))
     }
 
     fn scripthash_subscribe(
@@ -681,9 +861,9 @@ enum Params {
     PeersSubscribe,
     Ping,
     RelayFee,
-    ScriptHashGetBalance((ScriptHash,)),
+    ScriptHashGetBalance(ScriptHashWithAsset),
     ScriptHashGetHistory((ScriptHash,)),
-    ScriptHashListUnspent((ScriptHash,)),
+    ScriptHashListUnspent(ScriptHashWithAsset),
     ScriptHashSubscribe((ScriptHash,)),
     ScriptHashUnsubscribe((ScriptHash,)),
     TransactionGet(TxGetArgs),
@@ -908,5 +1088,190 @@ mod tests {
         assert!(parse_requests(r#"{"id":1,"method":"name","params":[]}"#).is_ok());
         assert!(parse_requests(r#"{"id":1,"method":"name","params":[],"unrelated":42}"#).is_ok());
         assert!(parse_requests(r#" { "id" : 1 , "method" : "name" , "params" : [ ] } "#).is_ok());
+    }
+
+    // ─── AssetFilter::from_json ────────────────────────────────────────────────
+    //
+    // Wire forms accepted (ElectrumX-neurai compatible):
+    //   false/null/absent  → NativeOnly
+    //   true               → All
+    //   "TOKEN"            → One("TOKEN")
+    //   [null, "T", ...]   → Many { include_native, assets }
+    // Inside an array, only `null` and string are valid; bool / number / etc.
+    // are rejected (bool is only valid as the top-level value).
+
+    fn parse_filter(s: &str) -> std::result::Result<AssetFilter, String> {
+        let v: Value = serde_json::from_str(s).map_err(|e| e.to_string())?;
+        AssetFilter::from_json(&v)
+    }
+
+    #[test]
+    fn asset_filter_false_is_native_only() {
+        assert_eq!(parse_filter("false").unwrap(), AssetFilter::NativeOnly);
+    }
+
+    #[test]
+    fn asset_filter_null_is_native_only() {
+        assert_eq!(parse_filter("null").unwrap(), AssetFilter::NativeOnly);
+    }
+
+    #[test]
+    fn asset_filter_true_is_all() {
+        assert_eq!(parse_filter("true").unwrap(), AssetFilter::All);
+    }
+
+    #[test]
+    fn asset_filter_string_is_one() {
+        assert_eq!(
+            parse_filter(r#""TOKEN""#).unwrap(),
+            AssetFilter::One("TOKEN".into())
+        );
+    }
+
+    #[test]
+    fn asset_filter_empty_array_is_empty_many() {
+        assert_eq!(
+            parse_filter("[]").unwrap(),
+            AssetFilter::Many {
+                include_native: false,
+                assets: BTreeSet::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn asset_filter_array_assets_only() {
+        let assets: BTreeSet<String> =
+            ["TOKEN_A".to_string(), "TOKEN_B".to_string()].into_iter().collect();
+        assert_eq!(
+            parse_filter(r#"["TOKEN_A","TOKEN_B"]"#).unwrap(),
+            AssetFilter::Many {
+                include_native: false,
+                assets,
+            }
+        );
+    }
+
+    #[test]
+    fn asset_filter_array_with_null_includes_native() {
+        let assets: BTreeSet<String> = ["TOKEN_A".to_string()].into_iter().collect();
+        assert_eq!(
+            parse_filter(r#"[null,"TOKEN_A"]"#).unwrap(),
+            AssetFilter::Many {
+                include_native: true,
+                assets,
+            }
+        );
+    }
+
+    #[test]
+    fn asset_filter_array_just_null() {
+        assert_eq!(
+            parse_filter("[null]").unwrap(),
+            AssetFilter::Many {
+                include_native: true,
+                assets: BTreeSet::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn asset_filter_array_duplicates_deduped() {
+        let assets: BTreeSet<String> = ["TOKEN_A".to_string()].into_iter().collect();
+        assert_eq!(
+            parse_filter(r#"["TOKEN_A","TOKEN_A"]"#).unwrap(),
+            AssetFilter::Many {
+                include_native: false,
+                assets,
+            }
+        );
+    }
+
+    #[test]
+    fn asset_filter_array_double_null() {
+        // Repeated nulls keep include_native=true (no semantic change).
+        assert_eq!(
+            parse_filter("[null,null]").unwrap(),
+            AssetFilter::Many {
+                include_native: true,
+                assets: BTreeSet::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn asset_filter_number_top_level_rejected() {
+        assert!(parse_filter("42").is_err());
+    }
+
+    #[test]
+    fn asset_filter_bool_inside_array_rejected() {
+        // `bool` is only valid as the whole top-level parameter, never as an
+        // array element. Wallets that emit `["TOKEN", true]` are malformed.
+        assert!(parse_filter(r#"["TOKEN",true]"#).is_err());
+    }
+
+    #[test]
+    fn asset_filter_number_inside_array_rejected() {
+        assert!(parse_filter(r#"["TOKEN",42]"#).is_err());
+    }
+
+    // ─── ScriptHashWithAsset deserialization ──────────────────────────────────
+
+    fn parse_args(s: &str) -> std::result::Result<ScriptHashWithAsset, String> {
+        let v: Value = serde_json::from_str(s).map_err(|e| e.to_string())?;
+        serde_json::from_value(v).map_err(|e| e.to_string())
+    }
+
+    /// All-zeros scripthash as a hex string (32 bytes).
+    const ZERO_SH: &str = "\"0000000000000000000000000000000000000000000000000000000000000000\"";
+
+    #[test]
+    fn scripthash_with_asset_just_scripthash_defaults_to_native() {
+        let args = parse_args(&format!("[{ZERO_SH}]")).unwrap();
+        assert_eq!(args.asset, AssetFilter::NativeOnly);
+    }
+
+    #[test]
+    fn scripthash_with_asset_explicit_false() {
+        let args = parse_args(&format!("[{ZERO_SH}, false]")).unwrap();
+        assert_eq!(args.asset, AssetFilter::NativeOnly);
+    }
+
+    #[test]
+    fn scripthash_with_asset_explicit_true() {
+        let args = parse_args(&format!("[{ZERO_SH}, true]")).unwrap();
+        assert_eq!(args.asset, AssetFilter::All);
+    }
+
+    #[test]
+    fn scripthash_with_asset_single_token() {
+        let args = parse_args(&format!("[{ZERO_SH}, \"TOKEN\"]")).unwrap();
+        assert_eq!(args.asset, AssetFilter::One("TOKEN".into()));
+    }
+
+    #[test]
+    fn scripthash_with_asset_array_with_null() {
+        let args = parse_args(&format!("[{ZERO_SH}, [null, \"TOKEN\"]]")).unwrap();
+        let mut assets = BTreeSet::new();
+        assets.insert("TOKEN".to_string());
+        assert_eq!(
+            args.asset,
+            AssetFilter::Many {
+                include_native: true,
+                assets
+            }
+        );
+    }
+
+    #[test]
+    fn scripthash_with_asset_empty_array_rejected() {
+        // 0-element arg array doesn't carry the required scripthash.
+        assert!(parse_args("[]").is_err());
+    }
+
+    #[test]
+    fn scripthash_with_asset_too_many_args_rejected() {
+        assert!(parse_args(&format!("[{ZERO_SH}, false, \"extra\"]")).is_err());
     }
 }
