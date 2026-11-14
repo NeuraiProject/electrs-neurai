@@ -7,6 +7,7 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::LazyLock;
 
+use super::anchors;
 use super::block::BlockHashAlgo;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize)]
@@ -14,6 +15,10 @@ pub enum NeuraiNetwork {
     Mainnet,
     Testnet,
     Regtest,
+    /// Regtest of the Neurai v1.0.7 mainnet release (X16Rv2 headers), used to
+    /// test against the same consensus/asset code as mainnet. `regtest` is the
+    /// DePIN-Test regtest.
+    RegtestV1,
 }
 
 impl Default for NeuraiNetwork {
@@ -28,6 +33,7 @@ impl fmt::Display for NeuraiNetwork {
             NeuraiNetwork::Mainnet => "neurai",
             NeuraiNetwork::Testnet => "testnet",
             NeuraiNetwork::Regtest => "regtest",
+            NeuraiNetwork::RegtestV1 => "regtest-v1",
         })
     }
 }
@@ -40,8 +46,9 @@ impl FromStr for NeuraiNetwork {
             "neurai" | "mainnet" | "main" => Ok(NeuraiNetwork::Mainnet),
             "testnet" | "test" => Ok(NeuraiNetwork::Testnet),
             "regtest" => Ok(NeuraiNetwork::Regtest),
+            "regtest-v1" => Ok(NeuraiNetwork::RegtestV1),
             other => Err(format!(
-                "unknown network '{other}' (expected 'neurai', 'testnet' or 'regtest')"
+                "unknown network '{other}' (expected 'neurai', 'testnet', 'regtest' or 'regtest-v1')"
             )),
         }
     }
@@ -80,6 +87,9 @@ pub struct NetworkParams {
     pub genesis_nonce: u32,
     pub genesis_version: i32,
     pub genesis_merkle_root_le: [u8; 32],
+    /// Block hashes every [`anchors::INTERVAL`] blocks that authenticate the headers
+    /// up to them, so their KAWPOW is not recomputed (see [`anchors`]).
+    pub header_anchors: &'static [&'static str],
 }
 
 impl NetworkParams {
@@ -88,6 +98,7 @@ impl NetworkParams {
             NeuraiNetwork::Mainnet => LazyLock::force(&MAINNET),
             NeuraiNetwork::Testnet => LazyLock::force(&TESTNET),
             NeuraiNetwork::Regtest => LazyLock::force(&REGTEST),
+            NeuraiNetwork::RegtestV1 => LazyLock::force(&REGTEST_V1),
         }
     }
 }
@@ -158,6 +169,7 @@ static MAINNET: LazyLock<NetworkParams> = LazyLock::new(|| NetworkParams {
     genesis_nonce: 7131026,
     genesis_version: 4,
     genesis_merkle_root_le: hex_be_to_le(&MERKLE_ROOT_BE),
+    header_anchors: anchors::MAINNET,
 });
 
 static TESTNET: LazyLock<NetworkParams> = LazyLock::new(|| NetworkParams {
@@ -187,6 +199,7 @@ static TESTNET: LazyLock<NetworkParams> = LazyLock::new(|| NetworkParams {
     genesis_nonce: 0,
     genesis_version: 2,
     genesis_merkle_root_le: hex_be_to_le(&MERKLE_ROOT_BE),
+    header_anchors: &[],
 });
 
 static REGTEST: LazyLock<NetworkParams> = LazyLock::new(|| NetworkParams {
@@ -213,6 +226,36 @@ static REGTEST: LazyLock<NetworkParams> = LazyLock::new(|| NetworkParams {
     genesis_nonce: 0,
     genesis_version: 2,
     genesis_merkle_root_le: hex_be_to_le(&MERKLE_ROOT_BE),
+    header_anchors: &[],
+});
+
+/// Neurai v1.0.7 regtest (`CRegTestParams` of the `main` branch).
+static REGTEST_V1: LazyLock<NetworkParams> = LazyLock::new(|| NetworkParams {
+    network: NeuraiNetwork::RegtestV1,
+    magic: Magic::from_bytes([0x52, 0x55, 0x45, 0x4e]),
+    default_p2p_port: 19200,
+    default_rpc_port: 19201,
+    default_electrum_port: 60411,
+    default_monitoring_port: 24234,
+    pkh_prefix: 127,
+    sh_prefix: 196,
+    bech32_hrp: "rnq",
+    // nKAWPOWActivationTime = 3582830167 (2083): 80-byte X16Rv2 headers
+    kawpow_activation_time: 3_582_830_167,
+    block_hash_algo: BlockHashAlgo::X16rv2ThenKawpow,
+    pq_witness_enabled: false,
+    asset_activation_height: 0,
+    depin_assets_activation_height: None,
+    daemon_dir_subdir: Some("regtest"),
+    db_subdir: "regtest-v1",
+    // genesis 6d7844e7…fa2e4 is X16R (not X16Rv2): fetched from the daemon
+    genesis_hash_le: [0u8; 32],
+    genesis_time: 1681720840,
+    genesis_bits: 0x207fffff,
+    genesis_nonce: 1,
+    genesis_version: 4,
+    genesis_merkle_root_le: hex_be_to_le(&MERKLE_ROOT_BE),
+    header_anchors: &[],
 });
 
 #[cfg(test)]
@@ -239,6 +282,7 @@ mod tests {
             NeuraiNetwork::Mainnet,
             NeuraiNetwork::Testnet,
             NeuraiNetwork::Regtest,
+            NeuraiNetwork::RegtestV1,
         ] {
             assert_eq!(NeuraiNetwork::from_str(&n.to_string()).unwrap(), n);
         }

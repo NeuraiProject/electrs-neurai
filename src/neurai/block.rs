@@ -34,6 +34,9 @@ pub enum BlockHashAlgo {
     /// Mainnet: pre-KAWPOW (genesis only) is X16R and is resolved via the hard-coded
     /// genesis hash; every subsequent block uses [`hash_kawpow_header`].
     X16rThenKawpow,
+    /// Neurai v1.0.7 regtest: X16Rv2 until the (year 2083) KAWPOW activation.
+    /// The genesis hash (X16R) is fetched from the daemon.
+    X16rv2ThenKawpow,
 }
 
 /// KAWPOW-specific header fields.
@@ -115,6 +118,15 @@ impl NeuraiBlockHeader {
                     None
                 }
             },
+            BlockHashAlgo::X16rv2ThenKawpow => match self.kawpow {
+                Some(k) => Some(hash_kawpow_header(self, k)),
+                None => {
+                    let bytes: [u8; 80] = self.serialize().try_into().expect("80-byte header");
+                    Some(BlockHash::from_raw_hash(sha256d::Hash::from_byte_array(
+                        hasherx16r_sys::x16rv2(&bytes),
+                    )))
+                }
+            },
         }
     }
 }
@@ -169,14 +181,17 @@ fn hash_kawpow_header(header: &NeuraiBlockHeader, k: KawpowFields) -> BlockHash 
     // the bytes between internal LE and the BE layout progpow reads. Mirror that here.
     let input_be = reverse32(&input_le);
     let mix_be = reverse32(&k.mix_hash);
-    let hash_be = hasherkawpow_sys::kawpow_hash_no_verify(
-        &input_be,
-        &k.nonce64,
-        k.height as i32,
-        &mix_be,
-    );
+    let hash_be = hasherkawpow_sys::kawpow_hash_no_verify(&input_be, &k.nonce64, &mix_be);
     // Reverse back: BlockHash stores bytes in internal LE order.
     BlockHash::from_raw_hash(sha256d::Hash::from_byte_array(reverse32(&hash_be)))
+}
+
+/// Blocks per KAWPOW epoch (`ETHASH_EPOCH_LENGTH` in the vendored ethash).
+const KAWPOW_EPOCH_LENGTH: u32 = 7500;
+
+/// The KAWPOW epoch whose light cache verifies this header (`None` before KAWPOW).
+pub fn kawpow_epoch(header: &NeuraiBlockHeader) -> Option<u32> {
+    header.kawpow.map(|k| k.height / KAWPOW_EPOCH_LENGTH)
 }
 
 /// Verify that the header's declared `mix_hash` is the one ProgPoW would compute for

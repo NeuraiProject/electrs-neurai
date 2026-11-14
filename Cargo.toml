@@ -32,7 +32,11 @@ configure_me = "0.4"
 # KawPow hashing for Neurai mainnet block headers.
 # Vendored crate kept inside this repository.
 hasherkawpow-sys = { path = "hasherkawpow-sys" }
+# X16R / X16Rv2 hashing for pre-KAWPOW headers (Neurai v1.0.7 regtest).
+hasherx16r-sys = { path = "hasherx16r-sys" }
 crossbeam-channel = "0.5"
+# Native TLS for the ssl:// and wss:// Electrum listeners.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 dirs-next = "2.0"
 env_logger = "0.10"
 log = "0.4"

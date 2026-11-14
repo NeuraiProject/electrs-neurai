@@ -1,0 +1,11 @@
+[package]
+name = "hasherx16r-sys"
+version = "0.1.0"
+edition = "2021"
+description = "X16R / X16Rv2 block header hashing (Neurai v1.0.7 pre-KAWPOW headers), on the bundled sphlib."
+license = "MIT"
+
+[build-dependencies]
+cc = "1"
+
+[dependencies]

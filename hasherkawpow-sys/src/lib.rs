@@ -29,8 +29,10 @@
 //! // Compute a hash
 //! let (mix, hash) = hash_kawpow(&header_hash, &nonce, block_height);
 //!
-//! // Verify the hash
-//! assert!(verify_kawpow(&header_hash, &nonce, block_height, &mix, &hash));
+//! // Verify the hash (`verify_kawpow` also writes the final hash it derives)
+//! let mut hash_out = [0u8; 32];
+//! assert!(verify_kawpow(&header_hash, &nonce, block_height, &mix, &mut hash_out));
+//! assert_eq!(hash_out, hash);
 //! ```
 
 unsafe extern "C" {
@@ -49,6 +51,13 @@ unsafe extern "C" {
         mix_hash_bytes: *const u8,
         hash_out_bytes: *mut u8,
     ) -> bool;
+
+    fn hash_no_verify(
+        header_hash_bytes: *const u8,
+        nonce64_ptr: *const u64,
+        mix_hash_bytes: *const u8,
+        hash_out_bytes: *mut u8,
+    );
 }
 
 /// Computes a KawPow hash.
@@ -108,28 +117,22 @@ pub fn hash_kawpow(header_hash: &[u8; 32], nonce: &u64, block_height: i32) -> ([
 ///
 /// * `header_hash` — 32 bytes of `SHA256d(version || prev || merkle || nTime || nBits || nHeight)`.
 /// * `nonce` — the 64-bit header nonce (`nNonce64`).
-/// * `block_height` — the header's `nHeight` field.
 /// * `mix_hash` — the 32-byte mix digest stored in the header.
+///
+/// It needs no epoch context and touches no dataset: two Keccak-f[800] permutations,
+/// so it is cheap enough to run for every stored header (unlike [`verify_kawpow`],
+/// which recomputes the mix from the epoch's light cache).
 ///
 /// # Returns
 ///
 /// The 32-byte final hash (internal little-endian byte order, like every other
 /// Bitcoin-family hash).
-pub fn kawpow_hash_no_verify(
-    header_hash: &[u8; 32],
-    nonce: &u64,
-    block_height: i32,
-    mix_hash: &[u8; 32],
-) -> [u8; 32] {
+pub fn kawpow_hash_no_verify(header_hash: &[u8; 32], nonce: &u64, mix_hash: &[u8; 32]) -> [u8; 32] {
     let mut hash_out = [0u8; 32];
     unsafe {
-        // The C `verify` helper writes `hash_out` from (state2, mix_hash) before
-        // comparing the recomputed mix; discarding the bool gives us exactly the
-        // "no_verify" semantics. See src/ethash/progpow.cpp::verify.
-        let _ = verify(
+        hash_no_verify(
             header_hash.as_ptr(),
             nonce,
-            block_height,
             mix_hash.as_ptr(),
             hash_out.as_mut_ptr(),
         );
@@ -144,8 +147,8 @@ pub fn kawpow_hash_no_verify(
 /// * `header_hash` - The 32-byte header hash of the block.
 /// * `nonce` - The nonce used for the hash.
 /// * `block_height` - The block height at which the hash is being verified.
-/// * `mix_out` - The 32-byte mix digest that was computed.
-/// * `hash_out` - The 32-byte final KawPow hash that was computed.
+/// * `mix_hash` - The 32-byte mix digest to verify.
+/// * `hash_out` - Receives the final KawPow hash derived from `mix_hash`.
 ///
 /// # Returns
 ///
@@ -169,8 +172,10 @@ pub fn kawpow_hash_no_verify(
 /// let (mix, hash) = hash_kawpow(&header_hash, &nonce, block_height);
 ///
 /// // Verify the hash
-/// let is_valid = verify_kawpow(&header_hash, &nonce, block_height, &mix, &hash);
+/// let mut hash_out = [0u8; 32];
+/// let is_valid = verify_kawpow(&header_hash, &nonce, block_height, &mix, &mut hash_out);
 /// assert!(is_valid);
+/// assert_eq!(hash_out, hash);
 /// ```
 pub fn verify_kawpow(
     header_hash: &[u8; 32],
@@ -304,9 +309,23 @@ mod tests {
         let header_hash_arr: [u8; 32] = header_hash.try_into().unwrap();
 
         let (mix, hash) = hash_kawpow(&header_hash_arr, &nonce, block_height);
-        let no_verify_hash =
-            kawpow_hash_no_verify(&header_hash_arr, &nonce, block_height, &mix);
+        let no_verify_hash = kawpow_hash_no_verify(&header_hash_arr, &nonce, &mix);
 
         assert_eq!(no_verify_hash, hash);
+    }
+
+    #[test]
+    fn test_kawpow_hash_no_verify_matches_verify_output() {
+        // `verify_kawpow` also writes the final hash (from the given mix) before it
+        // checks the mix; both paths must agree for valid and invalid mixes alike.
+        let block_height = 262523i32;
+        for i in 0u8..16 {
+            let header_hash = [i.wrapping_mul(37); 32];
+            let mix = [i.wrapping_mul(91) ^ 0x5a; 32];
+            let nonce = u64::from(i) * 0x0123_4567_89ab_cdef;
+            let mut verify_hash = [0u8; 32];
+            verify_kawpow(&header_hash, &nonce, block_height, &mix, &mut verify_hash);
+            assert_eq!(kawpow_hash_no_verify(&header_hash, &nonce, &mix), verify_hash);
+        }
     }
 }

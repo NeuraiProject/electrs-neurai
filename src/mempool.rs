@@ -9,6 +9,8 @@ use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, Transaction, Txid};
 use serde::ser::{Serialize, SerializeSeq, Serializer};
 
+use crate::index::{tx_asset_events, TxAssetOutputs, TxLocation};
+use crate::types::{AssetEventKind, AssetEventRow, AssetMetaEventRow};
 use crate::{
     daemon::Daemon,
     metrics::{Gauge, Metrics},
@@ -16,6 +18,25 @@ use crate::{
     signals::ExitFlag,
     types::ScriptHash,
 };
+
+/// Asset events found in mempool transactions, by name / logical key.
+#[derive(Default)]
+pub(crate) struct MempoolAssets {
+    pub meta: HashMap<Vec<u8>, Vec<AssetMetaEventRow>>,
+    pub events: HashMap<(AssetEventKind, Vec<u8>), Vec<AssetEventRow>>,
+}
+
+impl MempoolAssets {
+    pub(crate) fn events(&self, kind: AssetEventKind, key: &[u8]) -> &[AssetEventRow] {
+        self.events
+            .get(&(kind, key.to_vec()))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    pub(crate) fn meta(&self, name: &[u8]) -> &[AssetMetaEventRow] {
+        self.meta.get(name).map_or(&[], Vec::as_slice)
+    }
+}
 
 pub(crate) struct Entry {
     pub txid: Txid,
@@ -36,6 +57,12 @@ pub(crate) struct Mempool {
     /// prefix — mempool is small enough that exact names are cheap.
     by_asset_name: HashMap<Vec<u8>, HashSet<Txid>>,
     fees: FeeHistogram,
+    /// `mempool.get_fee_histogram` reply, computed like ElectrumX.
+    compact_histogram: Vec<(f64, u64)>,
+    /// Asset events of mempool transactions (overlaid on confirmed state).
+    assets: MempoolAssets,
+    /// Bumped whenever the set of mempool transactions changes.
+    generation: u64,
     // stats
     vsize: Gauge,
     count: Gauge,
@@ -150,6 +177,9 @@ impl Mempool {
             by_spending: Default::default(),
             by_asset_name: Default::default(),
             fees: FeeHistogram::default(),
+            compact_histogram: Vec::new(),
+            assets: MempoolAssets::default(),
+            generation: 0,
             vsize: metrics.gauge(
                 "mempool_txs_vsize",
                 "Total vsize of mempool transactions (in bytes)",
@@ -163,8 +193,72 @@ impl Mempool {
         }
     }
 
-    pub(crate) fn fees_histogram(&self) -> &FeeHistogram {
-        &self.fees
+    /// Compact fee histogram exactly as ElectrumX builds it
+    /// (`electrumx/server/mempool.py` `_update_histogram` / `_compress_histogram`):
+    /// fee rates in sat/byte rounded *down* to 0.1, weighted by the full
+    /// serialized size, grouped in tranches of at least 100 kB that grow ×1.1.
+    pub(crate) fn compact_fee_histogram(&self) -> &[(f64, u64)] {
+        &self.compact_histogram
+    }
+
+    pub(crate) fn assets(&self) -> &MempoolAssets {
+        &self.assets
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn update_assets(&mut self) {
+        let mut assets = MempoolAssets::default();
+        for entry in self.entries.values() {
+            let mut outputs = TxAssetOutputs::default();
+            for (vout, output) in entry.tx.output.iter().enumerate() {
+                outputs.add_output(vout as u32, output.script_pubkey.as_bytes());
+            }
+            if outputs.is_empty() {
+                continue;
+            }
+            let loc = TxLocation {
+                txid: entry.txid,
+                block_hash: bitcoin::BlockHash::all_zeros(),
+                height: 0,
+                tx_pos: 0,
+            };
+            let events = tx_asset_events(loc, outputs);
+            for meta in events.meta {
+                assets.meta.entry(meta.name.clone()).or_default().push(meta);
+            }
+            for event in events.events {
+                assets
+                    .events
+                    .entry((event.kind, event.key.clone()))
+                    .or_default()
+                    .push(event);
+            }
+        }
+        self.assets = assets;
+    }
+
+    fn update_compact_histogram(&mut self) {
+        let mut histogram: Vec<(f64, u64)> = Vec::new();
+        {
+            let mut by_rate = std::collections::BTreeMap::<u64, u64>::new(); // key: f64 bits
+            for entry in self.entries.values() {
+                let size = bitcoin::consensus::serialize(&entry.tx).len() as u64;
+                if size == 0 {
+                    continue;
+                }
+                let fee_rate = entry.fee.to_sat() as f64 / size as f64;
+                let fee_rate = (10.0 * fee_rate).floor() / 10.0;
+                *by_rate.entry(fee_rate.to_bits()).or_default() += size;
+            }
+            histogram.extend(by_rate.into_iter().map(|(bits, size)| (f64::from_bits(bits), size)));
+        }
+        // Sorted by descending fee rate (all rates are non-negative, so the
+        // bit pattern order equals the numeric order).
+        histogram.reverse();
+        self.compact_histogram = compress_histogram(&histogram, 100_000.0);
     }
 
     pub(crate) fn get(&self, txid: &Txid) -> Option<&Entry> {
@@ -217,6 +311,11 @@ impl Mempool {
         }
 
         self.update_metrics();
+        self.update_compact_histogram();
+        if added > 0 || removed > 0 {
+            self.generation += 1;
+            self.update_assets();
+        }
 
         debug!(
             "{} mempool txs: {} added, {} removed",
@@ -339,6 +438,34 @@ impl Mempool {
             self.fees.remove(bin_index, vsize);
         }
     }
+}
+
+/// ElectrumX `MemPool._compress_histogram`. `histogram` must be sorted by
+/// descending fee rate.
+fn compress_histogram(histogram: &[(f64, u64)], mut bin_size: f64) -> Vec<(f64, u64)> {
+    let mut compact = vec![];
+    let mut cum_size = 0u64;
+    let mut prev_fee_rate: Option<f64> = None;
+    for &(fee_rate, size) in histogram {
+        // a big lump of txs at this specific rate: flush the previous tranche first
+        if size as f64 > 2.0 * bin_size {
+            if let Some(prev) = prev_fee_rate {
+                if cum_size > 0 {
+                    compact.push((prev, cum_size));
+                    cum_size = 0;
+                    bin_size *= 1.1;
+                }
+            }
+        }
+        cum_size += size;
+        if cum_size as f64 > bin_size {
+            compact.push((fee_rate, cum_size));
+            cum_size = 0;
+            bin_size *= 1.1;
+        }
+        prev_fee_rate = Some(fee_rate);
+    }
+    compact
 }
 
 pub(crate) struct FeeHistogram {
@@ -496,5 +623,32 @@ mod tests {
                 ])
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod compact_histogram_tests {
+    use super::compress_histogram;
+
+    /// Vectors produced by ElectrumX `MemPool._compress_histogram(..., bin_size=100_000)`.
+    #[test]
+    fn matches_electrumx_compression() {
+        // Small mempool: everything below the first 100 kB tranche → empty.
+        assert!(compress_histogram(&[(10.0, 500), (1.0, 300)], 100_000.0).is_empty());
+
+        let hist = [(50.0, 60_000), (20.0, 50_000), (10.0, 250_000), (1.0, 120_000)];
+        // 60k + 50k > 100k → (20.0, 110000); then 250k > 2*110k: nothing pending,
+        // 250k > 110k → (10.0, 250000); 120k > 121k? no → dropped.
+        assert_eq!(
+            compress_histogram(&hist, 100_000.0),
+            vec![(20.0, 110_000), (10.0, 250_000)]
+        );
+
+        // Big lump flushes the previous partial tranche first.
+        let hist = [(5.0, 40_000), (2.0, 300_000)];
+        assert_eq!(
+            compress_histogram(&hist, 100_000.0),
+            vec![(5.0, 40_000), (2.0, 300_000)]
+        );
     }
 }

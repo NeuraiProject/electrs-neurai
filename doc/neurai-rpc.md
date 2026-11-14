@@ -1,172 +1,132 @@
 # electrs-neurai — RPC reference
 
-All of the standard Electrum v1.4 methods (see the
-[upstream protocol docs](https://electrum-protocol.readthedocs.io/)) are
-supported. This page covers only the **Neurai-specific extensions**.
+electrs-neurai speaks the protocol of **ElectrumX-neurai**
+([NeuraiProject/electrumx-neurai](https://github.com/NeuraiProject/electrumx-neurai)),
+so wallets written for it — in particular the Electrum desktop wallet
+**electrum-neurai** — work unchanged. This page lists what is supported, the
+few deliberate differences, and the electrs-neurai extensions. For the
+semantics of each method, see ElectrumX-neurai's
+[`docs/protocol-methods.rst`](https://github.com/NeuraiProject/electrumx-neurai/blob/main/docs/protocol-methods.rst).
 
-Transport and framing are identical to upstream: newline-delimited JSON-RPC 2.0
-over a TCP connection (default mainnet port `50001`, testnet `60001`, regtest
-`60401`).
+## Transports
 
----
+| Service | Option | Default | Framing |
+|---------|--------|---------|---------|
+| `tcp://` | `--electrum-rpc-addr` | `127.0.0.1:50001` (mainnet) | newline-delimited JSON-RPC |
+| `ssl://` | `--electrum-ssl-addr` | disabled | newline-delimited JSON-RPC over TLS |
+| `ws://`  | `--electrum-ws-addr`  | disabled | one JSON-RPC message per WebSocket message |
+| `wss://` | `--electrum-wss-addr` | disabled | same, over TLS |
 
-## `blockchain.address.get_scripthash`
+* TLS is native (rustls). `ssl://` and `wss://` need `--ssl-certfile` and
+  `--ssl-keyfile` (PEM; PKCS#8, PKCS#1 or SEC1 key). The Docker images create a
+  self-signed certificate on first start when the files don't exist.
+* WebSocket framing is ElectrumX's (aiorpcX 0.22): every request is a whole
+  JSON-RPC message or batch in one text (or binary) message, without a newline;
+  every response and notification is sent as its own *text* message, without a
+  newline. Incoming messages are limited to 5 MB, like ElectrumX `MAX_RECV`.
+* `server.features` advertises the services given with `--report-services`
+  (e.g. `ssl://electrum.example.org:50002,wss://electrum.example.org:50004`),
+  or the listening addresses when it is not set.
 
-Resolve a Neurai address string to its Electrum scripthash.
+## Protocol version
 
-Useful for wallets that need to subscribe to an address by human-readable
-string (Neurai addresses don't decode with the upstream `bitcoin::Address`
-type because of the custom base58 prefixes and bech32 HRPs).
+Like ElectrumX-neurai: protocol `1.0` to `1.4`, negotiated with ElectrumX's
+algorithm (`server.version` accepts a version string or a `[min, max]` pair;
+electrum-neurai asks for `"1.0"`). An unsupported version gets an error reply
+and the connection is closed; a second `server.version` is an error. All
+methods are available whatever version was negotiated.
 
-### Request
+## Methods
+
+Every method registered by ElectrumX-neurai is supported, with the same
+positional **and named** parameters, result shapes and error messages:
+
+| Group | Methods |
+|-------|---------|
+| server | `server.version`, `server.features`, `server.banner`, `server.donation_address`, `server.ping`, `server.peers.subscribe` (always `[]`), `server.add_peer` (always `false`) |
+| headers & fees | `blockchain.headers.subscribe`, `blockchain.block.header` (with `cp_height`), `blockchain.block.headers` (with `cp_height`), `blockchain.estimatefee` (with `mode`), `blockchain.relayfee`, `mempool.get_fee_histogram` |
+| scripthash | `blockchain.scripthash.get_balance`, `.get_history`, `.get_mempool`, `.listunspent`, `.subscribe`, `.unsubscribe` |
+| transactions | `blockchain.transaction.broadcast`, `.get`, `.get_merkle`, `.get_tsc_merkle`, `.id_from_pos` |
+| assets | `blockchain.asset.get_meta`, `.get_assets_with_prefix`, `.list_addresses_by_asset`, `.broadcasts`, `.is_frozen`, `.verifier_string`, `.restricted_associations`, and `.subscribe` / `.unsubscribe` for the asset itself and for `broadcasts`, `is_frozen`, `verifier_string`, `restricted_associations` |
+| tags | `blockchain.tag.check`, `blockchain.tag.qualifier.list`, `blockchain.tag.h160.list`, `blockchain.tag.qualifier.subscribe` / `.unsubscribe`, `blockchain.tag.h160.subscribe` / `.unsubscribe` |
+
+Notes:
+
+* Asset outputs (`<P2PKH> OP_XNA_ASSET <payload> OP_DROP`) are indexed under
+  the scripthash of their base script, so `blockchain.scripthash.*` of a plain
+  address include its asset transactions. `get_balance` / `listunspent` take
+  ElectrumX's `asset` parameter (`false`, `true`, a name, or a list where `null`
+  means XNA); in multi-asset replies XNA uses the key `"rvn"`.
+* `blockchain.asset.get_meta` replies `{}` for an unknown asset and otherwise
+  `{"sats_in_circulation", "divisions", "reissuable", "has_ipfs", ["ipfs"],
+  "source": {"tx_hash", "tx_pos", "height"}, ["source_divisions"], ["source_ipfs"]}`.
+  The state is folded from the issuance events like the daemon does (reissues add
+  to the supply; units `-1` and reissues without IPFS keep the previous values,
+  whose outputs are then given as `source_divisions` / `source_ipfs`).
+  IPFS and TXID references are the base58 encoding of their 34 bytes.
+* Mempool entries in asset and tag replies have `"height": -1`.
+* `blockchain.asset.list_addresses_by_asset` is answered by the daemon's
+  `listaddressesbyasset`, which needs `assetindex=1` on the node.
+* `blockchain.transaction.get` with `verbose=true` does not need `txindex`:
+  confirmed transactions are decoded with `decoderawtransaction` and the block
+  fields (`blockhash`, `confirmations`, `time`, `blocktime`, `hex`) are added.
+
+### Subscription statuses
+
+Statuses are `sha256` of the following strings (hex, *not* reversed), or
+`null` when there is no data — the same as ElectrumX, which matters because
+electrum-neurai recomputes them:
+
+| Subscription | Hashed string |
+|--------------|---------------|
+| scripthash | `"{tx_hash}:{height}:"` for every history entry |
+| asset | `f"{sats_in_circulation}{divisions}{reissuable}{has_ipfs}"` + `ipfs` when `has_ipfs` |
+| tag.qualifier / tag.h160 | `";".join(f"{key}:{height}{tx_hash}{tx_pos}{flag}")`, sorted by key |
+| broadcasts | `";".join(f"{tx_hash}:{height}{tx_pos}{data}{expiration}")`, ascending by `(height, tx_hash, tx_pos)` |
+| restricted_associations | `";".join(f"{asset}:{height}{tx_hash}{restricted_tx_pos}{qualifying_tx_pos}{associated}")`, sorted by asset |
+
+Booleans are written `True` / `False` and a missing expiration `None`.
+`is_frozen` and `verifier_string` subscriptions send the data object itself.
+Notifications are sent when the value changes after a new block or a mempool
+update.
+
+### Differences from ElectrumX-neurai (bugs not reproduced)
+
+| ElectrumX-neurai | electrs-neurai |
+|------------------|----------------|
+| Confirmed asset names are Python `bytes`, so `listunspent` / `get_balance` with assets produce no reply | asset names are strings |
+| `get_assets_with_prefix` names start with a stray `a` | plain names |
+| asset/tag `*.unsubscribe` always return `false` | `true` when the item was subscribed |
+| `tag.check` reports `tx_hash` / `tx_pos` / `height` decoded from the lookup key | the real location of the tag |
+| mempool tags are never merged into `tag.h160.list`; mempool associations are wrong | merged / computed correctly |
+| broadcasts and freezes are not always undone on reorgs | every asset event is checked against the active chain |
+| `restricted_associations.subscribe` notifications echo `"##NAME"` | `"#NAME"`, as subscribed |
+
+`blockchain.transaction.get_tsc_merkle` keeps ElectrumX's behaviour of using
+`sha256d(raw header)` as the `block_hash` target, which for KAWPOW headers is
+not the block hash.
+
+## electrs-neurai extensions
+
+### `blockchain.address.get_scripthash`
+
+Resolve a Neurai address (base58check `N…` / `t…`, or bech32 `nq1…` / `tnq1…` /
+`rnq1…`) to its Electrum scripthash (64 hex characters).
+
 ```json
 {"id": 1, "method": "blockchain.address.get_scripthash", "params": ["NQ…"]}
 ```
 
-### Params
-| # | Type   | Description                                                            |
-|---|--------|------------------------------------------------------------------------|
-| 0 | string | A Neurai address — legacy base58check (`N…` / `t…`) or bech32 (`nq1…`, `tnq1…`, `rnq1…`, plus bech32m for taproot / future post-quantum witness versions). |
+### `blockchain.asset.get_history`
 
-### Response
-A 64-character lowercase hex string: the Electrum scripthash, i.e.
-`SHA256(script_pubkey)` in Electrum's big-endian display order.
-
-```json
-{"id": 1, "result": "4b3d912c1523ece4615e91bf0d27381ca72169dbf6b1c2ffcc9f92381d4984a3"}
-```
-
-### Errors
-- `{"code": 1, "message": "address version byte X does not match network …"}`
-  — address prefix doesn't match the server's network.
-- `{"code": 1, "message": "wrong bech32 HRP: expected nq, got …"}` — HRP
-  mismatch between the address and the server's network.
-- `{"code": 1, "message": "invalid base58check checksum"}` — standard checksum
-  failure.
-
----
-
-## `blockchain.asset.get_meta`
-
-Return the current metadata of an asset, or `null` if the name is unknown.
-
-Every confirmed `New` and `Reissue` output is stored as an event in the
-server's `asset_meta` column family. The response folds the events that are on
-the active chain, in chain order, the same way the daemon's asset cache does:
-a reissue adds to the supply, always sets `reissuable`, changes `units` unless
-it was sent as `-1`, and replaces the IPFS hash only when it carries one.
-Owner tokens (`ROOT!`) have no issuance metadata and return `null`.
-
-### Request
-```json
-{"id": 1, "method": "blockchain.asset.get_meta", "params": ["TESTASSET"]}
-```
-
-### Params
-| # | Type   | Description           |
-|---|--------|-----------------------|
-| 0 | string | Full asset name, e.g. `TESTASSET`, `ROOT/SUB`, `ROOT#UNIQUE`, `#QUALIFIER`, `$RESTRICTED`. |
-
-### Response
-Either `null` (no row found) or an object:
-
-```json
-{
-  "name": "TESTASSET",
-  "event": "new",
-  "issuance_txid": "a3d9…",
-  "issuance_height": 12345,
-  "amount": 1000000000,
-  "units": 8,
-  "reissuable": true,
-  "ipfs_hash": "11112222…",
-  "ipfs_type": "ipfs"
-}
-```
-
-| Field              | Type              | Notes                                                                              |
-|--------------------|-------------------|------------------------------------------------------------------------------------|
-| `name`             | string            | Echo of the requested name.                                                        |
-| `event`            | `"new"` / `"reissue"` | Kind of the **latest** issuance event applied.                                 |
-| `issuance_txid`    | hex string (64)   | Full txid of that latest issuance/reissue transaction.                             |
-| `issuance_height`  | integer           | Block height at which that latest event was confirmed.                             |
-| `amount`           | integer (satoshi-equivalent) | Signed 64-bit **total supply**: initial issuance plus every reissue.   |
-| `units`            | integer (0–8)     | Current decimal places.                                                            |
-| `reissuable`       | boolean           | Whether further reissuance is allowed.                                             |
-| `ipfs_hash`        | hex string (64) / `null` | Current 32-byte IPFS content hash or TXID reference.                        |
-| `ipfs_type`        | `"ipfs"` / `"txid"` / `null` | Marker byte: `0x12` = IPFS SHA-256, `0x54` = on-chain tx reference.      |
-
----
-
-## `blockchain.asset.get_history`
-
-Return every confirmed `(asset, tx, height)` event and every unconfirmed
-mempool transaction that touched the given asset. Confirmed entries are
-sorted by ascending `(height, tx_prefix)`; mempool entries are appended last
-and sorted by `(has_unconfirmed_inputs, tx_hash)` so transactions that depend
-on other unconfirmed ones come after clean ones — matching the convention
-used by `blockchain.scripthash.get_history`.
-
-Multiple transactions in the same block that touch the same asset each
-produce their own entry, so the client sees true per-transaction granularity
-(not just block-level coarsening).
-
-### Request
-```json
-{"id": 1, "method": "blockchain.asset.get_history", "params": ["TESTASSET"]}
-```
-
-### Params
-| # | Type   | Description           |
-|---|--------|-----------------------|
-| 0 | string | Full asset name.      |
-
-### Response
-A JSON array of heterogeneous objects. Each entry is either **confirmed** or
-**unconfirmed** — clients disambiguate by presence of `tx_prefix` /
-`block_hash` vs `tx_hash`.
-
-```json
-[
-  { "height": 12345, "block_hash": "a7f3…", "tx_prefix": "4a1b2c3d4e5f6071" },
-  { "height": 12345, "block_hash": "a7f3…", "tx_prefix": "9988776655443322" },
-  { "height": 12350, "block_hash": "b802…", "tx_prefix": "0011223344556677" },
-  { "height": 0,   "tx_hash": "cafe…", "fee": 4242 },
-  { "height": -1,  "tx_hash": "babe…", "fee": 8000 }
-]
-```
-
-| Field         | Present on   | Type        | Meaning                                                             |
-|---------------|--------------|-------------|---------------------------------------------------------------------|
-| `height`      | all          | integer     | Positive = confirmed; `0` = mempool (no unconfirmed inputs); `-1` = mempool and the tx depends on other unconfirmed outputs. |
-| `block_hash`  | confirmed    | hex (64)    | Block containing the transaction.                                  |
-| `tx_prefix`   | confirmed    | hex (16)    | 16-character suffix of the transaction's txid **as displayed to users**. Lets clients distinguish multiple events in the same block without a daemon round-trip: `tx_hash.ends_with(tx_prefix)` picks the matching transaction when the block is fetched. |
-| `tx_hash`     | unconfirmed  | hex (64)    | Full txid of the mempool transaction, in the standard Electrum display byte order. |
-| `fee`         | unconfirmed  | integer     | Satoshi-equivalent fee as reported by the daemon.                  |
-
-> **Byte order of `tx_prefix`** — The server stores `txid.as_byte_array()[..8]`
-> (the first 8 bytes in consensus / wire order), but emits it reversed so the
-> hex string is directly comparable to the tail of the user-facing txid
-> display (which is the reversed hex of consensus bytes). In practice:
->
-> - If your client keeps txids as display-order hex (the usual Electrum
->   convention): match with `display_txid.ends_with(tx_prefix)`.
-> - If your client holds txids as raw `[u8; 32]` in consensus order: match
->   with `bytes[..8] == reverse(hex_decode(tx_prefix))`.
->
-> Returning the full 32-byte txid per confirmed event would require re-reading
-> the block, so only the 8-byte fingerprint is persisted in the
-> `asset_history` column family. Clients that need the full txid can fetch
-> the block and select the matching tx by suffix.
-
----
+Every confirmed `(asset, tx, height)` event and every mempool transaction that
+touched an asset. Confirmed entries: `{"height", "block_hash", "tx_prefix"}`
+where `tx_prefix` is the last 16 hex characters of the displayed txid; mempool
+entries: `{"height": 0 or -1, "tx_hash", "fee"}`.
 
 ## Behaviour during initial sync
 
-While electrs-neurai is still building its index (the period before the first
-compaction completes), all three new methods return the standard
-`{"code": -32603, "message": "unavailable index"}` error, matching the
-behaviour of `blockchain.scripthash.get_history` and other index-dependent
-methods. A handful of bootstrap methods (`blockchain.block.header`,
-`blockchain.block.headers`, `blockchain.headers.subscribe`, `server.version`)
-remain available so clients can display a meaningful "syncing" status.
+Until the first index compaction completes, index-dependent methods return
+`{"code": -32603, "message": "unavailable index"}`. `server.*`,
+`blockchain.headers.subscribe`, `blockchain.block.header(s)`,
+`blockchain.estimatefee` and `blockchain.relayfee` remain available.

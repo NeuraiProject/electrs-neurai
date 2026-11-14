@@ -41,5 +41,5 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
 WORKDIR /workspace/electrs-neurai
 COPY . .
 
-RUN cargo build --locked --bin electrs-neurai
+RUN cargo build --locked --bin electrs
 RUN cargo test  --locked

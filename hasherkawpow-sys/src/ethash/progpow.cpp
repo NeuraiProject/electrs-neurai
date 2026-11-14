@@ -357,6 +357,49 @@ void hash_one(const epoch_context& context, int block_number, const hash256 *hea
         hash_out_ptr->word32s[i] = le::uint32(state[i]);
 }
 
+void hash_no_verify(const hash256 *header_hash, const hash256 &mix_hash, uint64_t nonce,
+    hash256 *hash_out) noexcept
+{
+    // The same two Keccak-f[800] rounds as verify() below, without recomputing the mix
+    // (Ravencoin's progpow::hash_no_verify, used by KAWPOWHash_OnlyMix / GetHash()).
+    // No epoch context and no dataset access: this costs two permutations.
+    uint32_t state2[8];
+
+    {
+        uint32_t state[25] = {0x0};     // Keccak's state
+
+        for (int i = 0; i < 8; i++)
+            state[i] = header_hash->word32s[i];
+
+        state[8] = nonce;
+        state[9] = nonce >> 32;
+
+        for (int i = 10; i < 25; i++)
+            state[i] = ravencoin_kawpow[i-10];
+
+        keccak_progpow_64(state);
+
+        for (int i = 0; i < 8; i++)
+            state2[i] = state[i];
+    }
+
+    uint32_t state[25] = {0x0};     // Keccak's state
+
+    for (int i = 0; i < 8; i++)
+        state[i] = state2[i];
+
+    for (int i = 8; i < 16; i++)
+        state[i] = mix_hash.word32s[i-8];
+
+    for (int i = 16; i < 25; i++)
+        state[i] = ravencoin_kawpow[i - 16];
+
+    keccak_progpow_256(state);
+
+    for (int i = 0; i < 8; ++i)
+        hash_out->word32s[i] = le::uint32(state[i]);
+}
+
 bool verify(const epoch_context& context, int block_number, const hash256 *header_hash,
     const hash256 &mix_hash, uint64_t nonce, hash256 *hash_out) noexcept
 {

@@ -7,7 +7,8 @@ use std::ops::ControlFlow;
 use std::thread;
 
 use crate::neurai::asset::{
-    is_null_asset_script, parse_asset_script, AssetData, AssetOutput, IpfsRef,
+    is_null_asset_script, parse_asset_script, parse_null_asset_script, AssetData, AssetOutput,
+    IpfsRef, NullAssetScript, TaggedDestination,
 };
 use crate::neurai::block::neurai_to_bsl_block;
 use crate::neurai::NetworkParams;
@@ -18,9 +19,9 @@ use crate::{
     metrics::{self, Gauge, Histogram, Metrics},
     signals::ExitFlag,
     types::{
-        bsl_txid, AssetFundingRow, AssetHistoryRow, AssetMetaEvent, AssetMetaEventRow,
-        AssetMetadata, HashPrefixRow, HeaderRow, ScriptHash, ScriptHashRow, SerBlock,
-        SpendingPrefixRow, TxidRow,
+        bsl_txid, verifier_qualifiers, AssetEventKind, AssetEventPayload, AssetEventRow,
+        AssetFundingRow, AssetHistoryRow, AssetMetaEvent, AssetMetaEventRow,
+        HashPrefixRow, HeaderRow, ScriptHash, ScriptHashRow, SerBlock, SpendingPrefixRow, TxidRow,
     },
 };
 
@@ -216,12 +217,11 @@ impl Index {
             })
     }
 
-    /// Current asset state: its `New` / `Reissue` events on the active chain,
-    /// folded in chain order. Events from blocks that were reorged away are
+    /// `New` / `Reissue` / `Owner` events of an asset that are on the active
+    /// chain, in chain order. Events from blocks that were reorged away are
     /// dropped by checking their block hash against the chain at their height.
-    pub(crate) fn get_asset_metadata(&self, name: &[u8]) -> Option<AssetMetadata> {
-        let events: Vec<AssetMetaEventRow> = self
-            .store
+    pub(crate) fn asset_meta_events(&self, name: &[u8]) -> Vec<AssetMetaEventRow> {
+        self.store
             .iter_asset_meta(AssetMetaEventRow::scan_prefix(name))
             .into_iter()
             .filter_map(|(key, value)| match AssetMetaEventRow::from_db(&key, &value) {
@@ -233,8 +233,41 @@ impl Index {
             })
             .filter(|row| row.name == name) // 8-byte name prefixes may collide
             .filter(|row| self.chain.get_block_hash(row.height as usize) == Some(row.block_hash))
-            .collect();
-        AssetMetadata::fold(&events)
+            .collect()
+    }
+
+    /// `asset_events` rows of one kind and logical key on the active chain,
+    /// in chain order.
+    pub(crate) fn asset_events(&self, kind: AssetEventKind, key: &[u8]) -> Vec<AssetEventRow> {
+        self.store
+            .iter_asset_events(crate::types::asset_event_prefix(kind, key))
+            .into_iter()
+            .filter_map(|(k, v)| match AssetEventRow::from_db(&k, &v) {
+                Ok(row) => Some(row),
+                Err(e) => {
+                    warn!("skipping invalid asset_events row: {}", e);
+                    None
+                }
+            })
+            .filter(|row| row.kind == kind && row.key == key)
+            .filter(|row| self.chain.get_block_hash(row.height as usize) == Some(row.block_hash))
+            .collect()
+    }
+
+    /// Names of the assets created on the active chain that start with `prefix`.
+    pub(crate) fn assets_with_prefix(&self, prefix: &[u8]) -> Vec<String> {
+        self.store
+            .iter_asset_names(prefix)
+            .into_iter()
+            .filter(|(_, value)| {
+                value.len() == 36 && {
+                    let height = u32::from_be_bytes(value[..4].try_into().expect("4 bytes"));
+                    let hash = BlockHash::from_slice(&value[4..]).expect("32 bytes");
+                    self.chain.get_block_hash(height as usize) == Some(hash)
+                }
+            })
+            .map(|(name, _)| String::from_utf8_lossy(&name).into_owned())
+            .collect()
     }
 
     // Return `Ok(true)` when the chain is fully synced and the index is compacted.
@@ -336,13 +369,22 @@ impl Index {
     }
 }
 
-fn asset_name_of(data: &AssetData) -> &str {
+pub(crate) fn asset_name_of(data: &AssetData) -> &str {
     match data {
         AssetData::New(a) => a.name.as_str(),
         AssetData::Transfer(a) => a.name.as_str(),
         AssetData::Reissue(a) => a.name.as_str(),
         AssetData::Owner(a) => a.name.as_str(),
     }
+}
+
+/// Where a transaction sits on the chain (zeroed for mempool transactions).
+#[derive(Clone, Copy)]
+pub(crate) struct TxLocation {
+    pub txid: Txid,
+    pub block_hash: BlockHash,
+    pub height: u32,
+    pub tx_pos: u32,
 }
 
 /// Where an asset output sits on the chain.
@@ -354,8 +396,20 @@ struct OutputLocation {
     vout: u32,
 }
 
-/// Build the `asset_meta` event row for a `New` or `Reissue` output.
-/// Transfer/Owner outputs don't change metadata — they're tracked only in
+impl TxLocation {
+    fn output(&self, vout: u32) -> OutputLocation {
+        OutputLocation {
+            txid: self.txid,
+            block_hash: self.block_hash,
+            height: self.height,
+            tx_pos: self.tx_pos,
+            vout,
+        }
+    }
+}
+
+/// Build the `asset_meta` event row for a `New`, `Reissue` or `Owner` output.
+/// Transfer outputs don't change metadata — they're tracked only in
 /// history/funding.
 fn asset_meta_event_of(data: &AssetData, loc: &OutputLocation) -> Option<AssetMetaEventRow> {
     let (event, name, amount, units, reissuable, ipfs) = match data {
@@ -375,7 +429,15 @@ fn asset_meta_event_of(data: &AssetData, loc: &OutputLocation) -> Option<AssetMe
             a.reissuable,
             a.ipfs.as_ref(),
         ),
-        AssetData::Transfer(_) | AssetData::Owner(_) => return None,
+        AssetData::Owner(a) => (
+            AssetMetaEvent::Owner,
+            &a.name,
+            100_000_000, // OWNER_ASSET_AMOUNT
+            0,
+            false,
+            None,
+        ),
+        AssetData::Transfer(_) => return None,
     };
     let (ipfs_marker, ipfs_hash) = match ipfs {
         Some(IpfsRef { marker, hash }) => (*marker, *hash),
@@ -395,6 +457,153 @@ fn asset_meta_event_of(data: &AssetData, loc: &OutputLocation) -> Option<AssetMe
         ipfs_marker,
         ipfs_hash,
     })
+}
+
+/// Asset-related outputs of one transaction, as collected while parsing it.
+#[derive(Default)]
+pub(crate) struct TxAssetOutputs {
+    /// `(vout, scripthash of the base script, parsed asset output)`
+    pub assets: Vec<(u32, ScriptHash, AssetOutput)>,
+    /// Null-asset outputs (tags, freezes, verifier strings).
+    pub null_assets: Vec<(u32, NullAssetScript)>,
+}
+
+impl TxAssetOutputs {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.assets.is_empty() && self.null_assets.is_empty()
+    }
+
+    /// Record an output if it is asset-related. Returns the scripthash the
+    /// output is indexed under (base script for asset outputs), or `None` for
+    /// unspendable outputs (OP_RETURN and null-asset scripts).
+    pub(crate) fn add_output(&mut self, vout: u32, script_bytes: &[u8]) -> Option<ScriptHash> {
+        if is_null_asset_script(script_bytes) {
+            if let Some(null_asset) = parse_null_asset_script(script_bytes) {
+                self.null_assets.push((vout, null_asset));
+            }
+            return None;
+        }
+        if bitcoin::Script::from_bytes(script_bytes).is_op_return() {
+            return None;
+        }
+        // Asset-wrapped outputs hash on the *base* script (the P2PKH or
+        // AuthScript prefix before OP_XNA_ASSET) so that a wallet subscribed to
+        // the bare address sees the asset transfer.
+        match parse_asset_script(script_bytes) {
+            Some(asset) => {
+                let scripthash = ScriptHash::hash(&asset.base_script);
+                self.assets.push((vout, scripthash, asset));
+                Some(scripthash)
+            }
+            None => Some(ScriptHash::hash(script_bytes)),
+        }
+    }
+}
+
+/// Rows derived from one transaction's asset outputs.
+#[derive(Default)]
+pub(crate) struct TxAssetEvents {
+    pub meta: Vec<AssetMetaEventRow>,
+    /// `(name, height ‖ block hash)` of created assets
+    pub names: Vec<(Vec<u8>, Vec<u8>)>,
+    pub events: Vec<AssetEventRow>,
+}
+
+/// Turn a transaction's asset outputs into `asset_meta`, `asset_names` and
+/// `asset_events` rows, following ElectrumX-neurai's block processor:
+/// * tags `c0 14 <h160> <push>` are recorded under both the asset and the h160;
+/// * a verifier string applies to the *last* `$RESTRICTED` output of the tx and
+///   only counts when there is one; the last verifier output wins;
+/// * a transfer of an owner token (`!`) or channel (`~`) carrying a message is
+///   a broadcast candidate.
+pub(crate) fn tx_asset_events(loc: TxLocation, outputs: TxAssetOutputs) -> TxAssetEvents {
+    let mut result = TxAssetEvents::default();
+    let event = |vout: u32, kind: AssetEventKind, key: Vec<u8>, payload: AssetEventPayload| AssetEventRow {
+        kind,
+        key,
+        txid: loc.txid,
+        block_hash: loc.block_hash,
+        height: loc.height,
+        tx_pos: loc.tx_pos,
+        vout,
+        payload,
+    };
+    let mut last_restricted: Option<(u32, String)> = None;
+    for (vout, scripthash, asset) in &outputs.assets {
+        let name = asset_name_of(&asset.data);
+        if name.starts_with('$') {
+            last_restricted = Some((*vout, name.to_owned()));
+        }
+        if let Some(meta) = asset_meta_event_of(&asset.data, &loc.output(*vout)) {
+            if matches!(meta.event, AssetMetaEvent::New | AssetMetaEvent::Owner) {
+                let mut value = loc.height.to_be_bytes().to_vec();
+                value.extend_from_slice(loc.block_hash.as_byte_array());
+                result.names.push((meta.name.clone(), value));
+            }
+            result.meta.push(meta);
+        }
+        if let AssetData::Transfer(t) = &asset.data {
+            if let (Some(message), true) = (&t.message, t.name.contains('!') || t.name.contains('~')) {
+                let mut data = [0u8; 34];
+                data[0] = message.ipfs.marker;
+                data[1] = 0x20;
+                data[2..].copy_from_slice(&message.ipfs.hash);
+                let payload = AssetEventPayload::Broadcast {
+                    asset: t.name.clone(),
+                    data,
+                    expiration: message.expire_time.map(|t| t as u64),
+                    scripthash: *scripthash,
+                };
+                result.events.push(event(*vout, AssetEventKind::Broadcast, t.name.as_bytes().to_vec(), payload));
+            }
+        }
+    }
+    let mut verifier: Option<(u32, String)> = None;
+    for (vout, null_asset) in outputs.null_assets {
+        match null_asset {
+            NullAssetScript::AddressTag {
+                destination: TaggedDestination::Legacy(h160),
+                asset_name,
+                flag,
+            } => {
+                let payload = AssetEventPayload::Tag {
+                    h160,
+                    asset: asset_name.clone(),
+                    flag: flag != 0,
+                };
+                result.events.push(event(vout, AssetEventKind::TagByAsset, asset_name.into_bytes(), payload.clone()));
+                result.events.push(event(vout, AssetEventKind::TagByH160, h160.to_vec(), payload));
+            }
+            // AuthScript (DePIN testnet) tags have no h160; ElectrumX doesn't
+            // index them either.
+            NullAssetScript::AddressTag { .. } => (),
+            NullAssetScript::GlobalRestriction { asset_name, flag } => {
+                let payload = AssetEventPayload::Freeze {
+                    asset: asset_name.clone(),
+                    flag: flag != 0,
+                };
+                result.events.push(event(vout, AssetEventKind::Freeze, asset_name.into_bytes(), payload));
+            }
+            NullAssetScript::Verifier { verifier_string } => verifier = Some((vout, verifier_string)),
+        }
+    }
+    if let (Some((vout, string)), Some((restricted_vout, restricted))) = (verifier, last_restricted) {
+        for qualifier in verifier_qualifiers(&string) {
+            let qualifier = format!("#{}", qualifier);
+            let payload = AssetEventPayload::Association {
+                qualifier: qualifier.clone(),
+                restricted: restricted.clone(),
+            };
+            result.events.push(event(vout, AssetEventKind::Association, qualifier.into_bytes(), payload));
+        }
+        let payload = AssetEventPayload::Verifier {
+            asset: restricted.clone(),
+            string,
+            restricted_vout,
+        };
+        result.events.push(event(vout, AssetEventKind::Verifier, restricted.into_bytes(), payload));
+    }
+    result
 }
 
 fn index_single_block(
@@ -423,7 +632,7 @@ fn index_single_block(
         /// calls `visit_tx_out` for every output *before* `visit_transaction`
         /// (the txid is only known once the whole transaction is parsed), so
         /// they are indexed when `visit_transaction` runs.
-        pending_assets: Vec<(u32, ScriptHash, AssetOutput)>,
+        pending: TxAssetOutputs,
     }
 
     impl Visitor for IndexBlockVisitor<'_> {
@@ -432,45 +641,43 @@ fn index_single_block(
             self.batch
                 .txid_rows
                 .push(TxidRow::row(txid, self.height).to_db_row());
-            for (vout, scripthash, asset) in std::mem::take(&mut self.pending_assets) {
-                let loc = OutputLocation {
+            if !self.pending.is_empty() {
+                let outputs = std::mem::take(&mut self.pending);
+                for (_, scripthash, asset) in &outputs.assets {
+                    let name_bytes = asset_name_of(&asset.data).as_bytes();
+                    self.batch
+                        .asset_history_rows
+                        .push(AssetHistoryRow::row(name_bytes, txid, self.height));
+                    self.batch
+                        .asset_funding_rows
+                        .push(AssetFundingRow::row(*scripthash, name_bytes, self.height));
+                }
+                let loc = TxLocation {
                     txid,
                     block_hash: self.block_hash,
                     height: self.height as u32,
                     tx_pos: self.tx_pos,
-                    vout,
                 };
-                self.index_asset_output(scripthash, asset, &loc);
+                let events = tx_asset_events(loc, outputs);
+                self.batch
+                    .asset_meta_rows
+                    .extend(events.meta.iter().map(|m| (m.key(), m.value())));
+                self.batch.asset_name_rows.extend(events.names);
+                self.batch
+                    .asset_event_rows
+                    .extend(events.events.iter().map(|e| (e.key_bytes(), e.value_bytes())));
             }
             self.tx_pos += 1;
             ControlFlow::Continue(())
         }
 
         fn visit_tx_out(&mut self, vout: usize, tx_out: &bsl::TxOut) -> ControlFlow<()> {
-            let script_bytes = tx_out.script_pubkey();
-            let script = bitcoin::Script::from_bytes(script_bytes);
-            // Skip unspendable outputs:
-            //   * OP_RETURN data carriers,
-            //   * Null-asset scripts (OP_XNA_ASSET-prefixed: address tagging,
-            //     freeze/unfreeze, global restrictions, verifier strings) —
-            //     mirrors `CScript::IsUnspendable` in the daemon.
-            if !script.is_op_return() && !is_null_asset_script(script_bytes) {
-                // Asset-wrapped outputs must hash on the *base* script (the
-                // P2PKH or AuthScript prefix before OP_XNA_ASSET) so that a
-                // wallet subscribed to the bare address sees the asset
-                // transfer. Compute the scripthash from the base when present,
-                // and reuse the parsed AssetOutput for the asset event.
-                let asset = parse_asset_script(script_bytes);
-                let scripthash = match &asset {
-                    Some(a) => ScriptHash::hash(&a.base_script),
-                    None => ScriptHash::hash(script_bytes),
-                };
+            // Unspendable outputs (OP_RETURN, null-asset scripts — mirrors
+            // `CScript::IsUnspendable`) get no funding row.
+            if let Some(scripthash) = self.pending.add_output(vout as u32, tx_out.script_pubkey()) {
                 self.batch
                     .funding_rows
                     .push(ScriptHashRow::row(scripthash, self.height).to_db_row());
-                if let Some(asset) = asset {
-                    self.pending_assets.push((vout as u32, scripthash, asset));
-                }
             }
             ControlFlow::Continue(())
         }
@@ -486,33 +693,12 @@ fn index_single_block(
         // visit_block_header: default no-op (header already stored above)
     }
 
-    impl IndexBlockVisitor<'_> {
-        fn index_asset_output(
-            &mut self,
-            scripthash: ScriptHash,
-            asset: AssetOutput,
-            loc: &OutputLocation,
-        ) {
-            let name_bytes = asset_name_of(&asset.data).as_bytes();
-            self.batch
-                .asset_history_rows
-                .push(AssetHistoryRow::row(name_bytes, loc.txid, self.height));
-            self.batch
-                .asset_funding_rows
-                .push(AssetFundingRow::row(scripthash, name_bytes, self.height));
-
-            if let Some(event) = asset_meta_event_of(&asset.data, loc) {
-                self.batch.asset_meta_rows.push((event.key(), event.value()));
-            }
-        }
-    }
-
     let mut index_block = IndexBlockVisitor {
         batch,
         height,
         block_hash,
         tx_pos: 0,
-        pending_assets: Vec::new(),
+        pending: TxAssetOutputs::default(),
     };
     bsl::Block::visit(&synthetic_block, &mut index_block).expect("core returned invalid block");
 
@@ -525,12 +711,14 @@ fn index_single_block(
 #[cfg(test)]
 mod tests {
     use super::{asset_meta_event_of, asset_name_of, index_single_block, OutputLocation};
+    #[allow(unused_imports)]
+    use super::{tx_asset_events, TxAssetOutputs, TxLocation};
     use crate::db::WriteBatch;
     use crate::neurai::asset::{
         parse_asset_script, AssetData, ASSET_MAGIC, OP_DROP, OP_XNA_ASSET, TYPE_NEW, TYPE_TRANSFER,
     };
     use crate::neurai::{NeuraiNetwork, NetworkParams};
-    use crate::types::{AssetHistoryRow, AssetMetaEvent, AssetMetaEventRow};
+    use crate::types::{AssetEventRow, AssetHistoryRow, AssetMetaEvent, AssetMetaEventRow};
     use bitcoin::hashes::{hex::FromHex, Hash};
     use bitcoin::{BlockHash, Txid};
     use std::str::FromStr;
@@ -606,6 +794,104 @@ mod tests {
         assert!(asset_meta_event_of(&asset.data, &location(1)).is_none());
     }
 
+    fn index_fixture(height: u32, hash: &str) -> (BlockHash, Vec<AssetEventRow>) {
+        let params = NetworkParams::for_network(NeuraiNetwork::RegtestV1);
+        let path = format!(
+            "{}/tests/fixtures/neurai-v1.0.7-regtest-block-{}.hex",
+            env!("CARGO_MANIFEST_DIR"),
+            height
+        );
+        let block = Vec::<u8>::from_hex(std::fs::read_to_string(path).unwrap().trim()).unwrap();
+        let block_hash = BlockHash::from_str(hash).unwrap();
+        let mut batch = WriteBatch::default();
+        index_single_block(block_hash, block, height as usize, &mut batch, params);
+        let events = batch
+            .asset_event_rows
+            .iter()
+            .map(|(k, v)| AssetEventRow::from_db(k, v).unwrap())
+            .collect();
+        (block_hash, events)
+    }
+
+    fn txid(s: &str) -> Txid {
+        Txid::from_str(s).unwrap()
+    }
+
+    /// Qualifier tags, per-address and global freezes, verifier strings,
+    /// qualifier associations and broadcasts, from regtest blocks mined by
+    /// neuraid v1.0.7 (`addtagtoaddress`, `freezeaddress`,
+    /// `issuerestrictedasset`, `freezerestrictedasset`, `sendmessage`,
+    /// `removetagfromaddress`, `unfreeze*`, `reissuerestrictedasset`).
+    #[test]
+    fn real_v107_restricted_and_messaging_events() {
+        use crate::types::{AssetEventKind as K, AssetEventPayload as P};
+        let h160: [u8; 20] = hex_lit::hex!("9b312db54c03455177cc6bf4e5364f5191b7a308");
+
+        // 1104: freezeaddress $SHORT + addtagtoaddress #KYC, both for one h160
+        let (hash, events) = index_fixture(1104, "5a58fd706978a421caa2e4b299391c7353c7f1cd5d953cbe10cd215f17fc2603");
+        assert_eq!(events.len(), 4); // each tag is keyed by asset and by h160
+        let freeze = &events[0];
+        assert_eq!((freeze.kind, freeze.key.as_slice()), (K::TagByAsset, b"$SHORT".as_slice()));
+        assert_eq!(freeze.txid, txid("bd83e750370083a6f65dabcb743313ce16cde9eddd36d3b60f46b59864e653aa"));
+        assert_eq!((freeze.block_hash, freeze.height, freeze.tx_pos, freeze.vout), (hash, 1104, 1, 1));
+        assert_eq!(freeze.payload, P::Tag { h160, asset: "$SHORT".into(), flag: true });
+        assert_eq!((events[1].kind, events[1].key.as_slice()), (K::TagByH160, h160.as_slice()));
+        assert_eq!(events[3].payload, P::Tag { h160, asset: "#KYC".into(), flag: true });
+
+        // 1106: issuerestrictedasset $SHORT with verifier "KYC" (verifier vout 3, $ output vout 4)
+        let (_, events) = index_fixture(1106, "1ee8b1659c283305320265f3ad8eace4c1995e5ee5b58ab4a1d98f7d5cf1a6f0");
+        let kinds: Vec<K> = events.iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, vec![K::Association, K::Verifier]);
+        assert_eq!(events[0].key, b"#KYC");
+        assert_eq!(events[0].payload, P::Association { qualifier: "#KYC".into(), restricted: "$SHORT".into() });
+        assert_eq!(events[1].vout, 3);
+        assert_eq!(
+            events[1].payload,
+            P::Verifier { asset: "$SHORT".into(), string: "KYC".into(), restricted_vout: 4 }
+        );
+
+        // 1107: freezerestrictedasset $SHORT (global)
+        let (_, events) = index_fixture(1107, "484f2b0705ccce3f60a7e569d0d8f5688460474c80cba293007614dbe4031445");
+        assert_eq!(events.len(), 1);
+        assert_eq!((events[0].kind, events[0].vout), (K::Freeze, 2));
+        assert_eq!(events[0].payload, P::Freeze { asset: "$SHORT".into(), flag: true });
+
+        // 1110: sendmessage "SHORT!" <ipfs> 1999999999
+        let (_, events) = index_fixture(1110, "6eacc60e737caaf92a0d0370e1a1484bd31ee496ac74ad87ed9a57095a733b79");
+        assert_eq!(events.len(), 1);
+        match &events[0].payload {
+            P::Broadcast { asset, data, expiration, .. } => {
+                assert_eq!(asset, "SHORT!");
+                assert_eq!(bitcoin::base58::encode(data), "QmTqu3Lk3gmTsQVtjU7rYYM37EAW4xNmbuEAp2Mjr4AV7E");
+                assert_eq!(*expiration, Some(1_999_999_999));
+            }
+            other => panic!("expected a broadcast, got {other:?}"),
+        }
+        assert_eq!((events[0].tx_pos, events[0].vout), (1, 1));
+
+        // 1111: unfreezeaddress, unfreezerestrictedasset, removetagfromaddress, channel message
+        let (_, events) = index_fixture(1111, "713c11205b3fd68a37c490e8b228448a96131888e2bb0e8717b2eef94bcc64c8");
+        let by_asset: Vec<&AssetEventRow> = events.iter().filter(|e| e.kind != K::TagByH160).collect();
+        assert_eq!(by_asset[0].payload, P::Tag { h160, asset: "$SHORT".into(), flag: false });
+        assert_eq!(by_asset[1].payload, P::Freeze { asset: "$SHORT".into(), flag: false });
+        assert_eq!(by_asset[2].payload, P::Tag { h160, asset: "#KYC".into(), flag: false });
+        match &by_asset[3].payload {
+            P::Broadcast { asset, expiration, .. } => assert_eq!((asset.as_str(), *expiration), ("SHORT~CHAN", None)),
+            other => panic!("expected a broadcast, got {other:?}"),
+        }
+
+        // 1112: reissuerestrictedasset $SHORT with the new verifier "KYC&!BAD"
+        let (_, events) = index_fixture(1112, "760c9129ee534a3f188b743af17a66521a946c675f0639bf7c2639cf8bfbc145");
+        let associations: Vec<&[u8]> = events.iter().filter(|e| e.kind == K::Association).map(|e| e.key.as_slice()).collect();
+        assert_eq!(associations, vec![b"#KYC".as_slice(), b"#BAD".as_slice()]);
+        let verifier = events.iter().find(|e| e.kind == K::Verifier).unwrap();
+        assert_eq!(
+            verifier.payload,
+            P::Verifier { asset: "$SHORT".into(), string: "KYC&!BAD".into(), restricted_vout: 4 }
+        );
+        assert_eq!(verifier.vout, 1);
+    }
+
     /// Regtest block 1101 mined by neuraid v1.0.7: coinbase + three `issue`
     /// transactions (SHORT, LONGTRANSFERNAME12345, and a 30-char name with an
     /// IPFS hash whose payload needs OP_PUSHDATA1). Every asset row must carry
@@ -628,7 +914,16 @@ mod tests {
         ];
         assert_eq!(batch.txid_rows.len(), 4);
         assert_eq!(batch.asset_history_rows.len(), 2 * issues.len()); // owner + new each
-        assert_eq!(batch.asset_meta_rows.len(), issues.len());
+        // owner + new event per issuance, in output order
+        assert_eq!(batch.asset_meta_rows.len(), 2 * issues.len());
+        let new_events: Vec<AssetMetaEventRow> = batch
+            .asset_meta_rows
+            .iter()
+            .map(|(k, v)| AssetMetaEventRow::from_db(k, v).unwrap())
+            .filter(|e| e.event == AssetMetaEvent::New)
+            .collect();
+        assert_eq!(new_events.len(), issues.len());
+        assert_eq!(batch.asset_name_rows.len(), 2 * issues.len());
 
         for (tx_pos, (name, txid, qty, units)) in issues.iter().enumerate() {
             let txid = Txid::from_str(txid).unwrap();
@@ -636,8 +931,7 @@ mod tests {
                 let row = AssetHistoryRow::row(asset.as_bytes(), txid, 1101);
                 assert!(batch.asset_history_rows.contains(&row), "missing history row for {asset}");
             }
-            let (key, value) = &batch.asset_meta_rows[tx_pos];
-            let event = AssetMetaEventRow::from_db(key, value).unwrap();
+            let event = &new_events[tx_pos];
             assert_eq!(event.name, name.as_bytes());
             assert_eq!(event.txid, txid);
             assert_eq!(event.block_hash, block_hash);
@@ -645,8 +939,6 @@ mod tests {
             assert_eq!(event.amount, qty * 100_000_000);
             assert_eq!(event.units, *units);
         }
-        let (key, value) = &batch.asset_meta_rows[2];
-        let event = AssetMetaEventRow::from_db(key, value).unwrap();
-        assert_eq!(event.ipfs_marker, 0x12);
+        assert_eq!(new_events[2].ipfs_marker, 0x12);
     }
 }

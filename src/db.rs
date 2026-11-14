@@ -22,6 +22,10 @@ pub(crate) struct WriteBatch {
     /// `(key, value)` of `AssetMetaEventRow`s — written to `asset_meta` CF.
     /// Every issuance event has its own key, so write order doesn't matter.
     pub(crate) asset_meta_rows: Vec<(Vec<u8>, Vec<u8>)>,
+    /// `(key, value)` of `AssetEventRow`s — written to `asset_events` CF.
+    pub(crate) asset_event_rows: Vec<(Vec<u8>, Vec<u8>)>,
+    /// `(asset name, height ‖ block hash)` — written to `asset_names` CF.
+    pub(crate) asset_name_rows: Vec<(Vec<u8>, Vec<u8>)>,
     pub(crate) asset_history_rows: Vec<SerializedAssetHistoryRow>,
     pub(crate) asset_funding_rows: Vec<SerializedAssetFundingRow>,
 }
@@ -33,6 +37,8 @@ impl WriteBatch {
         self.spending_rows.sort_unstable();
         self.txid_rows.sort_unstable();
         self.asset_meta_rows.sort();
+        self.asset_event_rows.sort();
+        self.asset_name_rows.sort();
         self.asset_history_rows.sort_unstable();
         self.asset_funding_rows.sort_unstable();
     }
@@ -52,6 +58,9 @@ const SPENDING_CF: &str = "spending";
 const ASSET_META_CF: &str = "asset_meta";
 const ASSET_HISTORY_CF: &str = "asset_history";
 const ASSET_FUNDING_CF: &str = "asset_funding";
+const ASSET_EVENTS_CF: &str = "asset_events";
+/// Keyed by the full asset name, iterated in total order (no prefix extractor).
+const ASSET_NAMES_CF: &str = "asset_names";
 
 const COLUMN_FAMILIES: &[&str] = &[
     CONFIG_CF,
@@ -62,6 +71,8 @@ const COLUMN_FAMILIES: &[&str] = &[
     ASSET_META_CF,
     ASSET_HISTORY_CF,
     ASSET_FUNDING_CF,
+    ASSET_EVENTS_CF,
+    ASSET_NAMES_CF,
 ];
 
 const CONFIG_KEY: &str = "C";
@@ -121,7 +132,10 @@ struct Config {
 //           recognised, asset rows carry the right txid, and `asset_meta` is an
 //           append-only log of issuance events keyed by (name, height, tx, vout)
 //           instead of one overwritten value per asset name.
-const CURRENT_FORMAT: u64 = 4;
+// Format 5: owner-token events in `asset_meta`; new `asset_events` (tags,
+//           freezes, verifier strings, associations, broadcasts) and
+//           `asset_names` column families for ElectrumX-neurai compatibility.
+const CURRENT_FORMAT: u64 = 5;
 
 impl Default for Config {
     fn default() -> Self {
@@ -157,7 +171,14 @@ impl DBStore {
     fn create_cf_descriptors(parallelism: u8) -> Vec<rocksdb::ColumnFamilyDescriptor> {
         COLUMN_FAMILIES
             .iter()
-            .map(|&name| rocksdb::ColumnFamilyDescriptor::new(name, default_opts(parallelism)))
+            .map(|&name| {
+                let mut opts = default_opts(parallelism);
+                if name == ASSET_NAMES_CF {
+                    // variable-length keys scanned by arbitrary prefixes
+                    opts.set_prefix_extractor(rocksdb::SliceTransform::create_noop());
+                }
+                rocksdb::ColumnFamilyDescriptor::new(name, opts)
+            })
             .collect()
     }
 
@@ -273,6 +294,18 @@ impl DBStore {
             .expect("missing ASSET_META_CF")
     }
 
+    fn asset_events_cf(&self) -> &rocksdb::ColumnFamily {
+        self.db
+            .cf_handle(ASSET_EVENTS_CF)
+            .expect("missing ASSET_EVENTS_CF")
+    }
+
+    fn asset_names_cf(&self) -> &rocksdb::ColumnFamily {
+        self.db
+            .cf_handle(ASSET_NAMES_CF)
+            .expect("missing ASSET_NAMES_CF")
+    }
+
     fn asset_history_cf(&self) -> &rocksdb::ColumnFamily {
         self.db
             .cf_handle(ASSET_HISTORY_CF)
@@ -351,9 +384,36 @@ impl DBStore {
 
     /// All `asset_meta` rows whose key starts with `prefix`, in key order.
     pub(crate) fn iter_asset_meta(&self, prefix: HashPrefix) -> Vec<KeyValue> {
+        self.scan_prefix_cf(self.asset_meta_cf(), prefix)
+    }
+
+    /// All `asset_events` rows whose key starts with `prefix`, in key order.
+    pub(crate) fn iter_asset_events(&self, prefix: HashPrefix) -> Vec<KeyValue> {
+        self.scan_prefix_cf(self.asset_events_cf(), prefix)
+    }
+
+    /// `asset_names` rows whose name starts with `prefix` (byte order).
+    pub(crate) fn iter_asset_names(&self, prefix: &[u8]) -> Vec<KeyValue> {
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.set_total_order_seek(true);
+        let mut raw = self.db.raw_iterator_cf_opt(self.asset_names_cf(), opts);
+        raw.seek(prefix);
+        let mut rows = Vec::new();
+        while let (Some(key), Some(value)) = (raw.key(), raw.value()) {
+            if !key.starts_with(prefix) {
+                break;
+            }
+            rows.push((key.into(), value.into()));
+            raw.next();
+        }
+        raw.status().expect("asset_names scan failed");
+        rows
+    }
+
+    fn scan_prefix_cf(&self, cf: &rocksdb::ColumnFamily, prefix: HashPrefix) -> Vec<KeyValue> {
         let mut opts = rocksdb::ReadOptions::default();
         opts.set_prefix_same_as_start(true);
-        let mut raw = self.db.raw_iterator_cf_opt(self.asset_meta_cf(), opts);
+        let mut raw = self.db.raw_iterator_cf_opt(cf, opts);
         raw.seek(prefix);
         let mut rows = Vec::new();
         while let (Some(key), Some(value)) = (raw.key(), raw.value()) {
@@ -363,7 +423,7 @@ impl DBStore {
             rows.push((key.into(), value.into()));
             raw.next();
         }
-        raw.status().expect("asset_meta scan failed");
+        raw.status().expect("prefix scan failed");
         rows
     }
 
@@ -396,6 +456,14 @@ impl DBStore {
         let asset_meta_cf = self.asset_meta_cf();
         for (name, meta) in &batch.asset_meta_rows {
             db_batch.put_cf(asset_meta_cf, name, meta);
+        }
+        let asset_events_cf = self.asset_events_cf();
+        for (key, value) in &batch.asset_event_rows {
+            db_batch.put_cf(asset_events_cf, key, value);
+        }
+        let asset_names_cf = self.asset_names_cf();
+        for (key, value) in &batch.asset_name_rows {
+            db_batch.put_cf(asset_names_cf, key, value);
         }
         let asset_history_cf = self.asset_history_cf();
         for key in &batch.asset_history_rows {

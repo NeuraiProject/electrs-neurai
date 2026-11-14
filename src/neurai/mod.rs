@@ -4,6 +4,7 @@
 //! but block headers and chain parameters differ from Bitcoin and live here.
 
 pub mod address;
+pub mod anchors;
 pub mod asset;
 pub mod block;
 pub mod network;

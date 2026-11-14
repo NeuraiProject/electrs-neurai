@@ -17,13 +17,16 @@ use bitcoin::{
     BlockHash,
 };
 use crossbeam_channel::{bounded, select, Receiver, Sender};
+use rayon::prelude::*;
 
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::neurai::block::{decode_header, header_len, verify_kawpow_header, NeuraiBlockHeader};
-use crate::neurai::NetworkParams;
+use crate::neurai::block::{
+    decode_header, header_len, kawpow_epoch, verify_kawpow_header, NeuraiBlockHeader,
+};
+use crate::neurai::{anchors, NetworkParams};
 use crate::types::SerBlock;
 use crate::{
     chain::{Chain, NewHeader},
@@ -63,6 +66,21 @@ pub(crate) struct Connection {
     params: &'static NetworkParams,
 }
 
+/// Verify the KAWPOW of `headers` on all cores. It recomputes the mix from the epoch's
+/// light cache (~15 ms per mainnet header); one epoch at a time, because the shared
+/// light cache holds a single epoch.
+fn verify_kawpow_headers(headers: &[(NeuraiBlockHeader, BlockHash, usize)]) -> Result<()> {
+    for epoch in headers.chunk_by(|(a, ..), (b, ..)| kawpow_epoch(a) == kawpow_epoch(b)) {
+        if let Some((_, hash, height)) = epoch
+            .par_iter()
+            .find_first(|(header, hash, _)| !verify_kawpow_header(header, hash))
+        {
+            bail!("header at height {height} ({hash}) failed KAWPOW mix_hash verification");
+        }
+    }
+    Ok(())
+}
+
 impl Connection {
     /// Get new block headers (supporting reorgs).
     /// https://en.bitcoin.it/wiki/Protocol_documentation#getheaders
@@ -83,23 +101,46 @@ impl Connection {
             None => bail!("missing prev_blockhash: {}", prev_blockhash),
         };
         let params = self.params;
-        headers
+        let mut headers: Vec<(NeuraiBlockHeader, BlockHash, usize)> = headers
             .into_iter()
             .zip(new_heights)
             .map(|(header, height)| {
                 let hash = header
                     .block_hash(params)
                     .context("p2p header must have computable hash")?;
-                // Re-run the KAWPOW FFI verifier here — otherwise a header with
-                // a corrupt `mix_hash` would still land in `Chain` (and in the
-                // responses to `blockchain.block.header{,s}` / `headers.subscribe`)
-                // even before the block body is downloaded.
-                if !verify_kawpow_header(&header, &hash) {
-                    bail!("header at height {height} ({hash}) failed KAWPOW mix_hash verification");
-                }
-                Ok(NewHeader::new(header, hash, height))
+                Ok((header, hash, height))
             })
-            .collect()
+            .collect::<Result<_>>()?;
+        // Each header must extend the previous one: this is what lets an anchor
+        // authenticate the headers before it.
+        for pair in headers.windows(2) {
+            let (prev_hash, (next, _, height)) = (pair[0].1, &pair[1]);
+            ensure!(
+                next.prev_blockhash == prev_hash,
+                "header at height {height} does not extend the previous one"
+            );
+        }
+
+        // Verify the KAWPOW of the headers — otherwise a header with a corrupt
+        // `mix_hash` would still land in `Chain` (and in the responses to
+        // `blockchain.block.header{,s}` / `headers.subscribe`) even before the block
+        // body is downloaded — except those authenticated by a header anchor.
+        let ids: Vec<(BlockHash, usize)> = headers
+            .iter()
+            .map(|&(_, hash, height)| (hash, height))
+            .collect();
+        let split = anchors::split_batch(params.header_anchors, &ids);
+        if let Some(height) = split.mismatch {
+            warn!(
+                "block {height} differs from Neurai core's header anchor: verifying every header"
+            );
+        }
+        headers.truncate(split.keep);
+        verify_kawpow_headers(&headers[split.verify_from..])?;
+        Ok(headers
+            .into_iter()
+            .map(|(header, hash, height)| NewHeader::new(header, hash, height))
+            .collect())
     }
 
     /// Request and process the specified blocks (in the specified order).
@@ -134,15 +175,10 @@ impl Connection {
                     let computed = neurai_hdr
                         .block_hash(params)
                         .with_context(|| format!("cannot compute hash for block {}", hash))?;
+                    // `hash` belongs to a header that `get_new_headers` already verified,
+                    // and the KAWPOW block hash takes the `mix_hash` as input, so an equal
+                    // hash means the same mix: no need to recompute the mix again here.
                     ensure!(computed == hash, "got unexpected block");
-                    // `block_hash()` runs KAWPOW but ignores the mix_hash field of the
-                    // incoming header — re-run the FFI verifier so a corrupted mix_hash
-                    // cannot land in the index alongside an otherwise-valid hash.
-                    ensure!(
-                        verify_kawpow_header(&neurai_hdr, &computed),
-                        "block {} failed KAWPOW mix_hash verification",
-                        hash,
-                    );
 
                     Ok(block)
                 })?;

@@ -54,17 +54,21 @@ RUN apt-get update -qqy && \
     apt-get install -qqy --no-install-recommends \
         ca-certificates \
         librocksdb9.10 \
-        libssl3 && \
+        libssl3 \
+        openssl && \
     rm -rf /var/lib/apt/lists/* && \
     useradd --system --create-home --home-dir /home/electrs --shell /usr/sbin/nologin electrs && \
-    mkdir -p /var/lib/electrs-neurai && chown electrs:electrs /var/lib/electrs-neurai
+    mkdir -p /var/lib/electrs-neurai /etc/electrs-tls && \
+    chown electrs:electrs /var/lib/electrs-neurai /etc/electrs-tls
 
 COPY --from=builder /workspace/electrs-neurai/target/release/electrs /usr/local/bin/electrs-neurai
+COPY --from=builder /workspace/electrs-neurai/docker/electrs-entrypoint.sh /usr/local/bin/electrs-entrypoint.sh
 
 USER electrs
 WORKDIR /home/electrs
-VOLUME ["/var/lib/electrs-neurai"]
-EXPOSE 50001 60001 60401 4224
+VOLUME ["/var/lib/electrs-neurai", "/etc/electrs-tls"]
+# 50001 tcp, 50002 ssl, 50004 wss (mainnet); 60001 testnet; 60401 regtest; 4224 metrics
+EXPOSE 50001 50002 50004 60001 60401 4224
 
-ENTRYPOINT ["/usr/local/bin/electrs-neurai"]
+ENTRYPOINT ["/usr/local/bin/electrs-entrypoint.sh"]
 CMD ["--network", "neurai", "--db-dir", "/var/lib/electrs-neurai", "--electrum-rpc-addr", "0.0.0.0:50001"]

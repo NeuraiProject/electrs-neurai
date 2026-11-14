@@ -76,53 +76,33 @@ Please read upgrade notes if you're upgrading to a newer version.
 
 ## Connecting an Electrum client ##
 
-To connect to your Electrs server, you will need to point Electrum to your server using the `ip_address:port` syntax. You will notice that most default servers in Electrum use the `50002` port (which is for SSL connections), while Electrs serves port `50001` and does not provide SSL out of the box.
+To connect to your server, point Electrum (electrum-neurai) to it with the `host:port:protocol` syntax. electrs-neurai serves plain TCP on `50001` by default and, when configured, TLS (`ssl://`) and WebSocket (`ws://` / `wss://`) natively — see _TLS and WebSocket listeners_ below. Plain TCP (`localhost:50001:t`) is not secure and is recommended only for local connections; electrum-neurai only auto-selects `s` (TLS) servers.
 
-You would need to either use a webserver to provide SSL (see _SSL connection_ below), or connect without SSL. To tell Electrum to connect to your server without SSL, you need to add `:t` after the port (ie: `localhost:50001:t`). Please note that this is not secure and therefore recommended only for local connections.
-
-Electrs will listen by default on `127.0.0.1:50001`, which means it will only serve clients in the local machine. This is configured via the `electrum_rpc_addr` setting and if you wish to connect from another machine, you need to change it to `0.0.0.0:50001`. This is less secure though, and the recommended way to access Electrs remotely is to keep listening on `127.0.0.1` and tunnel to your server.
+Electrs will listen by default on `127.0.0.1:50001`, which means it will only serve clients in the local machine. This is configured via the `electrum_rpc_addr` setting and if you wish to connect from another machine, you need to change it to `0.0.0.0:50001`.
 
 ## Extra configuration suggestions
 
-### SSL connection
+### TLS and WebSocket listeners
 
-In order to use a secure connection, you can also use [NGINX as an SSL endpoint](https://docs.nginx.com/nginx/admin-guide/security-controls/terminating-ssl-tcp/#)
-by placing the following block in `nginx.conf`.
-Notice that while electrs doesn't use HTTP the configuration below uses raw TCP stream which works.
+TLS is built in (rustls), no reverse proxy is needed:
 
-```nginx
-stream {
-        upstream electrs {
-                server 127.0.0.1:50001;
-        }
-
-        server {
-                listen 50002 ssl;
-                proxy_pass electrs;
-
-                ssl_certificate /path/to/example.crt;
-                ssl_certificate_key /path/to/example.key;
-                ssl_session_cache shared:SSL:1m;
-                ssl_session_timeout 4h;
-                ssl_protocols TLSv1 TLSv1.1 TLSv1.2 TLSv1.3;
-                ssl_prefer_server_ciphers on;
-        }
-}
+```toml
+electrum_ssl_addr = "0.0.0.0:50002"   # ssl://  (Electrum desktop wallets)
+electrum_wss_addr = "0.0.0.0:50004"   # wss://  (browser wallets, ElectrumX WebSocket framing)
+# electrum_ws_addr = "127.0.0.1:50003" # ws://   (plain WebSocket, e.g. behind a reverse proxy)
+ssl_certfile = "/etc/electrs-tls/cert.pem"
+ssl_keyfile = "/etc/electrs-tls/key.pem"
+# what server.features advertises (default: the listening addresses)
+report_services = "ssl://electrum.example.org:50002,wss://electrum.example.org:50004"
 ```
 
 ```bash
-$ sudo systemctl restart nginx
-$ electrum --oneserver --server=example:50002:s
+$ electrum --oneserver --server=electrum.example.org:50002:s
 ```
 
-Note: If you are connecting to electrs from Eclair Mobile or another similar client which does not allow self-signed SSL certificates, you can obtain a free SSL certificate as follows:
+The WebSocket listeners use ElectrumX's framing: one JSON-RPC message per WebSocket text message, without a trailing newline.
 
-1. Follow the instructions at https://certbot.eff.org/ to install the certbot on your system.
-2. When certbot obtains the SSL certificates for you, change the SSL paths in the nginx template above as follows:
-```
-ssl_certificate /etc/letsencrypt/live/<your-domain>/fullchain.pem;
-ssl_certificate_key /etc/letsencrypt/live/<your-domain>/privkey.pem;
-```
+electrum-neurai accepts self-signed certificates (trust on first use). For clients that require a CA-signed certificate, obtain one with [certbot](https://certbot.eff.org/) and point `ssl_certfile` / `ssl_keyfile` at `/etc/letsencrypt/live/<your-domain>/fullchain.pem` and `privkey.pem`. The Docker images create a self-signed certificate on first start when the configured files don't exist.
 
 ### Tor hidden service
 

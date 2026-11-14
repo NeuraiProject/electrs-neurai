@@ -15,11 +15,11 @@ use crate::{
     daemon::Daemon,
     db::DBStore,
     index::Index,
-    mempool::{FeeHistogram, Mempool},
+    mempool::Mempool,
     metrics::Metrics,
     signals::ExitFlag,
     status::{Balance, ScriptHashStatus, UnspentEntry},
-    types::{bsl_txid, AssetMetadata, ScriptHash},
+    types::{bsl_txid, ScriptHash},
 };
 
 /// Returned by [`Tracker::get_asset_history`].
@@ -107,10 +107,6 @@ impl Tracker {
         self.index.chain()
     }
 
-    pub(crate) fn fees_histogram(&self) -> &FeeHistogram {
-        self.mempool.fees_histogram()
-    }
-
     pub(crate) fn metrics(&self) -> &Metrics {
         &self.metrics
     }
@@ -150,8 +146,16 @@ impl Tracker {
         status.get_balance(self.chain())
     }
 
-    pub(crate) fn get_asset_metadata(&self, name: &[u8]) -> Option<AssetMetadata> {
-        self.index.get_asset_metadata(name)
+    pub(crate) fn index(&self) -> &Index {
+        &self.index
+    }
+
+    pub(crate) fn mempool(&self) -> &Mempool {
+        &self.mempool
+    }
+
+    pub(crate) fn compact_fee_histogram(&self) -> &[(f64, u64)] {
+        self.mempool.compact_fee_histogram()
     }
 
     /// One entry per row in `asset_history` — so multiple events in the same block

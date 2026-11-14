@@ -153,6 +153,10 @@ impl HistoryEntry {
         engine.input(s.as_bytes());
     }
 
+    pub(crate) fn is_unconfirmed(&self) -> bool {
+        matches!(self.height, Height::Unconfirmed { .. })
+    }
+
     fn confirmed(txid: Txid, height: usize) -> Self {
         Self {
             txid,
@@ -269,6 +273,9 @@ struct OutputInfo {
     value: u64,
     /// `None` for native, `Some(name)` for asset outputs.
     asset: Option<String>,
+    /// Insertion order: confirmed transactions are inserted in chain order,
+    /// then mempool ones — the order ElectrumX lists UTXOs in.
+    seq: usize,
 }
 
 #[derive(Default)]
@@ -276,14 +283,18 @@ struct Unspent {
     // mapping an outpoint to its (value, height, asset) tuple
     outpoints: HashMap<OutPoint, OutputInfo>,
     balance: Balance,
+    next_seq: usize,
 }
 
 impl Unspent {
     fn build(status: &ScriptHashStatus, chain: &Chain) -> Self {
         let mut unspent = Unspent::default();
-        // First, add all relevant entries' funding outputs to the outpoints' map
+        // First, add all relevant entries' funding outputs to the outpoints' map,
+        // in chain order (entries are already sorted by position within a block).
         status
             .confirmed_height_entries(chain)
+            .collect::<BTreeMap<usize, &[TxEntry]>>()
+            .into_iter()
             .for_each(|(height, entries)| entries.iter().for_each(|e| unspent.insert(e, height)));
         // Then, remove spent outpoints from the map
         status
@@ -318,9 +329,15 @@ impl Unspent {
         unspent
     }
 
+    /// UTXOs in ElectrumX order: confirmed by (height, position in block,
+    /// output index), then mempool. Zero-value outputs are not listed
+    /// (ElectrumX `db.all_utxos` skips them).
     fn into_entries(self) -> Vec<UnspentEntry> {
-        self.outpoints
+        let mut outpoints: Vec<(OutPoint, OutputInfo)> = self.outpoints.into_iter().collect();
+        outpoints.sort_by_key(|(outpoint, info)| (info.seq, outpoint.vout));
+        outpoints
             .into_iter()
+            .filter(|(_, info)| info.value > 0)
             .map(|(outpoint, info)| UnspentEntry {
                 height: info.height,
                 tx_hash: outpoint.txid,
@@ -334,7 +351,8 @@ impl Unspent {
     /// Sum of unspent values grouped by asset (key `"rvn"` for native).
     fn balance_by_asset(&self) -> BTreeMap<String, i128> {
         let mut map: BTreeMap<String, i128> = BTreeMap::new();
-        for info in self.outpoints.values() {
+        // Zero-value outputs carry no balance and ElectrumX doesn't report a key for them.
+        for info in self.outpoints.values().filter(|info| info.value > 0) {
             let key = info
                 .asset
                 .clone()
@@ -345,6 +363,8 @@ impl Unspent {
     }
 
     fn insert(&mut self, entry: &TxEntry, height: usize) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
         for output in &entry.outputs {
             let outpoint = OutPoint {
                 txid: entry.txid,
@@ -360,11 +380,13 @@ impl Unspent {
                     height,
                     value: a.amount,
                     asset: Some(a.name.clone()),
+                    seq,
                 },
                 None => OutputInfo {
                     height,
                     value: output.value.to_sat(),
                     asset: None,
+                    seq,
                 },
             };
             self.outpoints.insert(outpoint, info);

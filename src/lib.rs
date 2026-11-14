@@ -13,6 +13,7 @@ mod config;
 mod daemon;
 mod db;
 mod electrum;
+mod electrum_assets;
 mod index;
 mod mempool;
 mod merkle;
@@ -24,6 +25,7 @@ mod signals;
 mod status;
 mod thread;
 mod tracker;
+mod transport;
 mod types;
 
 pub use server::run;

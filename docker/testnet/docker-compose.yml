@@ -86,6 +86,7 @@ services:
     # supplied via `command:` below to override the image's default CMD.
     volumes:
       - electrs_data:/var/lib/electrs-neurai
+      - electrs_tls_certs:/etc/electrs-tls
       - ./electrs/config.toml:/etc/electrs/config.toml:ro
 
     command:
@@ -99,11 +100,24 @@ services:
       - "neuraid:19100"
       - "--electrum-rpc-addr"
       - "0.0.0.0:60001"
+      # Native TLS (ssl://) and WebSocket over TLS (wss://, ElectrumX framing).
+      # A self-signed certificate is created in the electrs_tls_certs volume on
+      # first start; mount your own cert.pem / key.pem there to replace it.
+      - "--electrum-ssl-addr"
+      - "0.0.0.0:50002"
+      - "--electrum-wss-addr"
+      - "0.0.0.0:50004"
+      - "--ssl-certfile"
+      - "/etc/electrs-tls/cert.pem"
+      - "--ssl-keyfile"
+      - "/etc/electrs-tls/key.pem"
       - "--log-filters"
       - "INFO"
 
     ports:
       - "60001:60001"   # Electrum testnet RPC
+      - "50002:50002"   # ssl://  (Electrum over TLS)
+      - "50004:50004"   # wss://  (Electrum over WebSocket + TLS, for browser wallets)
 
     networks:
       - neurai_net
@@ -111,35 +125,6 @@ services:
     depends_on:
       neuraid:
         condition: service_healthy
-
-  electrs-tls:
-    build:
-      context: ./electrs-tls
-      dockerfile: Dockerfile
-    image: neuraiproject/electrs-neurai-tls:1.0.0
-    container_name: neurai-testnet-electrs-tls
-    restart: unless-stopped
-
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "5"
-
-    # Mount your own cert.pem / key.pem at /etc/electrs-tls to skip the
-    # self-signed cert auto-generated on first start.
-    volumes:
-      - electrs_tls_certs:/etc/electrs-tls
-
-    ports:
-      - "50002:50002"   # ssl://  (Electrum native + TLS)
-      - "50004:50004"   # wss://  (Electrum WebSocket + TLS, for browser wallets)
-
-    networks:
-      - neurai_net
-
-    depends_on:
-      - electrs
 
 volumes:
   neurai_data:

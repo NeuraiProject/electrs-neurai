@@ -108,7 +108,7 @@ impl FromStr for ConfiguredNetwork {
 
 impl ::configure_me::parse_arg::ParseArgFromStr for ConfiguredNetwork {
     fn describe_type<W: fmt::Write>(mut writer: W) -> fmt::Result {
-        write!(writer, "either 'neurai', 'testnet' or 'regtest'")
+        write!(writer, "one of 'neurai', 'testnet', 'regtest' (DePIN-Test) or 'regtest-v1' (v1.0.7 regtest)")
     }
 }
 
@@ -130,6 +130,13 @@ pub struct Config {
     pub daemon_rpc_addr: SocketAddr,
     pub daemon_p2p_addr: SocketAddr,
     pub electrum_rpc_addr: SocketAddr,
+    pub electrum_ssl_addr: Option<SocketAddr>,
+    pub electrum_ws_addr: Option<SocketAddr>,
+    pub electrum_wss_addr: Option<SocketAddr>,
+    pub ssl_certfile: Option<PathBuf>,
+    pub ssl_keyfile: Option<PathBuf>,
+    pub report_services: String,
+    pub donation_address: String,
     pub monitoring_addr: SocketAddr,
     pub wait_duration: Duration,
     pub jsonrpc_timeout: Duration,
@@ -216,6 +223,20 @@ impl Config {
             (DEFAULT_SERVER_ADDRESS, default_electrum_port).into(),
             ResolvAddr::resolve_or_exit,
         );
+        let electrum_ssl_addr: Option<SocketAddr> =
+            config.electrum_ssl_addr.map(ResolvAddr::resolve_or_exit);
+        let electrum_ws_addr: Option<SocketAddr> =
+            config.electrum_ws_addr.map(ResolvAddr::resolve_or_exit);
+        let electrum_wss_addr: Option<SocketAddr> =
+            config.electrum_wss_addr.map(ResolvAddr::resolve_or_exit);
+        if (electrum_ssl_addr.is_some() || electrum_wss_addr.is_some())
+            && (config.ssl_certfile.is_none() || config.ssl_keyfile.is_none())
+        {
+            eprintln!(
+                "Error: electrum_ssl_addr / electrum_wss_addr require both ssl_certfile and ssl_keyfile"
+            );
+            std::process::exit(1);
+        }
         #[cfg(not(feature = "metrics"))]
         {
             if config.monitoring_addr.is_some() {
@@ -298,6 +319,13 @@ impl Config {
             daemon_rpc_addr,
             daemon_p2p_addr,
             electrum_rpc_addr,
+            electrum_ssl_addr,
+            electrum_ws_addr,
+            electrum_wss_addr,
+            ssl_certfile: config.ssl_certfile,
+            ssl_keyfile: config.ssl_keyfile,
+            report_services: config.report_services,
+            donation_address: config.donation_address,
             monitoring_addr,
             wait_duration: Duration::from_secs(config.wait_duration_secs),
             jsonrpc_timeout: Duration::from_secs(config.jsonrpc_timeout_secs),

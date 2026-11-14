@@ -1,4 +1,59 @@
-# Unreleased — Neurai v1.0.7 mainnet compatibility
+# Unreleased — ElectrumX-neurai compatibility, native TLS and WebSocket
+
+**ElectrumX-neurai protocol.** electrs-neurai now implements every method of
+ElectrumX-neurai (48), with its parameter names, reply shapes, error messages
+and subscription statuses, so the Electrum desktop wallet *electrum-neurai*
+works against it. See [doc/neurai-rpc.md](doc/neurai-rpc.md).
+
+* Protocol versions 1.0–1.4, negotiated like ElectrumX (electrum-neurai asks
+  for exactly "1.0", which was rejected before).
+* New: `blockchain.asset.*` (`get_assets_with_prefix`, `list_addresses_by_asset`,
+  `broadcasts`, `is_frozen`, `verifier_string`, `restricted_associations`, and
+  the `subscribe`/`unsubscribe` of each), `blockchain.tag.*` (`check`,
+  `qualifier.list`, `h160.list` and their subscriptions),
+  `blockchain.scripthash.get_mempool`, `blockchain.transaction.get_tsc_merkle`,
+  `server.add_peer`, `cp_height` in `blockchain.block.header(s)`, `mode` in
+  `blockchain.estimatefee` (falls back to the relay fee instead of -1),
+  ElectrumX's `mempool.get_fee_histogram` binning, named parameters.
+* `blockchain.asset.get_meta` uses ElectrumX's reply (`sats_in_circulation`,
+  `divisions`, `has_ipfs`, base58 `ipfs`, `source`, `source_divisions`,
+  `source_ipfs`; `{}` when unknown) and includes owner tokens.
+* New indexes (DB format 5): qualifier tags and per-address freezes, global
+  freezes, verifier strings, qualifier associations, broadcasts and asset
+  names. Like `asset_meta`, they are append-only and checked against the active
+  chain on read, so reorgs need no undo data. Mempool transactions are overlaid.
+* ElectrumX bugs are not reproduced (asset names as bytes, the stray prefix
+  byte in `get_assets_with_prefix`, unsubscribe always `false`, `tag.check`
+  locations, mempool asset filters, ...). Validated with a differential test
+  against ElectrumX-neurai on the same v1.0.7 regtest chain: every reply is
+  identical except for those bugs.
+
+**Transports.** Native TLS (`--electrum-ssl-addr`, rustls) and WebSocket
+(`--electrum-ws-addr`, `--electrum-wss-addr`) with ElectrumX's framing (one
+JSON-RPC message per text message). The Docker setups no longer need the
+nginx + websockify container, whose WebSocket bridge rejected text frames.
+
+**KAWPOW performance.** The block hash (`KAWPOWHash_OnlyMix`) is now two
+Keccak permutations (about 2 µs). It used to run the full KAWPOW verification
+(about 15 ms on mainnet, or 2 s when switching epochs), which made a restart
+with a fully indexed mainnet take weeks, because headers are loaded from the DB
+in random height order. The KAWPOW check is no longer repeated for every
+downloaded block, because the block hash already depends on the `mix_hash`.
+
+**Header anchors.** Mainnet headers up to height 1,732,000 are authenticated by
+Neurai core's header anchors (`src/chainparamsanchors.h` from b778146, one hash
+every 2,000 blocks, all checked against a v1.0.7 node). The KAWPOW block hash
+commits to every header field, so a header chain that links to an anchor needs
+no KAWPOW check. The remaining headers, and every header on testnet and regtest,
+are verified in parallel, one epoch at a time, using ethash's shared,
+thread-safe epoch context. If a block's hash differs from its anchor, every
+header is verified.
+
+**Testing.** `--network regtest-v1` indexes the regtest of the v1.0.7
+release (X16Rv2 headers, new `hasherx16r-sys` crate), so the mainnet consensus
+and asset code can be tested locally.
+
+# Neurai v1.0.7 mainnet compatibility
 
 Tested against `neuraiproject/neurai-node:v1.0.7`: asset scripts, blocks and
 RPC responses from regtest; KAWPOW headers and the P2P handshake on mainnet.

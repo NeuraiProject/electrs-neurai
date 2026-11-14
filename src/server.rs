@@ -4,9 +4,12 @@ use rayon::prelude::*;
 
 use std::{
     collections::hash_map::HashMap,
-    io::{BufRead, BufReader, Write},
     iter::once,
-    net::{Shutdown, TcpListener, TcpStream},
+    net::{SocketAddr, TcpListener},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 use crate::{
@@ -15,36 +18,52 @@ use crate::{
     metrics::{self, Metrics},
     signals::ExitError,
     thread::spawn,
+    transport::{load_tls_config, Connection, Service, Writer},
 };
 
 struct Peer {
     id: usize,
     client: Client,
-    stream: TcpStream,
+    writer: Writer,
 }
 
 impl Peer {
-    fn new(id: usize, stream: TcpStream) -> Self {
+    fn new(id: usize, writer: Writer) -> Self {
         let client = Client::default();
-        Self { id, client, stream }
+        Self { id, client, writer }
     }
 
     fn send(&mut self, values: Vec<String>) -> Result<()> {
-        for mut value in values {
+        for value in values {
             debug!("{}: send {}", self.id, value);
-            value += "\n";
-            self.stream
-                .write_all(value.as_bytes())
+            self.writer
+                .send_message(&value)
                 .with_context(|| format!("failed to send response: {:?}", value))?;
         }
         Ok(())
     }
 
     fn disconnect(self) {
-        if let Err(e) = self.stream.shutdown(Shutdown::Both) {
-            warn!("{}: failed to shutdown TCP connection {}", self.id, e)
+        self.writer.close();
+    }
+}
+
+/// Listening addresses of the enabled Electrum services.
+pub(crate) fn listeners(config: &Config) -> Vec<(Service, SocketAddr)> {
+    let mut result = vec![];
+    if !config.disable_electrum_rpc {
+        result.push((Service::Tcp, config.electrum_rpc_addr));
+    }
+    for (service, addr) in [
+        (Service::Ssl, config.electrum_ssl_addr),
+        (Service::Ws, config.electrum_ws_addr),
+        (Service::Wss, config.electrum_wss_addr),
+    ] {
+        if let Some(addr) = addr {
+            result.push((service, addr));
         }
     }
+    result
 }
 
 pub fn run() -> Result<()> {
@@ -65,11 +84,26 @@ fn serve() -> Result<()> {
     let metrics = Metrics::new(config.monitoring_addr)?;
 
     let (server_tx, server_rx) = unbounded();
-    if !config.disable_electrum_rpc {
-        let listener = TcpListener::bind(config.electrum_rpc_addr)?;
-        info!("serving Electrum RPC on {}", listener.local_addr()?);
-        spawn("accept_loop", || accept_loop(listener, server_tx)); // detach accepting thread
+    let tls = match (&config.ssl_certfile, &config.ssl_keyfile) {
+        (Some(cert), Some(key)) => Some(load_tls_config(cert, key)?),
+        _ => None,
     };
+    let next_peer_id = Arc::new(AtomicUsize::new(0));
+    for (service, addr) in listeners(&config) {
+        let listener = TcpListener::bind(addr)
+            .with_context(|| format!("failed to bind {}://{}", service.scheme(), addr))?;
+        info!(
+            "serving Electrum RPC over {} on {}",
+            service.scheme(),
+            listener.local_addr()?
+        );
+        let tx = server_tx.clone();
+        let tls = tls.clone();
+        let ids = Arc::clone(&next_peer_id);
+        spawn("accept_loop", move || accept_loop(listener, service, tls, ids, tx)); // detach accepting thread
+    }
+    // `server_tx` stays alive here, so the channel never disconnects even when
+    // no listener is enabled (`disable_electrum_rpc`).
 
     let server_batch_size = metrics.histogram_vec(
         "server_batch_size",
@@ -158,7 +192,7 @@ struct Event {
 }
 
 enum Message {
-    New(TcpStream),
+    New(Writer),
     Request(String),
     Done,
 }
@@ -183,9 +217,9 @@ fn handle_peer_events(
     let mut done = false;
     for msg in messages {
         match msg {
-            Message::New(stream) => {
+            Message::New(writer) => {
                 debug!("{}: connected", peer_id);
-                peers.insert(peer_id, Peer::new(peer_id, stream));
+                peers.insert(peer_id, Peer::new(peer_id, writer));
             }
             Message::Request(line) => lines.push(line),
             Message::Done => {
@@ -204,46 +238,64 @@ fn handle_peer_events(
     if let Err(e) = result {
         error!("{}: disconnecting due to {}", peer_id, e);
         peers.remove(&peer_id).unwrap().disconnect();
+    } else if peers.get(&peer_id).is_some_and(|p| p.client.should_disconnect()) {
+        debug!("{}: disconnecting after reply", peer_id);
+        peers.remove(&peer_id).unwrap().disconnect();
     } else if done {
         peers.remove(&peer_id); // already disconnected, just remove from peers' map
     }
 }
 
-fn accept_loop(listener: TcpListener, server_tx: Sender<Event>) -> Result<()> {
-    for (peer_id, conn) in listener.incoming().enumerate() {
-        let stream = conn.context("failed to accept")?;
-        let tx = server_tx.clone();
-        spawn("recv_loop", move || {
-            let result = recv_loop(peer_id, &stream, tx);
-            if let Err(e) = stream.shutdown(Shutdown::Read) {
-                warn!("{}: failed to shutdown TCP receiving {}", peer_id, e)
+fn accept_loop(
+    listener: TcpListener,
+    service: Service,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    next_peer_id: Arc<AtomicUsize>,
+    server_tx: Sender<Event>,
+) -> Result<()> {
+    for conn in listener.incoming() {
+        let stream = match conn {
+            Ok(stream) => stream,
+            Err(e) => {
+                warn!("failed to accept {} connection: {}", service.scheme(), e);
+                continue;
             }
-            result
+        };
+        let peer_id = next_peer_id.fetch_add(1, Ordering::Relaxed);
+        let tx = server_tx.clone();
+        let tls = tls.clone();
+        spawn("recv_loop", move || {
+            let conn = match Connection::accept(stream, service, tls.as_ref()) {
+                Ok(conn) => conn,
+                Err(e) => {
+                    debug!("{}: {} connection setup failed: {:#}", peer_id, service.scheme(), e);
+                    return Ok(());
+                }
+            };
+            recv_loop(peer_id, conn, tx)
         });
     }
     Ok(())
 }
 
-fn recv_loop(peer_id: usize, stream: &TcpStream, server_tx: Sender<Event>) -> Result<()> {
-    let msg = Message::New(stream.try_clone()?);
+fn recv_loop(peer_id: usize, mut conn: Connection, server_tx: Sender<Event>) -> Result<()> {
+    let msg = Message::New(conn.writer.clone());
     server_tx.send(Event { peer_id, msg })?;
 
-    let mut first_line = true;
-    for line in BufReader::new(stream).lines() {
-        if let Err(e) = &line {
-            if first_line && e.kind() == std::io::ErrorKind::InvalidData {
-                warn!("InvalidData on first line may indicate client attempted to connect using SSL when server expects unencrypted communication.")
+    let result = loop {
+        match conn.recv() {
+            Ok(Some(request)) => {
+                debug!("{}: recv {}", peer_id, request);
+                let msg = Message::Request(request);
+                server_tx.send(Event { peer_id, msg })?;
             }
+            Ok(None) => break Ok(()),
+            Err(e) => break Err(e.context(format!("{}: recv failed", peer_id))),
         }
-        let line = line.with_context(|| format!("{}: recv failed", peer_id))?;
-        debug!("{}: recv {}", peer_id, line);
-        let msg = Message::Request(line);
-        server_tx.send(Event { peer_id, msg })?;
-        first_line = false;
-    }
+    };
 
     debug!("{}: disconnected", peer_id);
     let msg = Message::Done;
     server_tx.send(Event { peer_id, msg })?;
-    Ok(())
+    result
 }

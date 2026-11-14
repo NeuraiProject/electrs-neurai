@@ -32,4 +32,8 @@ void hash_one(const epoch_context& context, int block_number, const hash256 *hea
 bool verify(const epoch_context& context, int block_number, const hash256 *header_hash,
     const hash256 &mix_hash, uint64_t nonce, hash256 *hash_out) noexcept;
 
+/// The final KAWPOW hash from a header's stored mix, without verifying the mix.
+void hash_no_verify(const hash256 *header_hash, const hash256 &mix_hash, uint64_t nonce,
+    hash256 *hash_out) noexcept;
+
 }  // namespace progpow

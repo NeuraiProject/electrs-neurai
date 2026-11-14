@@ -215,26 +215,46 @@ impl Daemon {
         Ok(Self { p2p, rpc })
     }
 
-    pub(crate) fn estimate_fee(&self, nblocks: u16) -> Result<Option<Amount>> {
-        let res = self.rpc.estimate_smart_fee(nblocks, None);
-        if let Err(bitcoincore_rpc::Error::JsonRpc(jsonrpc::Error::Rpc(RpcError {
-            code: -32603,
-            ..
-        }))) = res
-        {
-            return Ok(None); // don't fail when fee estimation is disabled (e.g. with `-blocksonly=1`)
+    /// `estimatesmartfee` as ElectrumX calls it: the daemon's `feerate` float
+    /// (XNA/kB) is passed through unchanged; `None` when the daemon has no
+    /// estimate (no `feerate` key) or fee estimation is disabled.
+    pub(crate) fn estimate_smart_fee(&self, blocks: u64, mode: Option<&str>) -> Result<Option<f64>> {
+        let mut params = vec![json!(blocks)];
+        if let Some(mode) = mode {
+            params.push(json!(mode));
         }
-        Ok(res.context("failed to estimate fee")?.fee_rate)
+        match self.rpc.call::<Value>("estimatesmartfee", &params) {
+            Ok(result) => Ok(result.get("feerate").and_then(Value::as_f64)),
+            Err(bitcoincore_rpc::Error::JsonRpc(jsonrpc::Error::Rpc(RpcError {
+                code: -32603, ..
+            }))) => Ok(None),
+            Err(e) => Err(e).context("failed to estimate fee"),
+        }
     }
 
-    pub(crate) fn get_relay_fee(&self) -> Result<Amount> {
-        Ok(self
-            .rpc
-            .get_network_info()
-            .context("failed to get relay fee")?
-            .relay_fee)
+    /// Any daemon RPC, result passed through (errors keep the daemon's code).
+    pub(crate) fn call(&self, method: &str, params: &[Value]) -> Result<Value> {
+        self.rpc
+            .call::<Value>(method, params)
+            .with_context(|| format!("{} failed", method))
     }
 
+    /// Raw `getnetworkinfo` reply (relay fee as the daemon's own float, version
+    /// fields for the server banner).
+    pub(crate) fn get_network_info_raw(&self) -> Result<Value> {
+        self.rpc
+            .call::<Value>("getnetworkinfo", &[])
+            .context("failed to get network info")
+    }
+
+    /// `sendrawtransaction` of a hex string, decoded and validated by the daemon.
+    pub(crate) fn broadcast_raw(&self, tx_hex: &str) -> Result<Txid> {
+        self.rpc
+            .call("sendrawtransaction", &[json!(tx_hex)])
+            .context("failed to broadcast transaction")
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn broadcast(&self, tx: &Transaction) -> Result<Txid> {
         self.rpc
             .send_raw_transaction(tx)

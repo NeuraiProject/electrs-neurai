@@ -35,3 +35,6 @@ docker/
 
 # Dockerfiles themselves
 Dockerfile*
+
+# Needed by the image build
+!docker/electrs-entrypoint.sh

@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 use std::convert::TryFrom;
 
@@ -274,6 +274,8 @@ impl AssetFundingRow {
 pub enum AssetMetaEvent {
     New = 1,
     Reissue = 2,
+    /// Owner token (`NAME!`) creation: 1 unit, no decimals, not reissuable.
+    Owner = 3,
 }
 
 /// One `New` or `Reissue` event, stored as its own row in the `asset_meta` CF.
@@ -348,6 +350,7 @@ impl AssetMetaEventRow {
         let event = match value[0] {
             1 => AssetMetaEvent::New,
             2 => AssetMetaEvent::Reissue,
+            3 => AssetMetaEvent::Owner,
             other => bail!("unknown asset meta event tag: {}", other),
         };
         let mut ipfs_hash = [0u8; 32];
@@ -369,6 +372,15 @@ impl AssetMetaEventRow {
     }
 }
 
+/// Output that carried an issuance event (`get_meta` `source*` fields).
+/// `height` is `-1` for mempool events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AssetSource {
+    pub txid: Txid,
+    pub vout: u32,
+    pub height: i64,
+}
+
 /// Current state of an asset, as reported by `blockchain.asset.get_meta`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssetMetadata {
@@ -384,6 +396,14 @@ pub struct AssetMetadata {
     /// `0` = no IPFS/TXID, `0x12` = IPFS SHA-256, `0x54` = TXID reference.
     pub ipfs_marker: u8,
     pub ipfs_hash: [u8; 32],
+    /// Output of the latest event (`source`).
+    pub source: AssetSource,
+    /// Output of the event that last set the decimal places (`source_divisions`
+    /// when it isn't `source`, i.e. the latest reissue sent units `-1`).
+    pub divisions_source: AssetSource,
+    /// Output of the event that last set the IPFS hash (`source_ipfs` when it
+    /// isn't `source`, i.e. the latest reissue carried no IPFS).
+    pub ipfs_source: Option<AssetSource>,
 }
 
 impl AssetMetadata {
@@ -394,39 +414,325 @@ impl AssetMetadata {
     pub(crate) fn fold<'a>(events: impl IntoIterator<Item = &'a AssetMetaEventRow>) -> Option<Self> {
         let mut state: Option<Self> = None;
         for e in events {
-            match e.event {
-                AssetMetaEvent::New => {
-                    state = Some(Self {
-                        event: AssetMetaEvent::New,
-                        issuance_txid: e.txid,
-                        issuance_height: e.height,
-                        amount: e.amount,
-                        units: u8::try_from(e.units).unwrap_or(0),
-                        reissuable: e.reissuable,
-                        ipfs_marker: e.ipfs_marker,
-                        ipfs_hash: e.ipfs_hash,
-                    })
-                }
-                AssetMetaEvent::Reissue => {
-                    // A reissue without a prior issuance can't be valid on chain.
-                    let Some(s) = state.as_mut() else { continue };
-                    s.event = AssetMetaEvent::Reissue;
-                    s.issuance_txid = e.txid;
-                    s.issuance_height = e.height;
-                    s.amount = s.amount.saturating_add(e.amount);
-                    s.reissuable = e.reissuable;
-                    if let Ok(units) = u8::try_from(e.units) {
-                        s.units = units;
-                    }
-                    if e.ipfs_marker != 0 {
-                        s.ipfs_marker = e.ipfs_marker;
-                        s.ipfs_hash = e.ipfs_hash;
-                    }
-                }
-            }
+            Self::apply(&mut state, e, i64::from(e.height));
         }
         state
     }
+
+    /// Apply one event (`height` is `-1` for a mempool event).
+    pub(crate) fn apply(state: &mut Option<Self>, e: &AssetMetaEventRow, height: i64) {
+        let source = AssetSource {
+            txid: e.txid,
+            vout: e.vout,
+            height,
+        };
+        match e.event {
+            AssetMetaEvent::New | AssetMetaEvent::Owner => {
+                let has_ipfs = e.ipfs_marker != 0;
+                *state = Some(Self {
+                    event: e.event,
+                    issuance_txid: e.txid,
+                    issuance_height: e.height,
+                    amount: e.amount,
+                    units: u8::try_from(e.units).unwrap_or(0),
+                    reissuable: e.reissuable,
+                    ipfs_marker: e.ipfs_marker,
+                    ipfs_hash: e.ipfs_hash,
+                    source,
+                    divisions_source: source,
+                    ipfs_source: has_ipfs.then_some(source),
+                })
+            }
+            AssetMetaEvent::Reissue => {
+                // A reissue without a prior issuance can't be valid on chain.
+                let Some(s) = state.as_mut() else { return };
+                s.event = AssetMetaEvent::Reissue;
+                s.issuance_txid = e.txid;
+                s.issuance_height = e.height;
+                s.amount = s.amount.saturating_add(e.amount);
+                s.reissuable = e.reissuable;
+                s.source = source;
+                if let Ok(units) = u8::try_from(e.units) {
+                    s.units = units;
+                    s.divisions_source = source;
+                }
+                if e.ipfs_marker != 0 {
+                    s.ipfs_marker = e.ipfs_marker;
+                    s.ipfs_hash = e.ipfs_hash;
+                    s.ipfs_source = Some(source);
+                }
+            }
+        }
+    }
+
+    pub fn has_ipfs(&self) -> bool {
+        self.ipfs_marker != 0
+    }
+
+    /// The 34 bytes ElectrumX base58-encodes: marker, `0x20`, 32-byte hash.
+    pub fn ipfs_data(&self) -> [u8; 34] {
+        let mut data = [0u8; 34];
+        data[0] = self.ipfs_marker;
+        data[1] = 0x20;
+        data[2..].copy_from_slice(&self.ipfs_hash);
+        data
+    }
+}
+
+// ─── restricted-asset / qualifier / messaging events (`asset_events` CF) ──────
+
+/// Kind of an `asset_events` row; also the domain byte of its key prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum AssetEventKind {
+    /// Qualifier tag / per-address restricted freeze, keyed by asset name.
+    TagByAsset = b't',
+    /// The same event, keyed by the tagged h160.
+    TagByH160 = b'h',
+    /// Global freeze of a restricted asset, keyed by `$NAME`.
+    Freeze = b'f',
+    /// Verifier string of a restricted asset, keyed by `$NAME`.
+    Verifier = b'v',
+    /// "verifier of `$R` mentions `#Q`", keyed by `#Q` (candidates; the
+    /// association state is derived from `$R`'s verifier history).
+    Association = b'a',
+    /// Message on an owner token / message channel transfer, keyed by name.
+    Broadcast = b'b',
+}
+
+impl AssetEventKind {
+    fn from_byte(b: u8) -> Option<Self> {
+        Some(match b {
+            b't' => Self::TagByAsset,
+            b'h' => Self::TagByH160,
+            b'f' => Self::Freeze,
+            b'v' => Self::Verifier,
+            b'a' => Self::Association,
+            b'b' => Self::Broadcast,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssetEventPayload {
+    /// `c0 14 <h160> <push(name, flag)>`
+    Tag { h160: [u8; 20], asset: String, flag: bool },
+    /// `c0 50 50 <push(name, flag)>`
+    Freeze { asset: String, flag: bool },
+    /// `c0 50 <push(string)>` with `restricted_vout` = last `$` output of the tx.
+    Verifier { asset: String, string: String, restricted_vout: u32 },
+    Association { qualifier: String, restricted: String },
+    /// `data` = 34-byte IPFS/TXID reference, `scripthash` = receiving script.
+    Broadcast {
+        asset: String,
+        data: [u8; 34],
+        expiration: Option<u64>,
+        scripthash: ScriptHash,
+    },
+}
+
+/// One row of the `asset_events` CF.
+///
+/// Key: `H(kind ‖ logical key)[..8] | height_be(4) | tx_pos_be(4) | vout_be(4)`.
+/// Value: `kind(1) | txid(32) | block_hash(32) | logical key (u8 len + bytes) | payload`.
+/// Like `asset_meta`, rows are append-only and filtered by block hash on read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetEventRow {
+    pub kind: AssetEventKind,
+    /// Asset name bytes, or the 20-byte h160 for [`AssetEventKind::TagByH160`].
+    pub key: Vec<u8>,
+    pub txid: Txid,
+    pub block_hash: BlockHash,
+    pub height: u32,
+    pub tx_pos: u32,
+    pub vout: u32,
+    pub payload: AssetEventPayload,
+}
+
+pub(crate) fn asset_event_prefix(kind: AssetEventKind, key: &[u8]) -> HashPrefix {
+    let mut engine = sha256::Hash::engine();
+    bitcoin::hashes::HashEngine::input(&mut engine, &[kind as u8]);
+    bitcoin::hashes::HashEngine::input(&mut engine, key);
+    let hash = sha256::Hash::from_engine(engine);
+    let mut prefix = [0u8; HASH_PREFIX_LEN];
+    prefix.copy_from_slice(&hash[..HASH_PREFIX_LEN]);
+    prefix
+}
+
+fn put_str(out: &mut Vec<u8>, s: &[u8]) {
+    let len = u16::try_from(s.len()).unwrap_or(u16::MAX);
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&s[..usize::from(len)]);
+}
+
+fn take<'a>(data: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
+    if data.len() < n {
+        bail!("truncated asset_events value");
+    }
+    let (head, tail) = data.split_at(n);
+    *data = tail;
+    Ok(head)
+}
+
+fn take_str(data: &mut &[u8]) -> Result<String> {
+    let len = u16::from_le_bytes(take(data, 2)?.try_into().expect("2 bytes"));
+    let bytes = take(data, usize::from(len))?;
+    Ok(String::from_utf8_lossy(bytes).into_owned())
+}
+
+impl AssetEventRow {
+    pub(crate) fn key_bytes(&self) -> Vec<u8> {
+        let mut key = Vec::with_capacity(ASSET_META_KEY_SIZE);
+        key.extend_from_slice(&asset_event_prefix(self.kind, &self.key));
+        key.extend_from_slice(&self.height.to_be_bytes());
+        key.extend_from_slice(&self.tx_pos.to_be_bytes());
+        key.extend_from_slice(&self.vout.to_be_bytes());
+        key
+    }
+
+    pub(crate) fn value_bytes(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(128);
+        v.push(self.kind as u8);
+        v.extend_from_slice(self.txid.as_byte_array());
+        v.extend_from_slice(self.block_hash.as_byte_array());
+        put_str(&mut v, &self.key);
+        match &self.payload {
+            AssetEventPayload::Tag { h160, asset, flag } => {
+                v.extend_from_slice(h160);
+                put_str(&mut v, asset.as_bytes());
+                v.push(u8::from(*flag));
+            }
+            AssetEventPayload::Freeze { asset, flag } => {
+                put_str(&mut v, asset.as_bytes());
+                v.push(u8::from(*flag));
+            }
+            AssetEventPayload::Verifier {
+                asset,
+                string,
+                restricted_vout,
+            } => {
+                put_str(&mut v, asset.as_bytes());
+                put_str(&mut v, string.as_bytes());
+                v.extend_from_slice(&restricted_vout.to_le_bytes());
+            }
+            AssetEventPayload::Association {
+                qualifier,
+                restricted,
+            } => {
+                put_str(&mut v, qualifier.as_bytes());
+                put_str(&mut v, restricted.as_bytes());
+            }
+            AssetEventPayload::Broadcast {
+                asset,
+                data,
+                expiration,
+                scripthash,
+            } => {
+                put_str(&mut v, asset.as_bytes());
+                v.extend_from_slice(data);
+                match expiration {
+                    Some(t) => {
+                        v.push(1);
+                        v.extend_from_slice(&t.to_le_bytes());
+                    }
+                    None => v.push(0),
+                }
+                v.extend_from_slice(scripthash.as_byte_array());
+            }
+        }
+        v
+    }
+
+    pub(crate) fn from_db(key: &[u8], value: &[u8]) -> Result<Self> {
+        if key.len() != ASSET_META_KEY_SIZE {
+            bail!("asset_events key must be {} bytes, got {}", ASSET_META_KEY_SIZE, key.len());
+        }
+        let be_u32 = |b: &[u8]| u32::from_be_bytes(b.try_into().expect("4-byte slice"));
+        let mut data = value;
+        let kind = AssetEventKind::from_byte(take(&mut data, 1)?[0])
+            .context("unknown asset_events kind")?;
+        let txid = Txid::from_slice(take(&mut data, 32)?).expect("32 bytes");
+        let block_hash = BlockHash::from_slice(take(&mut data, 32)?).expect("32 bytes");
+        let len = u16::from_le_bytes(take(&mut data, 2)?.try_into().expect("2 bytes"));
+        let logical_key = take(&mut data, usize::from(len))?.to_vec();
+        let payload = match kind {
+            AssetEventKind::TagByAsset | AssetEventKind::TagByH160 => {
+                let h160: [u8; 20] = take(&mut data, 20)?.try_into().expect("20 bytes");
+                let asset = take_str(&mut data)?;
+                let flag = take(&mut data, 1)?[0] != 0;
+                AssetEventPayload::Tag { h160, asset, flag }
+            }
+            AssetEventKind::Freeze => {
+                let asset = take_str(&mut data)?;
+                let flag = take(&mut data, 1)?[0] != 0;
+                AssetEventPayload::Freeze { asset, flag }
+            }
+            AssetEventKind::Verifier => {
+                let asset = take_str(&mut data)?;
+                let string = take_str(&mut data)?;
+                let restricted_vout =
+                    u32::from_le_bytes(take(&mut data, 4)?.try_into().expect("4 bytes"));
+                AssetEventPayload::Verifier {
+                    asset,
+                    string,
+                    restricted_vout,
+                }
+            }
+            AssetEventKind::Association => {
+                let qualifier = take_str(&mut data)?;
+                let restricted = take_str(&mut data)?;
+                AssetEventPayload::Association {
+                    qualifier,
+                    restricted,
+                }
+            }
+            AssetEventKind::Broadcast => {
+                let asset = take_str(&mut data)?;
+                let data34: [u8; 34] = take(&mut data, 34)?.try_into().expect("34 bytes");
+                let expiration = match take(&mut data, 1)?[0] {
+                    0 => None,
+                    _ => Some(u64::from_le_bytes(take(&mut data, 8)?.try_into().expect("8 bytes"))),
+                };
+                let scripthash =
+                    ScriptHash::from_slice(take(&mut data, 32)?).expect("32 bytes");
+                AssetEventPayload::Broadcast {
+                    asset,
+                    data: data34,
+                    expiration,
+                    scripthash,
+                }
+            }
+        };
+        Ok(Self {
+            kind,
+            key: logical_key,
+            txid,
+            block_hash,
+            height: be_u32(&key[8..12]),
+            tx_pos: be_u32(&key[12..16]),
+            vout: be_u32(&key[16..20]),
+            payload,
+        })
+    }
+}
+
+/// ElectrumX's qualifier extraction from a verifier string:
+/// `re.findall(r'([A-Z0-9_.]+)', string)`.
+pub fn verifier_qualifiers(string: &str) -> Vec<String> {
+    let mut out = vec![];
+    let mut current = String::new();
+    for c in string.chars() {
+        if c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_' || c == '.' {
+            current.push(c);
+        } else if !current.is_empty() {
+            out.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
 }
 
 #[cfg(test)]

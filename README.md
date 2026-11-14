@@ -26,8 +26,11 @@ phase-by-phase log of the adaptation from upstream electrs.
  * Mempool tracker with per-scripthash and per-asset-name lookups.
  * Neurai-aware address codec (base58check prefixes 53 / 127 → `N…` / `t…`,
    bech32/bech32m HRPs `nq` / `tnq` / `rnq`).
- * `blockchain.address.get_scripthash` and `blockchain.asset.*` RPC extensions —
-   see [doc/neurai-rpc.md](doc/neurai-rpc.md).
+ * Wire-compatible with **ElectrumX-neurai** (all 48 methods: assets, qualifier
+   tags, restricted assets, broadcasts and their subscriptions), so
+   electrum-neurai works unchanged — see [doc/neurai-rpc.md](doc/neurai-rpc.md).
+ * Native `tcp://`, `ssl://`, `ws://` and `wss://` listeners (rustls; ElectrumX
+   WebSocket framing for browser wallets).
  * Single RocksDB database, crash-safe, low index storage overhead.
  * Low CPU and memory usage after the initial sync.
  * `txindex` is **not** required on the Neurai daemon.
@@ -85,9 +88,12 @@ Per-network defaults:
 | neurai   | `:50001`     | `:19001`    | `:19000`    | `neurai`    | `N…` / `nq1…`      |
 | testnet  | `:60001`     | `:19101`    | `:19100`    | `testnet`   | `t…` / `tnq1…`     |
 | regtest  | `:60401`     | `:19201`    | `:19200`    | `regtest`   | `t…` / `rnq1…`     |
+| regtest-v1 | `:60411`   | `:19201`    | `:19200`    | `regtest-v1`| `t…`               |
 
-Testnet and regtest use an epoch-based genesis block that is fetched from the
-Neurai daemon over RPC at startup — you do not need to hardcode it in config.
+`testnet` and `regtest` are the DePIN-Test chains (SHA256d headers, epoch-based
+genesis fetched from the daemon over RPC at startup). `regtest-v1` is the regtest
+of the v1.0.7 mainnet release (X16Rv2 headers), for testing against the same
+consensus and asset code as mainnet.
 
 ## Tests
 

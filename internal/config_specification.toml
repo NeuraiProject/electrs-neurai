@@ -64,13 +64,50 @@ doc = "JSONRPC authentication cookie file (default: ~/.neurai/.cookie)"
 name = "network"
 type = "crate::config::ConfiguredNetwork"
 convert_into = "crate::neurai::NeuraiNetwork"
-doc = "Select Neurai network type ('neurai', 'testnet' or 'regtest')"
+doc = "Select Neurai network type ('neurai', 'testnet', 'regtest' for the DePIN-Test regtest, or 'regtest-v1' for the v1.0.7 regtest)"
 default = "Default::default()"
 
 [[param]]
 name = "electrum_rpc_addr"
 type = "crate::config::ResolvAddr"
 doc = "Electrum server JSONRPC 'addr:port' to listen on (default: '127.0.0.1:50001' for neurai mainnet, '127.0.0.1:60001' for testnet, '127.0.0.1:60401' for regtest)"
+
+[[param]]
+name = "electrum_ssl_addr"
+type = "crate::config::ResolvAddr"
+doc = "Electrum server 'addr:port' to listen on for TLS (ssl://) connections (disabled unless set; requires ssl_certfile and ssl_keyfile)"
+
+[[param]]
+name = "electrum_ws_addr"
+type = "crate::config::ResolvAddr"
+doc = "Electrum server 'addr:port' to listen on for plain WebSocket (ws://) connections (disabled unless set)"
+
+[[param]]
+name = "electrum_wss_addr"
+type = "crate::config::ResolvAddr"
+doc = "Electrum server 'addr:port' to listen on for WebSocket over TLS (wss://) connections (disabled unless set; requires ssl_certfile and ssl_keyfile)"
+
+[[param]]
+name = "ssl_certfile"
+type = "std::path::PathBuf"
+doc = "PEM file with the TLS certificate chain for the ssl:// and wss:// listeners"
+
+[[param]]
+name = "ssl_keyfile"
+type = "std::path::PathBuf"
+doc = "PEM file with the TLS private key (PKCS#8, PKCS#1 or SEC1) for the ssl:// and wss:// listeners"
+
+[[param]]
+name = "report_services"
+type = "String"
+doc = "Comma-separated services advertised by server.features, e.g. 'tcp://host:50001,ssl://host:50002,wss://host:50004' (default: derived from the listening addresses)"
+default = "String::new()"
+
+[[param]]
+name = "donation_address"
+type = "String"
+doc = "Address returned by server.donation_address"
+default = "String::new()"
 
 [[param]]
 name = "daemon_rpc_addr"
