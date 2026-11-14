@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 
 use bitcoin::{consensus::deserialize, hashes::hex::FromHex};
 use bitcoin::{Amount, BlockHash, Transaction, Txid};
-use bitcoincore_rpc::{json, jsonrpc, Auth, Client, RpcApi};
+use bitcoincore_rpc::{jsonrpc, Auth, Client, RpcApi};
 use crossbeam_channel::Receiver;
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -39,6 +39,43 @@ pub(crate) struct MempoolInfo {
 
 fn default_true() -> Option<bool> {
     Some(true)
+}
+
+/// Minimal view over `getmempoolentry`.
+///
+/// Neurai (v1.0.7 and the DePIN-Test branch) still returns the pre-Bitcoin-0.17
+/// shape — `size` / `fee` / `depends`, without the `fees` object, `spentby` or
+/// `bip125-replaceable` — which `bitcoincore_rpc::json::GetMempoolEntryResult`
+/// requires. Newer field names are accepted too.
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct MempoolEntry {
+    /// Virtual size (`size` on Neurai).
+    #[serde(alias = "size")]
+    pub vsize: u64,
+    #[serde(default, with = "bitcoin::amount::serde::as_btc::opt")]
+    fee: Option<Amount>,
+    #[serde(default)]
+    fees: Option<MempoolEntryFees>,
+    pub depends: Vec<Txid>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct MempoolEntryFees {
+    #[serde(with = "bitcoin::amount::serde::as_btc")]
+    base: Amount,
+}
+
+impl MempoolEntry {
+    pub(crate) fn fee(&self) -> Option<Amount> {
+        self.fees.as_ref().map(|f| f.base).or(self.fee)
+    }
+}
+
+/// Minimal view over `getblock <hash> 1` — Neurai doesn't return `nTx`, which
+/// `bitcoincore_rpc::json::GetBlockResult` requires.
+#[derive(Debug, serde::Deserialize)]
+struct BlockTxids {
+    tx: Vec<Txid>,
 }
 
 /// Minimal view over `getblockchaininfo` — only the fields electrs actually needs.
@@ -204,48 +241,46 @@ impl Daemon {
             .context("failed to broadcast transaction")
     }
 
-    pub(crate) fn get_transaction_info(
-        &self,
-        txid: &Txid,
-        blockhash: Option<BlockHash>,
-    ) -> Result<Value> {
+    // Neurai's `getrawtransaction` accepts at most 2 params (`txid`, `verbose`):
+    // there is no `blockhash` argument, so never pass one. Without `-txindex`
+    // it only finds mempool transactions and those with unspent outputs.
+
+    /// Verbose `getrawtransaction` — used for mempool transactions.
+    pub(crate) fn get_transaction_info(&self, txid: &Txid) -> Result<Value> {
         // No need to parse the resulting JSON, just return it as-is to the client.
         self.rpc
-            .call(
-                "getrawtransaction",
-                &[json!(txid), json!(true), json!(blockhash)],
-            )
+            .call("getrawtransaction", &[json!(txid), json!(true)])
             .context("failed to get transaction info")
     }
 
-    pub(crate) fn get_transaction_hex(
-        &self,
-        txid: &Txid,
-        blockhash: Option<BlockHash>,
-    ) -> Result<Value> {
+    /// `decoderawtransaction` — verbose JSON for a transaction we already have.
+    pub(crate) fn decode_transaction(&self, tx_bytes: &[u8]) -> Result<Value> {
+        use bitcoin::hex::DisplayHex;
+        self.rpc
+            .call("decoderawtransaction", &[json!(tx_bytes.to_lower_hex_string())])
+            .context("failed to decode transaction")
+    }
+
+    pub(crate) fn get_transaction_hex(&self, txid: &Txid) -> Result<Value> {
         use bitcoin::consensus::serde::{hex::Lower, Hex, With};
 
-        let tx = self.get_transaction(txid, blockhash)?;
+        let tx = self.get_transaction(txid)?;
         #[derive(serde::Serialize)]
         #[serde(transparent)]
         struct TxAsHex(#[serde(with = "With::<Hex<Lower>>")] Transaction);
         serde_json::to_value(TxAsHex(tx)).map_err(Into::into)
     }
 
-    pub(crate) fn get_transaction(
-        &self,
-        txid: &Txid,
-        blockhash: Option<BlockHash>,
-    ) -> Result<Transaction> {
+    pub(crate) fn get_transaction(&self, txid: &Txid) -> Result<Transaction> {
         self.rpc
-            .get_raw_transaction(txid, blockhash.as_ref())
+            .get_raw_transaction(txid, None)
             .context("failed to get transaction")
     }
 
     pub(crate) fn get_block_txids(&self, blockhash: BlockHash) -> Result<Vec<Txid>> {
         Ok(self
             .rpc
-            .get_block_info(&blockhash)
+            .call::<BlockTxids>("getblock", &[json!(blockhash), json!(1)])
             .context("failed to get block txids")?
             .tx)
     }
@@ -262,17 +297,18 @@ impl Daemon {
             .context("failed to get mempool txids")
     }
 
-    pub(crate) fn get_mempool_entries(
-        &self,
-        txids: &[Txid],
-    ) -> Result<Vec<Option<json::GetMempoolEntryResult>>> {
+    pub(crate) fn get_mempool_entries(&self, txids: &[Txid]) -> Result<Vec<Option<MempoolEntry>>> {
         let results = batch_request(self.rpc.get_jsonrpc_client(), "getmempoolentry", txids)?;
         Ok(results
             .into_iter()
-            .map(|r| match r?.result::<json::GetMempoolEntryResult>() {
-                Ok(entry) => Some(entry),
+            .map(|r| match r?.result::<MempoolEntry>() {
+                Ok(entry) if entry.fee().is_some() => Some(entry),
+                Ok(entry) => {
+                    warn!("mempool entry without fee: {:?}", entry);
+                    None
+                }
                 Err(err) => {
-                    debug!("failed to get mempool entry: {}", err); // probably due to RBF
+                    debug!("failed to get mempool entry: {}", err); // probably evicted meanwhile
                     None
                 }
             })
@@ -372,5 +408,68 @@ where
             Ok(values)
         }
         Err(err) => bail!("batch {} request failed: {}", name, err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BlockTxids, MempoolEntry};
+    use bitcoin::Amount;
+
+    /// `getmempoolentry` exactly as returned by neuraid v1.0.7.
+    #[test]
+    fn mempool_entry_from_neurai_v107() {
+        let entry: MempoolEntry = serde_json::from_str(
+            r#"{"size":542,"fee":0.00556575,"modifiedfee":0.00556575,"time":1794678725,
+            "height":1107,"descendantcount":1,"descendantsize":542,"descendantfees":556575,
+            "ancestorcount":1,"ancestorsize":542,"ancestorfees":556575,
+            "wtxid":"2e49ee922182755060849d0543c652d08e70efa21758b9ba3623eb22caaf09f1",
+            "depends":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(entry.vsize, 542);
+        assert_eq!(entry.fee(), Some(Amount::from_sat(556_575)));
+        assert!(entry.depends.is_empty());
+    }
+
+    /// Bitcoin Core >= 0.17 shape (`vsize` + `fees.base`) is still accepted.
+    #[test]
+    fn mempool_entry_from_newer_shape() {
+        let entry: MempoolEntry = serde_json::from_str(
+            r#"{"vsize":141,"fees":{"base":0.00001410,"modified":0.00001410},
+            "depends":["2e49ee922182755060849d0543c652d08e70efa21758b9ba3623eb22caaf09f1"]}"#,
+        )
+        .unwrap();
+        assert_eq!(entry.vsize, 141);
+        assert_eq!(entry.fee(), Some(Amount::from_sat(1_410)));
+        assert_eq!(entry.depends.len(), 1);
+    }
+
+    /// `getblock <hash> 1` from neuraid v1.0.7 (no `nTx` field).
+    #[test]
+    fn block_txids_from_neurai_v107() {
+        let block: BlockTxids = serde_json::from_str(
+            r#"{"hash":"18c6ce11c89a6b132e1f51bca36e317a5d03a1b65e3257595419492e4c036c0c",
+            "confirmations":8,"strippedsize":1236,"size":1272,"weight":4980,"height":1101,
+            "version":805307392,"versionHex":"30000400",
+            "merkleroot":"b5db62d1bacd65886663c4e45f79e5be4a41078f5b6335af4b57426ef8d0382a",
+            "tx":["8a3cefe269ef43e81b46227abd087966bd7b55b3cc964b518ffdba4cd0b0a105",
+            "fcc43c0b3ce4fbc51b146023e6f70af89ce6a6be167921562ef9ff0276931f74",
+            "0218cb7e8ca0abdc7c9066660a0a183c64e8370522c34622dbf0d160307157d2",
+            "b8cbbbc6561ed4f2edae553eaa7941eb85f400f4c55c53616926b671644309f9"],
+            "time":1794678827,"mediantime":1794678826,"nonce":3,"bits":"207fffff",
+            "difficulty":4.656542373906925e-10,
+            "chainwork":"000000000000000000000000000000000000000000000000000000000000089a",
+            "headerhash":"9d73ddc6e268f2543a67e7772cad6cee7d8ac003df72f6a8ff7391cc2c8a8cf0",
+            "mixhash":"0000000000000000000000000000000000000000000000000000000000000000",
+            "nonce64":0,
+            "previousblockhash":"035a8b1bebc1b88e9c388d261cf9baf2012a1f46cb7adfa69a64829be4dccfd1"}"#,
+        )
+        .unwrap();
+        assert_eq!(block.tx.len(), 4);
+        assert_eq!(
+            block.tx[2].to_string(),
+            "0218cb7e8ca0abdc7c9066660a0a183c64e8370522c34622dbf0d160307157d2"
+        );
     }
 }

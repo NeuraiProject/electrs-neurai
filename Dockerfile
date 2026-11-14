@@ -20,7 +20,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    RUST_VERSION=1.85.0 \
+    RUST_VERSION=1.88.0 \
     ROCKSDB_INCLUDE_DIR=/usr/include \
     ROCKSDB_LIB_DIR=/usr/lib
 

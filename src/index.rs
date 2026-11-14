@@ -18,8 +18,9 @@ use crate::{
     metrics::{self, Gauge, Histogram, Metrics},
     signals::ExitFlag,
     types::{
-        bsl_txid, AssetFundingRow, AssetHistoryRow, AssetMetaEvent, AssetMetadata, HashPrefixRow,
-        HeaderRow, ScriptHash, ScriptHashRow, SerBlock, SpendingPrefixRow, TxidRow,
+        bsl_txid, AssetFundingRow, AssetHistoryRow, AssetMetaEvent, AssetMetaEventRow,
+        AssetMetadata, HashPrefixRow, HeaderRow, ScriptHash, ScriptHashRow, SerBlock,
+        SpendingPrefixRow, TxidRow,
     },
 };
 
@@ -215,11 +216,25 @@ impl Index {
             })
     }
 
-    /// Point lookup for asset metadata (latest `New` / `Reissue` written).
+    /// Current asset state: its `New` / `Reissue` events on the active chain,
+    /// folded in chain order. Events from blocks that were reorged away are
+    /// dropped by checking their block hash against the chain at their height.
     pub(crate) fn get_asset_metadata(&self, name: &[u8]) -> Option<AssetMetadata> {
-        self.store
-            .get_asset_meta(name)
-            .and_then(|bytes| AssetMetadata::from_bytes(&bytes).ok())
+        let events: Vec<AssetMetaEventRow> = self
+            .store
+            .iter_asset_meta(AssetMetaEventRow::scan_prefix(name))
+            .into_iter()
+            .filter_map(|(key, value)| match AssetMetaEventRow::from_db(&key, &value) {
+                Ok(row) => Some(row),
+                Err(e) => {
+                    warn!("skipping invalid asset_meta row: {}", e);
+                    None
+                }
+            })
+            .filter(|row| row.name == name) // 8-byte name prefixes may collide
+            .filter(|row| self.chain.get_block_hash(row.height as usize) == Some(row.block_hash))
+            .collect();
+        AssetMetadata::fold(&events)
     }
 
     // Return `Ok(true)` when the chain is fully synced and the index is compacted.
@@ -330,19 +345,31 @@ fn asset_name_of(data: &AssetData) -> &str {
     }
 }
 
-/// Extract persistent metadata for a `New` or `Reissue` event. Transfer/Owner
-/// outputs don't produce metadata rows — they're tracked only in history/funding.
-fn asset_metadata_of(data: &AssetData, txid: Txid, height: u32) -> Option<AssetMetadata> {
-    let (event, amount, units, reissuable, ipfs) = match data {
+/// Where an asset output sits on the chain.
+struct OutputLocation {
+    txid: Txid,
+    block_hash: BlockHash,
+    height: u32,
+    tx_pos: u32,
+    vout: u32,
+}
+
+/// Build the `asset_meta` event row for a `New` or `Reissue` output.
+/// Transfer/Owner outputs don't change metadata — they're tracked only in
+/// history/funding.
+fn asset_meta_event_of(data: &AssetData, loc: &OutputLocation) -> Option<AssetMetaEventRow> {
+    let (event, name, amount, units, reissuable, ipfs) = match data {
         AssetData::New(a) => (
             AssetMetaEvent::New,
+            &a.name,
             a.amount,
-            a.units,
+            i8::try_from(a.units).unwrap_or(i8::MAX),
             a.reissuable,
             a.ipfs.as_ref(),
         ),
         AssetData::Reissue(a) => (
             AssetMetaEvent::Reissue,
+            &a.name,
             a.amount,
             a.units,
             a.reissuable,
@@ -354,10 +381,14 @@ fn asset_metadata_of(data: &AssetData, txid: Txid, height: u32) -> Option<AssetM
         Some(IpfsRef { marker, hash }) => (*marker, *hash),
         None => (0u8, [0u8; 32]),
     };
-    Some(AssetMetadata {
+    Some(AssetMetaEventRow {
+        name: name.as_bytes().to_vec(),
         event,
-        issuance_txid: txid,
-        issuance_height: height,
+        txid: loc.txid,
+        block_hash: loc.block_hash,
+        height: loc.height,
+        tx_pos: loc.tx_pos,
+        vout: loc.vout,
         amount,
         units,
         reissuable,
@@ -386,20 +417,36 @@ fn index_single_block(
     struct IndexBlockVisitor<'a> {
         batch: &'a mut WriteBatch,
         height: usize,
-        current_txid: Option<Txid>,
+        block_hash: BlockHash,
+        tx_pos: u32,
+        /// Asset outputs of the transaction being parsed. `bitcoin_slices`
+        /// calls `visit_tx_out` for every output *before* `visit_transaction`
+        /// (the txid is only known once the whole transaction is parsed), so
+        /// they are indexed when `visit_transaction` runs.
+        pending_assets: Vec<(u32, ScriptHash, AssetOutput)>,
     }
 
     impl Visitor for IndexBlockVisitor<'_> {
         fn visit_transaction(&mut self, tx: &bsl::Transaction) -> ControlFlow<()> {
             let txid = bsl_txid(tx);
-            self.current_txid = Some(txid);
             self.batch
                 .txid_rows
                 .push(TxidRow::row(txid, self.height).to_db_row());
+            for (vout, scripthash, asset) in std::mem::take(&mut self.pending_assets) {
+                let loc = OutputLocation {
+                    txid,
+                    block_hash: self.block_hash,
+                    height: self.height as u32,
+                    tx_pos: self.tx_pos,
+                    vout,
+                };
+                self.index_asset_output(scripthash, asset, &loc);
+            }
+            self.tx_pos += 1;
             ControlFlow::Continue(())
         }
 
-        fn visit_tx_out(&mut self, _vout: usize, tx_out: &bsl::TxOut) -> ControlFlow<()> {
+        fn visit_tx_out(&mut self, vout: usize, tx_out: &bsl::TxOut) -> ControlFlow<()> {
             let script_bytes = tx_out.script_pubkey();
             let script = bitcoin::Script::from_bytes(script_bytes);
             // Skip unspendable outputs:
@@ -422,7 +469,7 @@ fn index_single_block(
                     .funding_rows
                     .push(ScriptHashRow::row(scripthash, self.height).to_db_row());
                 if let Some(asset) = asset {
-                    self.index_asset_output(scripthash, asset);
+                    self.pending_assets.push((vout as u32, scripthash, asset));
                 }
             }
             ControlFlow::Continue(())
@@ -440,22 +487,22 @@ fn index_single_block(
     }
 
     impl IndexBlockVisitor<'_> {
-        fn index_asset_output(&mut self, scripthash: ScriptHash, asset: AssetOutput) {
-            let txid = self
-                .current_txid
-                .expect("visit_transaction runs before visit_tx_out");
+        fn index_asset_output(
+            &mut self,
+            scripthash: ScriptHash,
+            asset: AssetOutput,
+            loc: &OutputLocation,
+        ) {
             let name_bytes = asset_name_of(&asset.data).as_bytes();
             self.batch
                 .asset_history_rows
-                .push(AssetHistoryRow::row(name_bytes, txid, self.height));
+                .push(AssetHistoryRow::row(name_bytes, loc.txid, self.height));
             self.batch
                 .asset_funding_rows
                 .push(AssetFundingRow::row(scripthash, name_bytes, self.height));
 
-            if let Some(meta) = asset_metadata_of(&asset.data, txid, self.height as u32) {
-                self.batch
-                    .asset_meta_rows
-                    .push((name_bytes.to_vec(), meta.to_bytes().to_vec()));
+            if let Some(event) = asset_meta_event_of(&asset.data, loc) {
+                self.batch.asset_meta_rows.push((event.key(), event.value()));
             }
         }
     }
@@ -463,7 +510,9 @@ fn index_single_block(
     let mut index_block = IndexBlockVisitor {
         batch,
         height,
-        current_txid: None,
+        block_hash,
+        tx_pos: 0,
+        pending_assets: Vec::new(),
     };
     bsl::Block::visit(&synthetic_block, &mut index_block).expect("core returned invalid block");
 
@@ -475,11 +524,16 @@ fn index_single_block(
 
 #[cfg(test)]
 mod tests {
-    use super::{asset_metadata_of, asset_name_of};
-    use crate::neurai::asset::{parse_asset_script, AssetData, ASSET_MAGIC, OP_DROP, OP_XNA_ASSET, TYPE_NEW, TYPE_TRANSFER};
-    use crate::types::{AssetMetaEvent, AssetMetadata};
-    use bitcoin::hashes::Hash;
-    use bitcoin::Txid;
+    use super::{asset_meta_event_of, asset_name_of, index_single_block, OutputLocation};
+    use crate::db::WriteBatch;
+    use crate::neurai::asset::{
+        parse_asset_script, AssetData, ASSET_MAGIC, OP_DROP, OP_XNA_ASSET, TYPE_NEW, TYPE_TRANSFER,
+    };
+    use crate::neurai::{NeuraiNetwork, NetworkParams};
+    use crate::types::{AssetHistoryRow, AssetMetaEvent, AssetMetaEventRow};
+    use bitcoin::hashes::{hex::FromHex, Hash};
+    use bitcoin::{BlockHash, Txid};
+    use std::str::FromStr;
 
     /// Helper: construct a P2PKH + OP_XNA_ASSET payload script exactly as the
     /// visitor would see it coming out of `bitcoin_slices::bsl::Block::visit`.
@@ -498,12 +552,21 @@ mod tests {
         script
     }
 
-    /// End-to-end: parse a synthetic asset output, lift it to AssetMetadata,
-    /// serialize it, and verify the round-trip survives unchanged. Mirrors the
-    /// `visit_tx_out` → `asset_metadata_of` → `to_bytes` pipeline that the
-    /// indexer runs for every new-asset output.
+    fn location(height: u32) -> OutputLocation {
+        OutputLocation {
+            txid: Txid::from_byte_array([0x42u8; 32]),
+            block_hash: BlockHash::from_byte_array([0x24u8; 32]),
+            height,
+            tx_pos: 3,
+            vout: 1,
+        }
+    }
+
+    /// Parse a synthetic new-asset output, lift it to an `asset_meta` event row
+    /// and check the DB key/value round-trip — the `visit_tx_out` →
+    /// `asset_meta_event_of` → `key()/value()` pipeline the indexer runs.
     #[test]
-    fn pipeline_new_asset_to_metadata_roundtrip() {
+    fn pipeline_new_asset_to_meta_event_roundtrip() {
         let mut body = Vec::new();
         body.push(5u8); // name length
         body.extend_from_slice(b"TOKEN");
@@ -516,19 +579,17 @@ mod tests {
         let asset = parse_asset_script(&script).expect("parse");
         assert_eq!(asset_name_of(&asset.data), "TOKEN");
 
-        let txid = Txid::from_slice(&[0x42u8; 32]).unwrap();
-        let meta = asset_metadata_of(&asset.data, txid, 1_234).expect("metadata");
-        assert_eq!(meta.event, AssetMetaEvent::New);
-        assert_eq!(meta.amount, 5_000);
-        assert_eq!(meta.units, 2);
-        assert!(meta.reissuable);
-        assert_eq!(meta.issuance_height, 1_234);
-        assert_eq!(meta.ipfs_marker, 0);
+        let event = asset_meta_event_of(&asset.data, &location(1_234)).expect("metadata");
+        assert_eq!(event.name, b"TOKEN");
+        assert_eq!(event.event, AssetMetaEvent::New);
+        assert_eq!(event.amount, 5_000);
+        assert_eq!(event.units, 2);
+        assert!(event.reissuable);
+        assert_eq!((event.height, event.tx_pos, event.vout), (1_234, 3, 1));
+        assert_eq!(event.ipfs_marker, 0);
 
-        // Byte-level round-trip (what gets stored in `asset_meta` CF).
-        let bytes = meta.to_bytes();
-        let decoded = AssetMetadata::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded, meta);
+        let decoded = AssetMetaEventRow::from_db(&event.key(), &event.value()).unwrap();
+        assert_eq!(decoded, event);
     }
 
     /// Transfer outputs must *not* produce metadata rows (only New/Reissue do).
@@ -542,7 +603,50 @@ mod tests {
 
         let asset = parse_asset_script(&script).expect("parse");
         assert!(matches!(asset.data, AssetData::Transfer(_)));
-        let txid = Txid::from_slice(&[0x01u8; 32]).unwrap();
-        assert!(asset_metadata_of(&asset.data, txid, 1).is_none());
+        assert!(asset_meta_event_of(&asset.data, &location(1)).is_none());
+    }
+
+    /// Regtest block 1101 mined by neuraid v1.0.7: coinbase + three `issue`
+    /// transactions (SHORT, LONGTRANSFERNAME12345, and a 30-char name with an
+    /// IPFS hash whose payload needs OP_PUSHDATA1). Every asset row must carry
+    /// the txid of the transaction that actually contains the output.
+    #[test]
+    fn real_v107_block_assets_are_attributed_to_their_own_tx() {
+        let params = NetworkParams::for_network(NeuraiNetwork::Regtest);
+        let hex = include_str!("../tests/fixtures/neurai-v1.0.7-regtest-block-1101.hex");
+        let block = Vec::<u8>::from_hex(hex.trim()).unwrap();
+        let block_hash =
+            BlockHash::from_str("18c6ce11c89a6b132e1f51bca36e317a5d03a1b65e3257595419492e4c036c0c")
+                .unwrap();
+        let mut batch = WriteBatch::default();
+        index_single_block(block_hash, block, 1101, &mut batch, params);
+
+        let issues = [
+            ("SHORT", "fcc43c0b3ce4fbc51b146023e6f70af89ce6a6be167921562ef9ff0276931f74", 1000, 2),
+            ("LONGTRANSFERNAME12345", "0218cb7e8ca0abdc7c9066660a0a183c64e8370522c34622dbf0d160307157d2", 500, 0),
+            ("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123", "b8cbbbc6561ed4f2edae553eaa7941eb85f400f4c55c53616926b671644309f9", 1000, 8),
+        ];
+        assert_eq!(batch.txid_rows.len(), 4);
+        assert_eq!(batch.asset_history_rows.len(), 2 * issues.len()); // owner + new each
+        assert_eq!(batch.asset_meta_rows.len(), issues.len());
+
+        for (tx_pos, (name, txid, qty, units)) in issues.iter().enumerate() {
+            let txid = Txid::from_str(txid).unwrap();
+            for asset in [name.to_string(), format!("{name}!")] {
+                let row = AssetHistoryRow::row(asset.as_bytes(), txid, 1101);
+                assert!(batch.asset_history_rows.contains(&row), "missing history row for {asset}");
+            }
+            let (key, value) = &batch.asset_meta_rows[tx_pos];
+            let event = AssetMetaEventRow::from_db(key, value).unwrap();
+            assert_eq!(event.name, name.as_bytes());
+            assert_eq!(event.txid, txid);
+            assert_eq!(event.block_hash, block_hash);
+            assert_eq!((event.height, event.tx_pos), (1101, tx_pos as u32 + 1));
+            assert_eq!(event.amount, qty * 100_000_000);
+            assert_eq!(event.units, *units);
+        }
+        let (key, value) = &batch.asset_meta_rows[2];
+        let event = AssetMetaEventRow::from_db(key, value).unwrap();
+        assert_eq!(event.ipfs_marker, 0x12);
     }
 }

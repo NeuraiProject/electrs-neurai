@@ -1,3 +1,48 @@
+# Unreleased — Neurai v1.0.7 mainnet compatibility
+
+Tested against `neuraiproject/neurai-node:v1.0.7`: asset scripts, blocks and
+RPC responses from regtest; KAWPOW headers and the P2P handshake on mainnet.
+
+* **DB format 4 — a full reindex runs automatically on upgrade.**
+* Confirmed history, unspent outputs and balances now point at the right
+  transaction. `bitcoin_slices` visits a transaction's inputs/outputs before
+  `visit_transaction`; the block filters attributed every match to the
+  previous transaction in the block (and could panic on coinbase outputs).
+* Asset rows (`asset_history`, `asset_meta`) carry the txid of the transaction
+  that contains the asset output (same visiting-order bug in the indexer).
+* Asset payloads of 76 bytes or more (encoded with `OP_PUSHDATA1`: long names
+  with an IPFS hash, transfers with a message) are recognised. They used to be
+  indexed as plain outputs, invisible to the holder's address.
+* `blockchain.asset.get_meta` reports the asset's current state, folded like
+  the daemon's asset cache: `amount` is the total supply, reissues with units
+  `-1` keep the decimal places, and reissues without IPFS keep the hash.
+  Events from reorged blocks are ignored.
+* Mempool tracking works with Neurai's `getmempoolentry` (`size`/`fee`, no
+  `fees` object) — it used to drop every mempool transaction.
+* `blockchain.transaction.get_merkle` / `id_from_pos` work with Neurai's
+  `getblock` (no `nTx`).
+* `blockchain.transaction.get` with `verbose=true` works: Neurai's
+  `getrawtransaction` takes no `blockhash`, so confirmed transactions are
+  decoded with `decoderawtransaction` and the block fields are added.
+* `docker/mainnet` runs the official `neuraiproject/neurai-node:v1.0.7` image
+  instead of building the `DePIN-Test` branch.
+
+**Fixes from upstream electrs up to 0.12.1** (upstream's switch to `bindex`
+in 0.12.0 is not ported: it requires Bitcoin Core 31+ RPC/REST features that
+Neurai doesn't have).
+
+* `blockchain.transaction.id_from_pos`: `merkle` is optional, and a bare txid
+  is returned when it is `false` (protocol compliance).
+* `bitcoin_slices` 0.12: rejects oversized length prefixes and too-large
+  transactions instead of truncating them.
+* Update dependencies (`bitcoin`, `crossbeam-channel`, `log`, `rayon`,
+  `serde_json`, `sha2`, `signal-hook`).
+
+**MSRV 1.88** (was 1.85), required by `sha2` 0.11.1 (fixes the AArch64 SHA-2
+backend under Rust's aliasing model). The Dockerfiles install 1.88.0 with
+rustup; Debian 13's packaged `cargo` (1.85) can no longer build the project.
+* Document the GCC 15 `<cstdint>` workaround for building RocksDB.
+
 # electrs-neurai 0.1.0 — initial Neurai release
 
 First release of the Neurai adaptation of

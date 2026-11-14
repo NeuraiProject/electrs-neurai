@@ -349,45 +349,42 @@ mod tests {
         assert_eq!(decoded, h);
     }
 
+    /// Real mainnet headers served by neuraid v1.0.7 (`getblockheader <hash> false`):
+    /// `block_hash()` must reproduce the daemon's block hash and the declared
+    /// `mix_hash` must pass ProgPoW verification.
     #[test]
-    fn kawpow_hash_matches_verify() {
-        // Build a KAWPOW header and check that computing its hash produces a value
-        // that verify_kawpow_header accepts (round-trip through the FFI).
-        let header = NeuraiBlockHeader {
-            version: 4,
-            prev_blockhash: BlockHash::from_raw_hash(sha256d::Hash::hash(b"prev")),
-            merkle_root: TxMerkleNode::from_raw_hash(sha256d::Hash::hash(b"merkle")),
-            time: 1_700_000_000,
-            bits: 0x1e00ffff,
-            nonce: 0,
-            kawpow: Some(KawpowFields {
-                height: 12345,
-                nonce64: 0xdead_beef_cafe_babe,
-                mix_hash: [0u8; 32], // will be filled in below
-            }),
-        };
+    fn kawpow_hash_matches_real_mainnet_headers() {
+        use std::str::FromStr;
+        let headers: [(&str, [u8; 120]); 3] = [
+            (
+                "0000000000010cd8101e9c0f26ed1a8694e31a14570d209e40f16624ffbf200b", // 146000
+                hex_lit::hex!("00000030dc63baa9042284f8cc6c169bde6728ff090f433db61801151114010000000000dbd76f72eb09e2ee7799a7c87d0a00bf12a75546346d43c158d96836d10c65864fccc46487ed011b503a020051b26e87c96ca7ca4906677fc8184e85788e3e1a272a1cb789ab79c7a07a00b5a06f15f39408e16b"),
+            ),
+            (
+                "0000000000011411150118b63d430f09ff2867de9b166cccf8842204a9ba63dc", // 145999
+                hex_lit::hex!("0000003021bcaa095d339312795e1ba08fac3bca2277004e9ac97731ae3e01000000000071bf1971ec3700e32ae7017e06e0903be5f30a96133b155ad8d2a2f6677ea2108fcbc46458ec011b4f3a02002740b23001b040d5aad246623714170c871d7a049fc505e96bfc2afb8fd632538abb8a733bbc4153"),
+            ),
+            (
+                "0000000000013eae3177c99a4e007722ca3bac8fa01b5e791293335d09aabc21", // 145998
+                hex_lit::hex!("00000030775390f2823cb63af56fdf6deb2a795b986874f7c18ee73fbb2a010000000000cd83e42f810d4f48df1c2bf3cdc2d3af140a3db8f5598184e33fca6ed8240fec17cbc46456e9011b4e3a0200467b155d5555472b5fc316e49b7f9041838ddb88082c1bb3de3d92f147f45148b8b3d07b9d1def60"),
+            ),
+        ];
+        let params = NetworkParams::for_network(NeuraiNetwork::Mainnet);
+        for (hash, raw) in headers {
+            let expected = BlockHash::from_str(hash).unwrap();
+            let header = decode_header(&mut raw.as_slice(), params).unwrap();
+            assert!(header.is_kawpow());
+            assert_eq!(header.serialize(), raw.to_vec());
+            assert_eq!(header.block_hash(params), Some(expected));
+            assert!(verify_kawpow_header(&header, &expected));
 
-        // First compute the expected (mix, hash) via the FFI directly.
-        let k = header.kawpow.unwrap();
-        let input = kawpow_input_hash(&header, k.height);
-        let (mix, hash) =
-            hasherkawpow_sys::hash_kawpow(&input, &k.nonce64, k.height as i32);
-
-        // Rebuild the header with the computed mix, then verify.
-        let mut with_mix = header;
-        with_mix.kawpow = Some(KawpowFields { mix_hash: mix, ..k });
-        let computed = with_mix.block_hash(
-            NetworkParams::for_network(NeuraiNetwork::Mainnet),
-        );
-        assert_eq!(
-            computed.unwrap().as_raw_hash().as_byte_array(),
-            &hash,
-            "block_hash() must return the KAWPOW hash"
-        );
-        assert!(
-            verify_kawpow_header(&with_mix, &computed.unwrap()),
-            "verify_kawpow_header must accept a self-consistent header"
-        );
+            let mut corrupted = header;
+            corrupted.kawpow.as_mut().unwrap().mix_hash[0] ^= 1;
+            assert!(!verify_kawpow_header(&corrupted, &expected));
+        }
+        // The headers chain together.
+        let h146000 = decode_header(&mut headers[0].1.as_slice(), params).unwrap();
+        assert_eq!(h146000.prev_blockhash, BlockHash::from_str(headers[1].0).unwrap());
     }
 
     #[test]

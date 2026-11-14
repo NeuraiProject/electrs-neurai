@@ -5,7 +5,7 @@
 //! ```text
 //! <base_script>
 //! OP_XNA_ASSET      (0xc0)
-//! <varint length>
+//! <script push: 1-byte length (< 76) or OP_PUSHDATA1 + 1-byte length>
 //! <3 bytes: magic "rvn">     — retained for Ravencoin protocol compatibility
 //! <1 byte: type 'q'|'t'|'r'|'o'>
 //! <type-specific payload>
@@ -25,6 +25,7 @@ use anyhow::{bail, Context, Result};
 
 pub const OP_XNA_ASSET: u8 = 0xc0;
 pub const OP_DROP: u8 = 0x75;
+pub const OP_PUSHDATA1: u8 = 0x4c;
 pub const OP_RESERVED: u8 = 0x50;
 pub const OP_1: u8 = 0x51;
 
@@ -91,7 +92,9 @@ pub struct AssetMessage {
 pub struct ReissueAsset {
     pub name: String,
     pub amount: i64,
-    pub units: u8,
+    /// New number of decimal places, or `-1` to keep the current ones
+    /// (the daemon's `CReissueAsset::nUnits` is an `int8_t`).
+    pub units: i8,
     pub reissuable: bool,
     pub ipfs: Option<IpfsRef>,
 }
@@ -131,10 +134,19 @@ pub fn parse_asset_script(bytes: &[u8]) -> Option<AssetOutput> {
         return None;
     }
 
-    let mut cursor = &bytes[asset_start + 1..bytes.len() - 1]; // between OP_XNA_ASSET and OP_DROP
-    let (payload_len, used) = read_varint(cursor)?;
-    cursor = &cursor[used..];
-    if cursor.len() != payload_len as usize {
+    let cursor = &bytes[asset_start + 1..bytes.len() - 1]; // between OP_XNA_ASSET and OP_DROP
+    // The daemon builds the payload with `script << vchMessage`, i.e. a script
+    // push, not a CompactSize: a direct push for payloads < 76 bytes and
+    // `OP_PUSHDATA1 <len>` above that (e.g. long names with an IPFS hash, or
+    // transfers carrying a message). `CScript::IsAssetScript` accepts exactly
+    // these two encodings ("rvn" at offset 27 or 28 of a P2PKH-based script).
+    let (payload_len, used) = match *cursor.first()? {
+        n @ 1..=0x4b => (n as usize, 1),
+        OP_PUSHDATA1 => (*cursor.get(1)? as usize, 2),
+        _ => return None,
+    };
+    let cursor = &cursor[used..];
+    if cursor.len() != payload_len {
         return None;
     }
     if cursor.len() < 4 || cursor[..3] != ASSET_MAGIC {
@@ -484,7 +496,7 @@ fn parse_transfer(mut data: &[u8]) -> Result<TransferAsset> {
 fn parse_reissue(mut data: &[u8]) -> Result<ReissueAsset> {
     let name = read_string(&mut data)?;
     let amount = read_i64_le(&mut data)?;
-    let units = read_u8(&mut data)?;
+    let units = read_u8(&mut data)? as i8;
     let reissuable = read_u8(&mut data)? != 0;
     let ipfs = if data.is_empty() {
         None
@@ -623,10 +635,14 @@ mod tests {
         let mut payload = Vec::from(ASSET_MAGIC);
         payload.push(type_byte);
         payload.extend_from_slice(tail);
-        assert!(payload.len() < 0xfd, "tests stay under the varint single-byte range");
+        assert!(payload.len() <= 0xff, "tests stay within OP_PUSHDATA1 range");
         let mut script = p2pkh_prefix();
         script.push(OP_XNA_ASSET);
-        script.push(payload.len() as u8); // 1-byte varint
+        // Same encoding as the daemon's `CScript << std::vector<unsigned char>`.
+        if payload.len() >= OP_PUSHDATA1 as usize {
+            script.push(OP_PUSHDATA1);
+        }
+        script.push(payload.len() as u8);
         script.extend_from_slice(&payload);
         script.push(OP_DROP);
         script
@@ -1142,6 +1158,145 @@ mod tests {
         script.push(inner.len() as u8);
         script.extend_from_slice(&inner);
         assert_eq!(effective_script(&script), script.as_slice());
+    }
+
+    // ─── real scripts produced by neuraid v1.0.7 (regtest) ────────────────────
+    //
+    // Captured from `getblock <hash> 2` after running the wallet RPCs named in
+    // each constant. They pin the exact on-chain encoding of the mainnet
+    // release, including the OP_PUSHDATA1 form used for payloads >= 76 bytes.
+
+    const IPFS_FIXTURE: &str = "51c87ba0b5f1bc07f19513007f22f4a9dd9211560d416094cd15de1e5080f311";
+
+    fn unhex(s: &str) -> Vec<u8> {
+        use bitcoin::hashes::hex::FromHex;
+        Vec::from_hex(s).expect("valid hex fixture")
+    }
+
+    fn ipfs_fixture() -> [u8; 32] {
+        unhex(IPFS_FIXTURE).try_into().unwrap()
+    }
+
+    /// `issue ABCDEFGHIJKLMNOPQRSTUVWXYZ0123 1000 <addr> "" 8 true true <ipfs>`
+    /// — 80-byte payload, encoded as `c0 4c 50 ...`.
+    const V107_NEW_LONG_NAME_IPFS: &str =
+        "76a914a2825ed4fefe6440124cdb0514483504fa9701fa88acc04c5072766e711e4142434445464748494a4b4c4d4e4f505152535455565758595a3031323300e8764817000000080101122051c87ba0b5f1bc07f19513007f22f4a9dd9211560d416094cd15de1e5080f31175";
+
+    /// `transfer LONGTRANSFERNAME12345 7 <addr> <ipfs> 9999999999`
+    /// — message + expire time, 76-byte payload.
+    const V107_TRANSFER_MESSAGE_EXPIRE: &str =
+        "76a9149b312db54c03455177cc6bf4e5364f5191b7a30888acc04c4c72766e74154c4f4e475452414e534645524e414d4531323334350027b92900000000122051c87ba0b5f1bc07f19513007f22f4a9dd9211560d416094cd15de1e5080f311ffe30b540200000075";
+
+    /// `transfer ABCDEFGHIJKLMNOPQRSTUVWXYZ0123 1.5 <addr> <ipfs> 1999999999`
+    const V107_TRANSFER_LONG_NAME_MESSAGE: &str =
+        "76a9149b312db54c03455177cc6bf4e5364f5191b7a30888acc04c5572766e741e4142434445464748494a4b4c4d4e4f505152535455565758595a3031323380d1f00800000000122051c87ba0b5f1bc07f19513007f22f4a9dd9211560d416094cd15de1e5080f311ff9335770000000075";
+
+    /// `reissue ABCDEFGHIJKLMNOPQRSTUVWXYZ0123 50 <addr> "" true -1`
+    /// — units byte is 0xff (= keep current units), no IPFS.
+    const V107_REISSUE_KEEP_UNITS: &str =
+        "76a914a2825ed4fefe6440124cdb0514483504fa9701fa88acc02d72766e721e4142434445464748494a4b4c4d4e4f505152535455565758595a3031323300f2052a01000000ff0175";
+
+    /// `reissue SHORT 10 <addr> "" true 4 <ipfs>`
+    const V107_REISSUE_UNITS_IPFS: &str =
+        "76a914a2825ed4fefe6440124cdb0514483504fa9701fa88acc03672766e720553484f525400ca9a3b000000000401122051c87ba0b5f1bc07f19513007f22f4a9dd9211560d416094cd15de1e5080f31175";
+
+    #[test]
+    fn v107_new_asset_with_pushdata1_payload() {
+        let script = unhex(V107_NEW_LONG_NAME_IPFS);
+        let out = parse_asset_script(&script).expect("parse");
+        assert_eq!(out.base_script, script[..25].to_vec());
+        assert_eq!(
+            out.data,
+            AssetData::New(NewAsset {
+                name: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123".into(),
+                amount: 1000 * 100_000_000,
+                units: 8,
+                reissuable: true,
+                ipfs: Some(IpfsRef { marker: IPFS_MARKER, hash: ipfs_fixture() }),
+            })
+        );
+        assert_eq!(effective_script(&script), &script[..25]);
+    }
+
+    #[test]
+    fn v107_transfers_with_message_use_pushdata1() {
+        let out = parse_asset_script(&unhex(V107_TRANSFER_MESSAGE_EXPIRE)).expect("parse");
+        assert_eq!(
+            out.data,
+            AssetData::Transfer(TransferAsset {
+                name: "LONGTRANSFERNAME12345".into(),
+                amount: 7 * 100_000_000,
+                message: Some(AssetMessage {
+                    ipfs: IpfsRef { marker: IPFS_MARKER, hash: ipfs_fixture() },
+                    expire_time: Some(9_999_999_999),
+                }),
+            })
+        );
+
+        let out = parse_asset_script(&unhex(V107_TRANSFER_LONG_NAME_MESSAGE)).expect("parse");
+        match out.data {
+            AssetData::Transfer(t) => {
+                assert_eq!(t.name, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123");
+                assert_eq!(t.amount, 150_000_000);
+                assert_eq!(t.message.unwrap().expire_time, Some(1_999_999_999));
+            }
+            other => panic!("expected Transfer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v107_reissue_units_minus_one_means_unchanged() {
+        let out = parse_asset_script(&unhex(V107_REISSUE_KEEP_UNITS)).expect("parse");
+        assert_eq!(
+            out.data,
+            AssetData::Reissue(ReissueAsset {
+                name: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123".into(),
+                amount: 50 * 100_000_000,
+                units: -1,
+                reissuable: true,
+                ipfs: None,
+            })
+        );
+
+        let out = parse_asset_script(&unhex(V107_REISSUE_UNITS_IPFS)).expect("parse");
+        assert_eq!(
+            out.data,
+            AssetData::Reissue(ReissueAsset {
+                name: "SHORT".into(),
+                amount: 10 * 100_000_000,
+                units: 4,
+                reissuable: true,
+                ipfs: Some(IpfsRef { marker: IPFS_MARKER, hash: ipfs_fixture() }),
+            })
+        );
+    }
+
+    #[test]
+    fn v107_null_asset_verifier_and_global_freeze() {
+        // issuerestrictedasset '$SHORT' 1000 "#KYC" <addr>
+        assert_eq!(
+            parse_null_asset_script(&unhex("c05004034b5943")),
+            Some(NullAssetScript::Verifier { verifier_string: "KYC".into() })
+        );
+        // freezerestrictedasset '$SHORT'
+        assert_eq!(
+            parse_null_asset_script(&unhex("c0505008062453484f525401")),
+            Some(NullAssetScript::GlobalRestriction { asset_name: "$SHORT".into(), flag: 1 })
+        );
+    }
+
+    #[test]
+    fn pushdata2_payload_is_not_an_asset() {
+        // `IsAssetScript` only finds "rvn" at offset 27 or 28, so an
+        // OP_PUSHDATA2-encoded payload is not an asset script for the daemon.
+        let mut script = p2pkh_prefix();
+        script.extend_from_slice(&[OP_XNA_ASSET, 0x4d, 0x11, 0x00]);
+        script.extend_from_slice(b"rvnt");
+        script.push(4);
+        script.extend_from_slice(b"COIN");
+        script.extend_from_slice(&1i64.to_le_bytes());
+        script.push(OP_DROP);
+        assert!(parse_asset_script(&script).is_none());
     }
 
     #[test]

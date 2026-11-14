@@ -57,7 +57,7 @@ docker run --rm -it \
 ## Building from source
 
 Requirements:
-- Rust 1.85.0 (pinned; see `rust-toolchain` expectations in the Dockerfiles)
+- Rust 1.88.0 (pinned via `RUST_VERSION` in the Dockerfiles)
 - `cmake`, `clang`, `libclang-dev`, `librocksdb-dev`, `libssl-dev`, `pkg-config`
 - The vendored `hasherkawpow-sys` crate included at `./hasherkawpow-sys`
 

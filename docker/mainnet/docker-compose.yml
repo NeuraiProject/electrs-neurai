@@ -1,11 +1,10 @@
 services:
   neuraid:
-    build:
-      context: ./node
-      dockerfile: Dockerfile
-      args:
-        BRANCH: DePIN-Test
-    image: neuraiproject/neuraid:mainnet-1.0.0
+    # Official Neurai mainnet release image (v1.0.7), pinned by digest.
+    # https://hub.docker.com/r/neuraiproject/neurai-node
+    # Replaces the previous local build of the `DePIN-Test` branch, which is the
+    # testnet development branch and not the mainnet release.
+    image: neuraiproject/neurai-node:v1.0.7@sha256:59e863a068a51ec8e88f334ef1656a5bad8030662637ff8c4c27bcbd8ff983f3
     container_name: neurai-electrs-mainnet-node
     restart: unless-stopped
 
@@ -15,21 +14,26 @@ services:
         max-size: "10m"
         max-file: "5"
 
+    # The image's entrypoint writes /data/neurai.conf from these variables
+    # ONLY on the first start (the file is then persisted in the volume).
+    # To change settings later, edit neurai.conf inside the volume and restart.
     environment:
       # ── Network ──────────────────────────────────────────────────────────
-      NEURAI_TESTNET: "0"
       # NEURAI_LISTEN must be 1: electrs needs P2P to bulk-download blocks from the daemon.
       NEURAI_LISTEN: "1"
+      NEURAI_P2P_PORT: "19000"
       NEURAI_REST: "1"
 
       # ── RPC ──────────────────────────────────────────────────────────────
       NEURAI_RPC_USER: "neurai"
       NEURAI_RPC_PASSWORD: "changeme"
-      # NEURAI_RPC_ALLOW_IP: restrict in production (e.g. 127.0.0.1/32)
+      # The image binds RPC to 127.0.0.1 by default; electrs runs in another
+      # container, so RPC must listen on all interfaces of the container.
+      NEURAI_RPC_BIND: "0.0.0.0"
+      # NEURAI_RPC_ALLOW_IP: restrict in production (e.g. the neurai_net subnet)
       NEURAI_RPC_ALLOW_IP: "0.0.0.0/0"
       NEURAI_RPC_PORT: "19001"
-      NEURAI_RPC_TIMEOUT: "240"
-      NEURAI_RPC_WORKQUEUE: "64"
+      NEURAI_RPC_WORK_QUEUE: "64"
       NEURAI_RPC_THREADS: "8"
 
       # ── Wallet ───────────────────────────────────────────────────────────
@@ -37,22 +41,26 @@ services:
       NEURAI_DISABLE_WALLET: "1"
 
       # ── Indexes ──────────────────────────────────────────────────────────
+      # electrs-neurai does not need any of them; kept for other consumers.
       NEURAI_TXINDEX: "1"
       NEURAI_ASSETINDEX: "1"
       NEURAI_ADDRESSINDEX: "1"
       NEURAI_TIMESTAMPINDEX: "1"
       NEURAI_SPENTINDEX: "1"
-      NEURAI_PUBKEYINDEX: "1"
 
-      # ── Data ─────────────────────────────────────────────────────────────
-      NEURAI_DATADIR: "/data"
+      # ── Extra neurai.conf lines (no dedicated variable in the image) ─────
+      NEURAI_EXTRA_CONF: |
+        rpcservertimeout=240
 
     volumes:
-      - neurai_data:/data
+      # New volume name on purpose: data written by the old image is owned by
+      # root (this image runs neuraid as the `neurai` user), its neurai.conf
+      # would not be regenerated, and it was synced by the DePIN-Test branch.
+      - neurai_mainnet_data:/data
 
     ports:
-      - "19000:19000"   # mainnet P2P
-      - "19001:19001"   # mainnet RPC
+      - "19000:19000"             # mainnet P2P
+      - "127.0.0.1:19001:19001"   # mainnet RPC — host loopback only
 
     networks:
       - neurai_net
@@ -60,9 +68,10 @@ services:
     healthcheck:
       test: ["CMD", "neurai-cli", "-datadir=/data", "getblockchaininfo"]
       interval: 60s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
+      # 1.0.7 can hold cs_main for ~10 s while validating KAWPOW headers.
+      timeout: 30s
+      retries: 5
+      start_period: 120s
 
   electrs:
     # ── Build mode: pick one ─────────────────────────────────────────────
@@ -150,7 +159,7 @@ services:
       - electrs
 
 volumes:
-  neurai_data:
+  neurai_mainnet_data:
     driver: local
   electrs_data:
     driver: local

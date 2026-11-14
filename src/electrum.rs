@@ -79,6 +79,22 @@ impl From<&TxGetArgs> for (Txid, bool) {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TxFromPosArgs {
+    HeightPos((usize, usize)),
+    HeightPosMerkle((usize, usize, bool)),
+}
+
+impl From<&TxFromPosArgs> for (usize, usize, bool) {
+    fn from(args: &TxFromPosArgs) -> Self {
+        match args {
+            TxFromPosArgs::HeightPos((height, tx_pos)) => (*height, *tx_pos, false),
+            TxFromPosArgs::HeightPosMerkle(args) => *args,
+        }
+    }
+}
+
 enum StandardError {
     ParseError,
     InvalidRequest,
@@ -633,11 +649,29 @@ impl Rpc {
     fn transaction_get(&self, args: &TxGetArgs) -> Result<Value> {
         let (txid, verbose) = args.into();
         if verbose {
-            let blockhash = self
-                .tracker
-                .lookup_transaction(&self.daemon, txid)?
-                .map(|(blockhash, _tx)| blockhash);
-            return self.daemon.get_transaction_info(&txid, blockhash);
+            // Neurai's `getrawtransaction` has no `blockhash` argument, so a
+            // confirmed transaction can't be fetched by txid without `-txindex`.
+            // Decode the raw transaction found through our own index instead and
+            // add the block fields `getrawtransaction` would have returned.
+            return match self.tracker.lookup_transaction(&self.daemon, txid)? {
+                Some((blockhash, tx_bytes)) => {
+                    let mut info = self.daemon.decode_transaction(&tx_bytes)?;
+                    let chain = self.tracker.chain();
+                    if let (Some(obj), Some(height)) =
+                        (info.as_object_mut(), chain.get_block_height(&blockhash))
+                    {
+                        obj.insert("hex".into(), json!(tx_bytes.to_lower_hex_string()));
+                        obj.insert("blockhash".into(), json!(blockhash));
+                        obj.insert("confirmations".into(), json!(chain.height() + 1 - height));
+                        if let Some(header) = chain.get_block_header(height) {
+                            obj.insert("time".into(), json!(header.time));
+                            obj.insert("blocktime".into(), json!(header.time));
+                        }
+                    }
+                    Ok(info)
+                }
+                None => self.daemon.get_transaction_info(&txid), // mempool
+            };
         }
         // if the scripthash was subscribed, tx should be cached
         if let Some(tx_hex) = self
@@ -656,7 +690,7 @@ impl Rpc {
             return Ok(json!(tx_hex));
         }
         // load unconfirmed transaction via RPC
-        Ok(json!(self.daemon.get_transaction_hex(&txid, None)?))
+        Ok(json!(self.daemon.get_transaction_hex(&txid)?))
     }
 
     fn transaction_get_merkle(&self, (txid, height): &(Txid, usize)) -> Result<Value> {
@@ -679,10 +713,8 @@ impl Rpc {
         }
     }
 
-    fn transaction_from_pos(
-        &self,
-        (height, tx_pos, merkle): (usize, usize, bool),
-    ) -> Result<Value> {
+    fn transaction_from_pos(&self, args: &TxFromPosArgs) -> Result<Value> {
+        let (height, tx_pos, merkle) = args.into();
         let chain = self.tracker.chain();
         let blockhash = match chain.get_block_hash(height) {
             None => bail!("missing block at {}", height),
@@ -697,7 +729,8 @@ impl Rpc {
             let proof = Proof::create(&txids, tx_pos);
             Ok(json!({"tx_hash": txid, "merkle": proof.to_hex()}))
         } else {
-            Ok(json!({ "tx_hash": txid }))
+            // The protocol specifies a bare transaction hash when `merkle` is false.
+            Ok(json!(txid))
         }
     }
 
@@ -836,7 +869,7 @@ impl Rpc {
                 Params::TransactionBroadcast(args) => self.transaction_broadcast(args),
                 Params::TransactionGet(args) => self.transaction_get(args),
                 Params::TransactionGetMerkle(args) => self.transaction_get_merkle(args),
-                Params::TransactionFromPosition(args) => self.transaction_from_pos(*args),
+                Params::TransactionFromPosition(args) => self.transaction_from_pos(args),
                 Params::Version(args) => self.version(args),
             };
             call.response(result)
@@ -868,7 +901,7 @@ enum Params {
     ScriptHashUnsubscribe((ScriptHash,)),
     TransactionGet(TxGetArgs),
     TransactionGetMerkle((Txid, usize)),
-    TransactionFromPosition((usize, usize, bool)),
+    TransactionFromPosition(TxFromPosArgs),
     Version((String, VersionRequest)),
 }
 
@@ -1073,6 +1106,40 @@ mod tests {
         assert!(check_between("1.4", "1.3", "1.3").is_err());
         assert!(check_between("1.4", "1.4.1", "1.5").is_err());
         assert!(check_between("1.4", "1", "1").is_err());
+    }
+
+    #[test]
+    fn test_tx_from_pos_args() {
+        // `merkle` is optional per the protocol, defaulting to false.
+        let args: TxFromPosArgs = serde_json::from_str("[630000,68]").unwrap();
+        assert_eq!(<(usize, usize, bool)>::from(&args), (630000, 68, false));
+
+        let args: TxFromPosArgs = serde_json::from_str("[630000,68,false]").unwrap();
+        assert_eq!(<(usize, usize, bool)>::from(&args), (630000, 68, false));
+
+        let args: TxFromPosArgs = serde_json::from_str("[630000,68,true]").unwrap();
+        assert_eq!(<(usize, usize, bool)>::from(&args), (630000, 68, true));
+
+        // Malformed params are still rejected.
+        assert!(serde_json::from_str::<TxFromPosArgs>("[630000]").is_err());
+        assert!(serde_json::from_str::<TxFromPosArgs>("[]").is_err());
+        assert!(serde_json::from_str::<TxFromPosArgs>("[630000,68,1]").is_err());
+        assert!(serde_json::from_str::<TxFromPosArgs>("[630000,68,true,1]").is_err());
+    }
+
+    #[test]
+    fn test_params_id_from_pos() {
+        // Both arities are accepted by the method dispatcher.
+        for params in ["[630000,68]", "[630000,68,true]"] {
+            let parsed = Params::parse(
+                "blockchain.transaction.id_from_pos",
+                serde_json::from_str(params).unwrap(),
+            );
+            assert!(
+                matches!(parsed, Ok(Params::TransactionFromPosition(_))),
+                "failed to parse {params}"
+            );
+        }
     }
 
     #[test]

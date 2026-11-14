@@ -5,7 +5,7 @@ use std::convert::TryFrom;
 use bitcoin::{
     consensus::encode::{deserialize, Decodable, Encodable},
     hashes::{hash_newtype, sha256, Hash},
-    io, OutPoint, Script, Txid,
+    io, BlockHash, OutPoint, Script, Txid,
 };
 use bitcoin_slices::bsl;
 
@@ -276,15 +276,108 @@ pub enum AssetMetaEvent {
     Reissue = 2,
 }
 
-/// Asset metadata persisted in the `asset_meta` column family (value side).
+/// One `New` or `Reissue` event, stored as its own row in the `asset_meta` CF.
 ///
-/// Key in the CF is the full asset name bytes.  Layout is fixed-size 80 bytes so
-/// upgrades don't need a new format version for length changes.
+/// Key:   `name_prefix(8) | height_be(4) | tx_pos_be(4) | vout_be(4)` — big-endian
+///        so RocksDB returns an asset's events in chain order.
+/// Value: `event(1) | txid(32) | block_hash(32) | amount_le(8) | units(1) |
+///        reissuable(1) | ipfs_marker(1) | ipfs_hash(32) | name(..)`.
+///
+/// Rows are append-only. Readers fold them with [`AssetMetadata::fold`] after
+/// dropping rows whose `block_hash` is no longer on the active chain, so events
+/// from reorged blocks never leak into the reported state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetMetaEventRow {
+    pub name: Vec<u8>,
+    pub event: AssetMetaEvent,
+    pub txid: Txid,
+    pub block_hash: BlockHash,
+    pub height: u32,
+    /// Position of the transaction inside its block.
+    pub tx_pos: u32,
+    pub vout: u32,
+    /// `New`: initial supply. `Reissue`: supply added by this event.
+    pub amount: i64,
+    /// `New`: decimal places. `Reissue`: new decimal places, or `-1` = unchanged.
+    pub units: i8,
+    pub reissuable: bool,
+    /// `0` = no IPFS/TXID, `0x12` = IPFS SHA-256, `0x54` = TXID reference.
+    pub ipfs_marker: u8,
+    pub ipfs_hash: [u8; 32],
+}
+
+pub const ASSET_META_KEY_SIZE: usize = HASH_PREFIX_LEN + 3 * 4;
+const ASSET_META_VALUE_FIXED_SIZE: usize = 1 + 32 + 32 + 8 + 1 + 1 + 1 + 32;
+
+impl AssetMetaEventRow {
+    pub(crate) fn scan_prefix(name: &[u8]) -> HashPrefix {
+        asset_name_prefix(name)
+    }
+
+    pub(crate) fn key(&self) -> Vec<u8> {
+        let mut key = Vec::with_capacity(ASSET_META_KEY_SIZE);
+        key.extend_from_slice(&asset_name_prefix(&self.name));
+        key.extend_from_slice(&self.height.to_be_bytes());
+        key.extend_from_slice(&self.tx_pos.to_be_bytes());
+        key.extend_from_slice(&self.vout.to_be_bytes());
+        key
+    }
+
+    pub(crate) fn value(&self) -> Vec<u8> {
+        let mut value = Vec::with_capacity(ASSET_META_VALUE_FIXED_SIZE + self.name.len());
+        value.push(self.event as u8);
+        value.extend_from_slice(self.txid.as_byte_array());
+        value.extend_from_slice(self.block_hash.as_byte_array());
+        value.extend_from_slice(&self.amount.to_le_bytes());
+        value.push(self.units as u8);
+        value.push(u8::from(self.reissuable));
+        value.push(self.ipfs_marker);
+        value.extend_from_slice(&self.ipfs_hash);
+        value.extend_from_slice(&self.name);
+        value
+    }
+
+    pub(crate) fn from_db(key: &[u8], value: &[u8]) -> Result<Self> {
+        if key.len() != ASSET_META_KEY_SIZE {
+            bail!("asset_meta key must be {} bytes, got {}", ASSET_META_KEY_SIZE, key.len());
+        }
+        if value.len() < ASSET_META_VALUE_FIXED_SIZE {
+            bail!("asset_meta value too short: {} bytes", value.len());
+        }
+        let be_u32 = |b: &[u8]| u32::from_be_bytes(b.try_into().expect("4-byte slice"));
+        let event = match value[0] {
+            1 => AssetMetaEvent::New,
+            2 => AssetMetaEvent::Reissue,
+            other => bail!("unknown asset meta event tag: {}", other),
+        };
+        let mut ipfs_hash = [0u8; 32];
+        ipfs_hash.copy_from_slice(&value[76..108]);
+        Ok(Self {
+            name: value[ASSET_META_VALUE_FIXED_SIZE..].to_vec(),
+            event,
+            txid: Txid::from_slice(&value[1..33]).expect("32-byte slice"),
+            block_hash: BlockHash::from_slice(&value[33..65]).expect("32-byte slice"),
+            height: be_u32(&key[8..12]),
+            tx_pos: be_u32(&key[12..16]),
+            vout: be_u32(&key[16..20]),
+            amount: i64::from_le_bytes(value[65..73].try_into().expect("8-byte slice")),
+            units: value[73] as i8,
+            reissuable: value[74] != 0,
+            ipfs_marker: value[75],
+            ipfs_hash,
+        })
+    }
+}
+
+/// Current state of an asset, as reported by `blockchain.asset.get_meta`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssetMetadata {
+    /// Kind of the latest issuance event applied.
     pub event: AssetMetaEvent,
+    /// Transaction and height of the latest issuance event applied.
     pub issuance_txid: Txid,
     pub issuance_height: u32,
+    /// Total supply: initial issuance plus every reissue.
     pub amount: i64,
     pub units: u8,
     pub reissuable: bool,
@@ -293,55 +386,46 @@ pub struct AssetMetadata {
     pub ipfs_hash: [u8; 32],
 }
 
-pub const ASSET_METADATA_SIZE: usize = 1 + 32 + 4 + 8 + 1 + 1 + 1 + 32;
-pub(crate) type SerializedAssetMetadata = [u8; ASSET_METADATA_SIZE];
-
 impl AssetMetadata {
-    pub(crate) fn to_bytes(&self) -> SerializedAssetMetadata {
-        let mut buf = [0u8; ASSET_METADATA_SIZE];
-        buf[0] = self.event as u8;
-        buf[1..33].copy_from_slice(self.issuance_txid.as_byte_array());
-        buf[33..37].copy_from_slice(&self.issuance_height.to_le_bytes());
-        buf[37..45].copy_from_slice(&self.amount.to_le_bytes());
-        buf[45] = self.units;
-        buf[46] = u8::from(self.reissuable);
-        buf[47] = self.ipfs_marker;
-        buf[48..80].copy_from_slice(&self.ipfs_hash);
-        buf
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() != ASSET_METADATA_SIZE {
-            bail!(
-                "asset metadata must be {} bytes, got {}",
-                ASSET_METADATA_SIZE,
-                bytes.len()
-            );
+    /// Fold an asset's issuance events (in chain order) into its current state,
+    /// mirroring the daemon's `CAssetsCache::AddReissueAsset`: a reissue adds
+    /// to the supply, always sets `reissuable`, changes `units` unless it is
+    /// `-1`, and replaces the IPFS hash only when it carries one.
+    pub(crate) fn fold<'a>(events: impl IntoIterator<Item = &'a AssetMetaEventRow>) -> Option<Self> {
+        let mut state: Option<Self> = None;
+        for e in events {
+            match e.event {
+                AssetMetaEvent::New => {
+                    state = Some(Self {
+                        event: AssetMetaEvent::New,
+                        issuance_txid: e.txid,
+                        issuance_height: e.height,
+                        amount: e.amount,
+                        units: u8::try_from(e.units).unwrap_or(0),
+                        reissuable: e.reissuable,
+                        ipfs_marker: e.ipfs_marker,
+                        ipfs_hash: e.ipfs_hash,
+                    })
+                }
+                AssetMetaEvent::Reissue => {
+                    // A reissue without a prior issuance can't be valid on chain.
+                    let Some(s) = state.as_mut() else { continue };
+                    s.event = AssetMetaEvent::Reissue;
+                    s.issuance_txid = e.txid;
+                    s.issuance_height = e.height;
+                    s.amount = s.amount.saturating_add(e.amount);
+                    s.reissuable = e.reissuable;
+                    if let Ok(units) = u8::try_from(e.units) {
+                        s.units = units;
+                    }
+                    if e.ipfs_marker != 0 {
+                        s.ipfs_marker = e.ipfs_marker;
+                        s.ipfs_hash = e.ipfs_hash;
+                    }
+                }
+            }
         }
-        let event = match bytes[0] {
-            1 => AssetMetaEvent::New,
-            2 => AssetMetaEvent::Reissue,
-            other => bail!("unknown asset meta event tag: {}", other),
-        };
-        let issuance_txid =
-            Txid::from_slice(&bytes[1..33]).expect("32-byte slice");
-        let issuance_height = u32::from_le_bytes(bytes[33..37].try_into().unwrap());
-        let amount = i64::from_le_bytes(bytes[37..45].try_into().unwrap());
-        let units = bytes[45];
-        let reissuable = bytes[46] != 0;
-        let ipfs_marker = bytes[47];
-        let mut ipfs_hash = [0u8; 32];
-        ipfs_hash.copy_from_slice(&bytes[48..80]);
-        Ok(Self {
-            event,
-            issuance_txid,
-            issuance_height,
-            amount,
-            units,
-            reissuable,
-            ipfs_marker,
-            ipfs_hash,
-        })
+        state
     }
 }
 
@@ -448,32 +532,84 @@ mod tests {
         assert_eq!(&row[16..20], &42u32.to_le_bytes());
     }
 
-    #[test]
-    fn test_asset_metadata_roundtrip() {
-        use crate::types::{AssetMetaEvent, AssetMetadata, ASSET_METADATA_SIZE};
-        let hex_txid = "d5d27987d2a3dfc724e359870c6644b40e497bdc0589a033220fe15429d88599";
-        let meta = AssetMetadata {
-            event: AssetMetaEvent::New,
-            issuance_txid: Txid::from_str(hex_txid).unwrap(),
-            issuance_height: 123_456,
-            amount: 1_000_000_000,
-            units: 8,
-            reissuable: true,
-            ipfs_marker: 0x12,
-            ipfs_hash: [0xAA; 32],
-        };
-        let bytes = meta.to_bytes();
-        assert_eq!(bytes.len(), ASSET_METADATA_SIZE);
-        let decoded = AssetMetadata::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded, meta);
+    fn meta_event(
+        event: crate::types::AssetMetaEvent,
+        height: u32,
+        amount: i64,
+        units: i8,
+        reissuable: bool,
+        ipfs: Option<u8>,
+    ) -> crate::types::AssetMetaEventRow {
+        use bitcoin::hashes::Hash;
+        crate::types::AssetMetaEventRow {
+            name: b"TOKEN".to_vec(),
+            event,
+            txid: Txid::from_byte_array([height as u8; 32]),
+            block_hash: bitcoin::BlockHash::from_byte_array([0xBB; 32]),
+            height,
+            tx_pos: 1,
+            vout: 0,
+            amount,
+            units,
+            reissuable,
+            ipfs_marker: if ipfs.is_some() { 0x12 } else { 0 },
+            ipfs_hash: [ipfs.unwrap_or(0); 32],
+        }
     }
 
     #[test]
-    fn test_asset_metadata_rejects_unknown_event() {
-        use crate::types::{AssetMetadata, ASSET_METADATA_SIZE};
-        let mut bytes = [0u8; ASSET_METADATA_SIZE];
-        bytes[0] = 99; // unknown event tag
-        assert!(AssetMetadata::from_bytes(&bytes).is_err());
+    fn test_asset_meta_event_row_roundtrip() {
+        use crate::types::{asset_name_prefix, AssetMetaEvent, AssetMetaEventRow, ASSET_META_KEY_SIZE};
+        let row = meta_event(AssetMetaEvent::Reissue, 123_456, 1_000_000_000, -1, true, Some(0xAA));
+        let key = row.key();
+        assert_eq!(key.len(), ASSET_META_KEY_SIZE);
+        assert_eq!(&key[..8], &asset_name_prefix(b"TOKEN"));
+        let decoded = AssetMetaEventRow::from_db(&key, &row.value()).unwrap();
+        assert_eq!(decoded, row);
+    }
+
+    #[test]
+    fn test_asset_meta_event_keys_sort_in_chain_order() {
+        use crate::types::AssetMetaEvent;
+        // Big-endian height/tx_pos/vout: byte order == chain order, even across
+        // a 256-block boundary where little-endian keys would misorder.
+        let mut a = meta_event(AssetMetaEvent::Reissue, 0x01ff, 1, -1, true, None);
+        let b = meta_event(AssetMetaEvent::Reissue, 0x0200, 1, -1, true, None);
+        assert!(a.key() < b.key());
+        let c = a.clone();
+        a.tx_pos = 2;
+        assert!(c.key() < a.key());
+    }
+
+    #[test]
+    fn test_asset_meta_event_rejects_unknown_event() {
+        use crate::types::{AssetMetaEvent, AssetMetaEventRow};
+        let row = meta_event(AssetMetaEvent::New, 1, 1, 0, true, None);
+        let mut value = row.value();
+        value[0] = 99; // unknown event tag
+        assert!(AssetMetaEventRow::from_db(&row.key(), &value).is_err());
+    }
+
+    #[test]
+    fn test_asset_metadata_fold_mirrors_daemon_reissue() {
+        use crate::types::{AssetMetaEvent, AssetMetadata};
+        let new = meta_event(AssetMetaEvent::New, 10, 1_000, 8, true, Some(0x11));
+        // units -1 and no IPFS: both must be kept from the previous state.
+        let keep = meta_event(AssetMetaEvent::Reissue, 20, 50, -1, true, None);
+        let change = meta_event(AssetMetaEvent::Reissue, 30, 7, 4, false, Some(0x22));
+
+        let s = AssetMetadata::fold([&new, &keep]).unwrap();
+        assert_eq!((s.amount, s.units, s.reissuable), (1_050, 8, true));
+        assert_eq!((s.ipfs_marker, s.ipfs_hash), (0x12, [0x11; 32]));
+        assert_eq!((s.event, s.issuance_height), (AssetMetaEvent::Reissue, 20));
+        assert_eq!(s.issuance_txid, keep.txid);
+
+        let s = AssetMetadata::fold([&new, &keep, &change]).unwrap();
+        assert_eq!((s.amount, s.units, s.reissuable), (1_057, 4, false));
+        assert_eq!(s.ipfs_hash, [0x22; 32]);
+
+        // A reissue without a known issuance is ignored.
+        assert_eq!(AssetMetadata::fold([&keep]), None);
     }
 
     #[test]

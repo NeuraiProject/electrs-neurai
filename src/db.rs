@@ -9,6 +9,9 @@ use crate::types::{
     SerializedHeaderRow,
 };
 
+/// A raw `(key, value)` row read from a column family.
+pub(crate) type KeyValue = (Box<[u8]>, Box<[u8]>);
+
 #[derive(Default)]
 pub(crate) struct WriteBatch {
     pub(crate) tip_row: [u8; 32],
@@ -16,7 +19,8 @@ pub(crate) struct WriteBatch {
     pub(crate) funding_rows: Vec<SerializedHashPrefixRow>,
     pub(crate) spending_rows: Vec<SerializedHashPrefixRow>,
     pub(crate) txid_rows: Vec<SerializedHashPrefixRow>,
-    /// `(asset_name_bytes, serialized_metadata)` — written to `asset_meta` CF.
+    /// `(key, value)` of `AssetMetaEventRow`s — written to `asset_meta` CF.
+    /// Every issuance event has its own key, so write order doesn't matter.
     pub(crate) asset_meta_rows: Vec<(Vec<u8>, Vec<u8>)>,
     pub(crate) asset_history_rows: Vec<SerializedAssetHistoryRow>,
     pub(crate) asset_funding_rows: Vec<SerializedAssetFundingRow>,
@@ -113,7 +117,11 @@ struct Config {
 //           a wallet computes from the bare address. Pre-format-3 funding rows
 //           were keyed by the full-script hash and are unrecoverable; a full
 //           reindex is required.
-const CURRENT_FORMAT: u64 = 3;
+// Format 4: asset payloads encoded with OP_PUSHDATA1 (>= 76 bytes) are now
+//           recognised, asset rows carry the right txid, and `asset_meta` is an
+//           append-only log of issuance events keyed by (name, height, tx, vout)
+//           instead of one overwritten value per asset name.
+const CURRENT_FORMAT: u64 = 4;
 
 impl Default for Config {
     fn default() -> Self {
@@ -341,11 +349,22 @@ impl DBStore {
         self.iter_cf(self.asset_funding_cf(), opts, Some(prefix))
     }
 
-    /// Point lookup of the stored metadata for an asset (by full name).
-    pub(crate) fn get_asset_meta(&self, name: &[u8]) -> Option<Vec<u8>> {
-        self.db
-            .get_cf(self.asset_meta_cf(), name)
-            .expect("get_asset_meta failed")
+    /// All `asset_meta` rows whose key starts with `prefix`, in key order.
+    pub(crate) fn iter_asset_meta(&self, prefix: HashPrefix) -> Vec<KeyValue> {
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.set_prefix_same_as_start(true);
+        let mut raw = self.db.raw_iterator_cf_opt(self.asset_meta_cf(), opts);
+        raw.seek(prefix);
+        let mut rows = Vec::new();
+        while let (Some(key), Some(value)) = (raw.key(), raw.value()) {
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            rows.push((key.into(), value.into()));
+            raw.next();
+        }
+        raw.status().expect("asset_meta scan failed");
+        rows
     }
 
     pub(crate) fn get_tip(&self) -> Option<Vec<u8>> {
@@ -583,19 +602,27 @@ mod tests {
     }
 
     #[test]
-    fn test_asset_meta_roundtrip() {
+    fn test_asset_meta_prefix_scan_in_key_order() {
         let dir = tempfile::tempdir().unwrap();
         let store = DBStore::open(dir.path(), None, true, 1).unwrap();
 
-        let name = b"TOKEN".to_vec();
-        let payload = vec![0x11, 0x22, 0x33, 0x44, 0x55];
+        let prefix: [u8; 8] = [0xAA; 8];
+        let other: [u8; 8] = [0xAB; 8];
+        let key = |p: [u8; 8], height: u32| [&p[..], &height.to_be_bytes()[..], &[0u8; 8][..]].concat();
+        // Written out of order: the scan must return them sorted by key.
         store.write(&WriteBatch {
-            asset_meta_rows: vec![(name.clone(), payload.clone())],
+            asset_meta_rows: vec![
+                (key(prefix, 0x0200), b"second".to_vec()),
+                (key(other, 1), b"other".to_vec()),
+                (key(prefix, 0x01ff), b"first".to_vec()),
+            ],
             ..Default::default()
         });
 
-        assert_eq!(store.get_asset_meta(&name).unwrap(), payload);
-        assert!(store.get_asset_meta(b"OTHER").is_none());
+        let rows = store.iter_asset_meta(prefix);
+        let values: Vec<&[u8]> = rows.iter().map(|(_, v)| &v[..]).collect();
+        assert_eq!(values, vec![&b"first"[..], &b"second"[..]]);
+        assert!(store.iter_asset_meta([0xCC; 8]).is_empty());
     }
 
     #[test]

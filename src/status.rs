@@ -572,7 +572,7 @@ impl ScriptHashStatus {
     }
 
     /// Sync with currently confirmed txs and mempool, downloading non-cached transactions via p2p protocol.
-    /// After a successful sync, scripthash status is updated.
+    /// After a successful sync, script-hash status is updated.
     pub(crate) fn sync(
         &mut self,
         index: &Index,
@@ -680,40 +680,26 @@ fn filter_block_txs_outputs(
     scripthash: ScriptHash,
     params: &'static NetworkParams,
 ) -> Vec<FilteredTx<TxOutput>> {
-    // Remember the transaction we are currently *inside* so matches gathered in
-    // `visit_tx_out` can be flushed with its own txid/bytes/pos — the bsl visitor
-    // calls `visit_transaction` *before* its outputs, so flushing lazily-at-next-tx
-    // would attribute matches to the *following* transaction and drop matches in
-    // the last tx entirely.
+    // `bitcoin_slices` calls `visit_tx_out` for every output of a transaction
+    // and only then `visit_transaction` for that same transaction (its txid
+    // needs the fully parsed slice). Matches are buffered and attributed to the
+    // transaction passed to the following `visit_transaction` call.
     struct FindOutputs {
         scripthash: ScriptHash,
         result: Vec<FilteredTx<TxOutput>>,
         buffer: Vec<TxOutput>,
-        current: Option<(Box<[u8]>, bitcoin::Txid, usize)>,
         pos: usize,
-    }
-    impl FindOutputs {
-        fn flush_current(&mut self) {
-            if self.buffer.is_empty() {
-                return;
-            }
-            let (tx_bytes, txid, pos) =
-                self.current.take().expect("flush called outside a transaction");
-            self.result.push(FilteredTx::<TxOutput> {
-                tx_bytes,
-                txid,
-                pos,
-                result: std::mem::take(&mut self.buffer),
-            });
-        }
     }
     impl Visitor for FindOutputs {
         fn visit_transaction(&mut self, tx: &bsl::Transaction) -> ControlFlow<()> {
-            // Flush the previous transaction's matches with *its* metadata first,
-            // then record this transaction as the new "current" owner of any
-            // matches that the upcoming `visit_tx_out` calls produce.
-            self.flush_current();
-            self.current = Some((tx.as_ref().into(), bsl_txid(tx), self.pos));
+            if !self.buffer.is_empty() {
+                self.result.push(FilteredTx::<TxOutput> {
+                    tx_bytes: tx.as_ref().into(),
+                    txid: bsl_txid(tx),
+                    pos: self.pos,
+                    result: std::mem::take(&mut self.buffer),
+                });
+            }
             self.pos += 1;
             ControlFlow::Continue(())
         }
@@ -739,12 +725,9 @@ fn filter_block_txs_outputs(
         scripthash,
         result: vec![],
         buffer: vec![],
-        current: None,
         pos: 0,
     };
     bsl::Block::visit(&synthetic_block, &mut find_outputs).expect("core returned invalid block");
-    // Final flush for the last tx in the block (bsl has no `visit_transaction_end`).
-    find_outputs.flush_current();
     find_outputs.result
 }
 
@@ -753,33 +736,25 @@ fn filter_block_txs_inputs(
     outpoints: &HashSet<OutPoint>,
     params: &'static NetworkParams,
 ) -> Vec<FilteredTx<OutPoint>> {
+    // Same visiting order as in `filter_block_txs_outputs`: inputs first, then
+    // `visit_transaction` for the transaction that owns them.
     struct FindInputs<'a> {
         outpoints: &'a HashSet<OutPoint>,
         result: Vec<FilteredTx<OutPoint>>,
         buffer: Vec<OutPoint>,
-        current: Option<(Box<[u8]>, bitcoin::Txid, usize)>,
         pos: usize,
-    }
-    impl FindInputs<'_> {
-        fn flush_current(&mut self) {
-            if self.buffer.is_empty() {
-                return;
-            }
-            let (tx_bytes, txid, pos) =
-                self.current.take().expect("flush called outside a transaction");
-            self.result.push(FilteredTx::<OutPoint> {
-                tx_bytes,
-                txid,
-                pos,
-                result: std::mem::take(&mut self.buffer),
-            });
-        }
     }
 
     impl Visitor for FindInputs<'_> {
         fn visit_transaction(&mut self, tx: &bsl::Transaction) -> ControlFlow<()> {
-            self.flush_current();
-            self.current = Some((tx.as_ref().into(), bsl_txid(tx), self.pos));
+            if !self.buffer.is_empty() {
+                self.result.push(FilteredTx::<OutPoint> {
+                    tx_bytes: tx.as_ref().into(),
+                    txid: bsl_txid(tx),
+                    pos: self.pos,
+                    result: std::mem::take(&mut self.buffer),
+                });
+            }
             self.pos += 1;
             ControlFlow::Continue(())
         }
@@ -798,11 +773,9 @@ fn filter_block_txs_inputs(
         outpoints,
         result: vec![],
         buffer: vec![],
-        current: None,
         pos: 0,
     };
     bsl::Block::visit(&synthetic_block, &mut find_inputs).expect("core returned invalid block");
-    find_inputs.flush_current();
     find_inputs.result
 }
 
@@ -854,14 +827,13 @@ mod tests {
         let scripthash = ScriptHash::new(&addr.script_pubkey());
 
         let result = &super::filter_block_txs_outputs(block, scripthash, params)[0];
-        // The matching output is at transaction index 7 (eighth tx in the block).
-        // The previous implementation reported the txid/pos of the *next* tx
-        // because it flushed its buffer at the wrong visitor boundary.
+        // The matching output is in transaction index 8 (see
+        // `test_filters_attribute_matches_to_their_own_tx` for a full cross-check).
         assert_eq!(
             result.txid.to_string(),
-            "416331679aca8560b3df2fafd779f7dfae694f1ba4381a9e0a998e1946b84ba7"
+            "7bcdcb44422da5a99daad47d6ba1c3d6f2e48f961a75e42c4fa75029d4b0ef49"
         );
-        assert_eq!(result.pos, 7);
+        assert_eq!(result.pos, 8);
         assert_eq!(result.result[0].index, 0);
         assert_eq!(result.result[0].value.to_sat(), 709503);
     }
@@ -880,10 +852,66 @@ mod tests {
         let result = &super::filter_block_txs_inputs(&block, &outpoints, params)[0];
         assert_eq!(
             result.txid.to_string(),
-            "416331679aca8560b3df2fafd779f7dfae694f1ba4381a9e0a998e1946b84ba7"
+            "7bcdcb44422da5a99daad47d6ba1c3d6f2e48f961a75e42c4fa75029d4b0ef49"
         );
-        assert_eq!(result.pos, 7);
+        assert_eq!(result.pos, 8);
         assert_eq!(result.result[0], outpoint);
+    }
+
+    /// Cross-check both block filters against a full `rust-bitcoin` decode of
+    /// the same block: every output and every spent outpoint must be reported
+    /// with the txid and position of the transaction that really contains it.
+    fn assert_filters_match_full_decode(block_bytes: &[u8], params: &'static NetworkParams) {
+        use bitcoin::consensus::deserialize;
+        use bitcoin::hashes::Hash;
+        let block: bitcoin::Block = deserialize(block_bytes).expect("80-byte header block");
+        for (pos, tx) in block.txdata.iter().enumerate() {
+            let txid = tx.compute_txid();
+            for (vout, out) in tx.output.iter().enumerate() {
+                let sh = ScriptHash::hash(crate::neurai::asset::effective_script(
+                    out.script_pubkey.as_bytes(),
+                ));
+                let found = super::filter_block_txs_outputs(block_bytes.to_vec(), sh, params);
+                assert!(
+                    found.iter().any(|f| f.txid == txid
+                        && f.pos == pos
+                        && f.result.iter().any(|o| o.index == vout as u32)),
+                    "output {txid}:{vout} (tx #{pos}) not attributed to its own tx"
+                );
+            }
+            for input in tx.input.iter().filter(|i| !i.previous_output.is_null()) {
+                let outpoints = HashSet::from([input.previous_output]);
+                let found = super::filter_block_txs_inputs(&block_bytes.to_vec(), &outpoints, params);
+                assert_eq!(found.len(), 1);
+                assert_eq!((found[0].txid, found[0].pos), (txid, pos));
+            }
+        }
+    }
+
+    #[test]
+    fn test_filters_attribute_matches_to_their_own_tx() {
+        assert_filters_match_full_decode(mainnet_702861(), testnet_params());
+    }
+
+    /// Regtest block 1101 mined by neuraid v1.0.7 (80-byte pre-KAWPOW header),
+    /// with asset issuance outputs including an OP_PUSHDATA1 payload.
+    #[test]
+    fn test_filters_on_real_neurai_v107_block() {
+        use bitcoin::hashes::{hex::FromHex, Hash};
+        let hex = include_str!("../tests/fixtures/neurai-v1.0.7-regtest-block-1101.hex");
+        let block = Vec::<u8>::from_hex(hex.trim()).unwrap();
+        let params = NetworkParams::for_network(NeuraiNetwork::Regtest);
+        assert_filters_match_full_decode(&block, params);
+
+        // tx #2 vout 0 pays this P2PKH and nothing else in the block does.
+        let spk = Vec::<u8>::from_hex("76a914528f02193798914da2e61e5ab15b2c516436a29f88ac").unwrap();
+        let found = super::filter_block_txs_outputs(block, ScriptHash::hash(&spk), params);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].txid.to_string(),
+            "0218cb7e8ca0abdc7c9066660a0a183c64e8370522c34622dbf0d160307157d2"
+        );
+        assert_eq!(found[0].pos, 2);
     }
 
     // ─── asset_tx_output_of ─────────────────────────────────────────────────

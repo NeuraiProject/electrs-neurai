@@ -48,10 +48,14 @@ A 64-character lowercase hex string: the Electrum scripthash, i.e.
 
 ## `blockchain.asset.get_meta`
 
-Return the stored metadata for an asset, or `null` if the name is unknown.
+Return the current metadata of an asset, or `null` if the name is unknown.
 
-Written to the server's `asset_meta` column family on every `New` and
-`Reissue` output indexed from a confirmed block.
+Every confirmed `New` and `Reissue` output is stored as an event in the
+server's `asset_meta` column family. The response folds the events that are on
+the active chain, in chain order, the same way the daemon's asset cache does:
+a reissue adds to the supply, always sets `reissuable`, changes `units` unless
+it was sent as `-1`, and replaces the IPFS hash only when it carries one.
+Owner tokens (`ROOT!`) have no issuance metadata and return `null`.
 
 ### Request
 ```json
@@ -61,7 +65,7 @@ Written to the server's `asset_meta` column family on every `New` and
 ### Params
 | # | Type   | Description           |
 |---|--------|-----------------------|
-| 0 | string | Full asset name, e.g. `TESTASSET`, `ROOT/SUB`, `ROOT#UNIQUE`, `ROOT!`. |
+| 0 | string | Full asset name, e.g. `TESTASSET`, `ROOT/SUB`, `ROOT#UNIQUE`, `#QUALIFIER`, `$RESTRICTED`. |
 
 ### Response
 Either `null` (no row found) or an object:
@@ -83,13 +87,13 @@ Either `null` (no row found) or an object:
 | Field              | Type              | Notes                                                                              |
 |--------------------|-------------------|------------------------------------------------------------------------------------|
 | `name`             | string            | Echo of the requested name.                                                        |
-| `event`            | `"new"` / `"reissue"` | The **latest** issuance event recorded for this asset.                         |
-| `issuance_txid`    | hex string (64)   | Full txid of the issuance/reissue transaction.                                     |
-| `issuance_height`  | integer           | Block height at which the event was confirmed.                                     |
-| `amount`           | integer (satoshi-equivalent) | Signed 64-bit. `New` = initial supply; `Reissue` = additional supply issued. |
-| `units`            | integer (0–8)     | Decimal places.                                                                    |
-| `reissuable`       | boolean           | Whether further reissuance is allowed after this event.                            |
-| `ipfs_hash`        | hex string (64) / `null` | 32-byte IPFS content hash or TXID reference.                                |
+| `event`            | `"new"` / `"reissue"` | Kind of the **latest** issuance event applied.                                 |
+| `issuance_txid`    | hex string (64)   | Full txid of that latest issuance/reissue transaction.                             |
+| `issuance_height`  | integer           | Block height at which that latest event was confirmed.                             |
+| `amount`           | integer (satoshi-equivalent) | Signed 64-bit **total supply**: initial issuance plus every reissue.   |
+| `units`            | integer (0–8)     | Current decimal places.                                                            |
+| `reissuable`       | boolean           | Whether further reissuance is allowed.                                             |
+| `ipfs_hash`        | hex string (64) / `null` | Current 32-byte IPFS content hash or TXID reference.                        |
 | `ipfs_type`        | `"ipfs"` / `"txid"` / `null` | Marker byte: `0x12` = IPFS SHA-256, `0x54` = on-chain tx reference.      |
 
 ---
