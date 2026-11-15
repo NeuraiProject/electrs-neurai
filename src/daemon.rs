@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 
-use bitcoin::{consensus::deserialize, hashes::hex::FromHex};
+use bitcoin::hashes::hex::FromHex;
 use bitcoin::{Amount, BlockHash, Transaction, Txid};
 use bitcoincore_rpc::{jsonrpc, Auth, Client, RpcApi};
 use crossbeam_channel::Receiver;
@@ -16,11 +16,14 @@ use crate::{
     chain::{Chain, NewHeader},
     config::Config,
     metrics::Metrics,
-    neurai::NetworkParams,
+    neurai::{self, NetworkParams},
     p2p::Connection,
     signals::ExitFlag,
     types::SerBlock,
 };
+
+/// A mempool transaction and its serialization.
+pub(crate) type MempoolTx = (Transaction, Box<[u8]>);
 
 enum PollResult {
     Done(Result<()>),
@@ -335,14 +338,14 @@ impl Daemon {
             .collect())
     }
 
-    pub(crate) fn get_mempool_transactions(
-        &self,
-        txids: &[Txid],
-    ) -> Result<Vec<Option<Transaction>>> {
+    /// Mempool transactions, decoded with Neurai's serialization (NIP-014
+    /// reference inputs included), with the bytes the daemon returned.
+    pub(crate) fn get_mempool_transactions(&self, txids: &[Txid]) -> Result<Vec<Option<MempoolTx>>> {
         let results = batch_request(self.rpc.get_jsonrpc_client(), "getrawtransaction", txids)?;
         Ok(results
             .into_iter()
-            .map(|r| -> Option<Transaction> {
+            .zip(txids)
+            .map(|(r, txid)| -> Option<MempoolTx> {
                 let tx_hex = match r?.result::<String>() {
                     Ok(tx_hex) => Some(tx_hex),
                     Err(err) => {
@@ -357,10 +360,14 @@ impl Daemon {
                         None
                     }
                 }?;
-                match deserialize(&tx_bytes) {
-                    Ok(tx) => Some(tx),
+                match neurai::tx::decode_transaction(&tx_bytes) {
+                    Ok(decoded) if decoded.txid == *txid => Some((decoded.tx, tx_bytes.into_boxed_slice())),
+                    Ok(decoded) => {
+                        warn!("mempool tx {} decodes as {}", txid, decoded.txid);
+                        None
+                    }
                     Err(err) => {
-                        warn!("got invalid tx {}: {}", tx_hex, err);
+                        warn!("got invalid tx {}: {:#}", tx_hex, err);
                         None
                     }
                 }

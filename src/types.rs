@@ -7,7 +7,6 @@ use bitcoin::{
     hashes::{hash_newtype, sha256, Hash},
     io, BlockHash, OutPoint, Script, Txid,
 };
-use bitcoin_slices::bsl;
 
 use crate::neurai::{block::{decode_header, NeuraiBlockHeader}, NetworkParams};
 
@@ -192,10 +191,6 @@ impl HeaderRow {
         let header = decode_header(&mut &row[..], params).expect("bad HeaderRow");
         Self { header }
     }
-}
-
-pub(crate) fn bsl_txid(tx: &bsl::Transaction) -> Txid {
-    bitcoin::Txid::from_slice(tx.txid_sha2().as_slice()).expect("invalid txid")
 }
 
 // ─── Asset index rows ─────────────────────────────────────────────────────────
@@ -498,6 +493,8 @@ pub enum AssetEventKind {
     Association = b'a',
     /// Message on an owner token / message channel transfer, keyed by name.
     Broadcast = b'b',
+    /// Transfer state of a DePIN asset (Neurai 2.0), keyed by `&NAME`.
+    DepinState = b'd',
 }
 
 impl AssetEventKind {
@@ -509,6 +506,7 @@ impl AssetEventKind {
             b'v' => Self::Verifier,
             b'a' => Self::Association,
             b'b' => Self::Broadcast,
+            b'd' => Self::DepinState,
             _ => return None,
         })
     }
@@ -530,6 +528,8 @@ pub enum AssetEventPayload {
         expiration: Option<u64>,
         scripthash: ScriptHash,
     },
+    /// `c0 50 50 <push(&NAME, state)>`: 0 closed, 1 open, 2 sealed.
+    DepinState { asset: String, state: i8 },
 }
 
 /// One row of the `asset_events` CF.
@@ -640,6 +640,10 @@ impl AssetEventRow {
                 }
                 v.extend_from_slice(scripthash.as_byte_array());
             }
+            AssetEventPayload::DepinState { asset, state } => {
+                put_str(&mut v, asset.as_bytes());
+                v.push(*state as u8);
+            }
         }
         v
     }
@@ -702,6 +706,11 @@ impl AssetEventRow {
                     expiration,
                     scripthash,
                 }
+            }
+            AssetEventKind::DepinState => {
+                let asset = take_str(&mut data)?;
+                let state = take(&mut data, 1)?[0] as i8;
+                AssetEventPayload::DepinState { asset, state }
             }
         };
         Ok(Self {

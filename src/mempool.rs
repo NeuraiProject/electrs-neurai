@@ -40,7 +40,13 @@ impl MempoolAssets {
 
 pub(crate) struct Entry {
     pub txid: Txid,
+    /// Decoded without its NIP-014 reference inputs (see `neurai::tx`).
     pub tx: Transaction,
+    /// The transaction as the daemon serialized it.
+    pub raw: Box<[u8]>,
+    /// Whether the unified fork's rules applied when it entered the mempool
+    /// (they classify its asset outputs).
+    pub fork: bool,
     pub fee: Amount,
     pub vsize: u64,
     pub has_unconfirmed_inputs: bool,
@@ -83,6 +89,7 @@ impl MempoolSyncUpdate {
         daemon: &Daemon,
         old_txids: HashSet<Txid>,
         exit_flag: &ExitFlag,
+        fork: bool,
     ) -> Result<MempoolSyncUpdate> {
         let txids = daemon.get_mempool_txids()?;
         debug!("loading {} mempool transactions", txids.len());
@@ -122,7 +129,7 @@ impl MempoolSyncUpdate {
                             return None;
                         }
                     };
-                    let tx = match tx {
+                    let (tx, raw) = match tx {
                         Some(tx) => tx,
                         None => {
                             debug!("missing mempool tx: {}", txid);
@@ -132,6 +139,8 @@ impl MempoolSyncUpdate {
                     Some(Entry {
                         txid: *txid,
                         tx,
+                        raw,
+                        fork,
                         vsize: entry.vsize,
                         fee: entry.fee().expect("filtered by Daemon::get_mempool_entries"),
                         has_unconfirmed_inputs: !entry.depends.is_empty(),
@@ -214,7 +223,7 @@ impl Mempool {
         for entry in self.entries.values() {
             let mut outputs = TxAssetOutputs::default();
             for (vout, output) in entry.tx.output.iter().enumerate() {
-                outputs.add_output(vout as u32, output.script_pubkey.as_bytes());
+                outputs.add_output(vout as u32, output.script_pubkey.as_bytes(), entry.fork);
             }
             if outputs.is_empty() {
                 continue;
@@ -245,7 +254,7 @@ impl Mempool {
         {
             let mut by_rate = std::collections::BTreeMap::<u64, u64>::new(); // key: f64 bits
             for entry in self.entries.values() {
-                let size = bitcoin::consensus::serialize(&entry.tx).len() as u64;
+                let size = entry.raw.len() as u64;
                 if size == 0 {
                     continue;
                 }
@@ -335,7 +344,8 @@ impl Mempool {
         }
     }
 
-    pub fn sync(&mut self, daemon: &Daemon, exit_flag: &ExitFlag) {
+    /// `fork`: whether the unified fork's rules apply to the next block.
+    pub fn sync(&mut self, daemon: &Daemon, exit_flag: &ExitFlag, fork: bool) {
         let loaded = match daemon.get_mempool_info() {
             Ok(info) => info.loaded.unwrap_or(true),
             Err(e) => {
@@ -350,7 +360,7 @@ impl Mempool {
 
         let old_txids = HashSet::<Txid>::from_iter(self.entries.keys().copied());
 
-        let poll_result = MempoolSyncUpdate::poll(daemon, old_txids, exit_flag);
+        let poll_result = MempoolSyncUpdate::poll(daemon, old_txids, exit_flag, fork);
 
         let sync_update = match poll_result {
             Ok(sync_update) => sync_update,
@@ -374,7 +384,7 @@ impl Mempool {
             // scripthash a wallet subscribes to. See `effective_script` in
             // neurai/asset.rs.
             let bytes = txo.script_pubkey.as_bytes();
-            let asset = parse_asset_script(bytes);
+            let asset = parse_asset_script(bytes, entry.fork);
             let scripthash = match &asset {
                 Some(a) => ScriptHash::hash(&a.base_script),
                 None => ScriptHash::hash(bytes),
@@ -405,7 +415,7 @@ impl Mempool {
         }
         for txo in entry.tx.output {
             let bytes = txo.script_pubkey.as_bytes();
-            let asset = parse_asset_script(bytes);
+            let asset = parse_asset_script(bytes, entry.fork);
             let scripthash = match &asset {
                 Some(a) => ScriptHash::hash(&a.base_script),
                 None => ScriptHash::hash(bytes),

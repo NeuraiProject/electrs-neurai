@@ -1,16 +1,14 @@
 use anyhow::Result;
 use bitcoin::{
-    consensus::serialize,
     hashes::{sha256, Hash, HashEngine},
     Amount, BlockHash, OutPoint, Transaction, Txid,
 };
-use bitcoin_slices::{bsl, Visit, Visitor};
 use rayon::prelude::*;
 use serde::ser::{Serialize, SerializeStruct, Serializer};
 
 use crate::neurai::{
     asset::{effective_script, parse_asset_script, AssetData},
-    block::neurai_to_bsl_block, NetworkParams,
+    tx, NetworkParams,
 };
 
 use std::convert::TryFrom;
@@ -25,7 +23,7 @@ use crate::{
     daemon::Daemon,
     index::Index,
     mempool::Mempool,
-    types::{bsl_txid, ScriptHash, SerBlock, StatusHash},
+    types::{ScriptHash, SerBlock, StatusHash},
 };
 
 /// Given a scripthash, store relevant inputs and outputs of a specific transaction
@@ -508,6 +506,12 @@ impl ScriptHashStatus {
         outpoints: &mut HashSet<OutPoint>,
     ) -> Result<HashMap<BlockHash, Vec<TxEntry>>> {
         let params = index.chain().params();
+        let fork_active = |blockhash: &BlockHash| {
+            index
+                .chain()
+                .get_block_height(blockhash)
+                .is_some_and(|height| params.fork_active(height))
+        };
 
         // Will be updated during the following block scans
         let mut result = HashMap::<BlockHash, HashMap<usize, TxEntry>>::new();
@@ -516,7 +520,8 @@ impl ScriptHashStatus {
         self.for_new_blocks(funding_blockhashes, daemon, |blockhash, block| {
             let block_entries = result.entry(blockhash).or_default();
 
-            for filtered_outputs in filter_block_txs_outputs(block, self.scripthash, params) {
+            let fork = fork_active(&blockhash);
+            for filtered_outputs in filter_block_txs_outputs(block, self.scripthash, params, fork) {
                 cache.add_tx(filtered_outputs.txid, move || filtered_outputs.tx_bytes);
                 outpoints.extend(make_outpoints(
                     filtered_outputs.txid,
@@ -568,7 +573,7 @@ impl ScriptHashStatus {
         let mut result = HashMap::<Txid, TxEntry>::new();
         // extract relevant funding transactions
         for entry in mempool.filter_by_funding(&self.scripthash) {
-            let funding_outputs = filter_outputs(&entry.tx, self.scripthash);
+            let funding_outputs = filter_outputs(&entry.tx, self.scripthash, entry.fork);
             assert!(!funding_outputs.is_empty());
             // store funded outpoints (to check for spending later)
             outpoints.extend(make_outpoints(entry.txid, &funding_outputs));
@@ -576,7 +581,7 @@ impl ScriptHashStatus {
                 .entry(entry.txid) // the transaction may already exist
                 .or_insert_with(|| TxEntry::new(entry.txid))
                 .outputs = funding_outputs;
-            cache.add_tx(entry.txid, || serialize(&entry.tx).into_boxed_slice());
+            cache.add_tx(entry.txid, || entry.raw.clone());
         }
         for entry in outpoints
             .iter()
@@ -588,7 +593,7 @@ impl ScriptHashStatus {
                 .entry(entry.txid) // the transaction may already exist
                 .or_insert_with(|| TxEntry::new(entry.txid))
                 .spent = spent_outpoints;
-            cache.add_tx(entry.txid, || serialize(&entry.tx).into_boxed_slice());
+            cache.add_tx(entry.txid, || entry.raw.clone());
         }
         result.into_values().collect()
     }
@@ -643,7 +648,7 @@ fn make_outpoints(txid: Txid, outputs: &[TxOutput]) -> impl Iterator<Item = OutP
         .map(move |out| OutPoint::new(txid, out.index))
 }
 
-fn filter_outputs(tx: &Transaction, scripthash: ScriptHash) -> Vec<TxOutput> {
+fn filter_outputs(tx: &Transaction, scripthash: ScriptHash, fork: bool) -> Vec<TxOutput> {
     let outputs = tx.output.iter().zip(0u32..);
     outputs
         .filter_map(move |(txo, vout)| {
@@ -651,8 +656,8 @@ fn filter_outputs(tx: &Transaction, scripthash: ScriptHash) -> Vec<TxOutput> {
             // (whose full-script hash differs from the bare-address hash) are
             // attributed to the subscriber's bare address. See `effective_script`.
             let bytes = txo.script_pubkey.as_bytes();
-            if ScriptHash::hash(effective_script(bytes)) == scripthash {
-                let asset = parse_asset_script(bytes).and_then(|a| asset_tx_output_of(&a.data));
+            if ScriptHash::hash(&effective_script(bytes, fork)) == scripthash {
+                let asset = parse_asset_script(bytes, fork).and_then(|a| asset_tx_output_of(&a.data));
                 Some(TxOutput {
                     index: vout,
                     value: txo.value,
@@ -701,23 +706,25 @@ fn filter_block_txs_outputs(
     block: SerBlock,
     scripthash: ScriptHash,
     params: &'static NetworkParams,
+    fork: bool,
 ) -> Vec<FilteredTx<TxOutput>> {
-    // `bitcoin_slices` calls `visit_tx_out` for every output of a transaction
+    // `tx::visit_block` calls `visit_tx_out` for every output of a transaction
     // and only then `visit_transaction` for that same transaction (its txid
     // needs the fully parsed slice). Matches are buffered and attributed to the
     // transaction passed to the following `visit_transaction` call.
     struct FindOutputs {
         scripthash: ScriptHash,
+        fork: bool,
         result: Vec<FilteredTx<TxOutput>>,
         buffer: Vec<TxOutput>,
         pos: usize,
     }
-    impl Visitor for FindOutputs {
-        fn visit_transaction(&mut self, tx: &bsl::Transaction) -> ControlFlow<()> {
+    impl tx::Visitor for FindOutputs {
+        fn visit_transaction(&mut self, tx: &tx::Transaction) -> ControlFlow<()> {
             if !self.buffer.is_empty() {
                 self.result.push(FilteredTx::<TxOutput> {
-                    tx_bytes: tx.as_ref().into(),
-                    txid: bsl_txid(tx),
+                    tx_bytes: tx.as_bytes().into(),
+                    txid: tx.txid(),
                     pos: self.pos,
                     result: std::mem::take(&mut self.buffer),
                 });
@@ -725,13 +732,13 @@ fn filter_block_txs_outputs(
             self.pos += 1;
             ControlFlow::Continue(())
         }
-        fn visit_tx_out(&mut self, vout: usize, tx_out: &bsl::TxOut) -> ControlFlow<()> {
+        fn visit_tx_out(&mut self, vout: usize, tx_out: &tx::TxOut) -> ControlFlow<()> {
             // Use the effective scripthash (base script for asset-wrapped
             // outputs) so the subscriber's bare-address hash matches.
             let bytes = tx_out.script_pubkey();
-            let current = ScriptHash::hash(effective_script(bytes));
+            let current = ScriptHash::hash(&effective_script(bytes, self.fork));
             if current == self.scripthash {
-                let asset = parse_asset_script(bytes).and_then(|a| asset_tx_output_of(&a.data));
+                let asset = parse_asset_script(bytes, self.fork).and_then(|a| asset_tx_output_of(&a.data));
                 self.buffer.push(TxOutput {
                     index: vout as u32,
                     value: Amount::from_sat(tx_out.value()),
@@ -741,15 +748,15 @@ fn filter_block_txs_outputs(
             ControlFlow::Continue(())
         }
     }
-    let (_header, synthetic_block) = neurai_to_bsl_block(&block, params)
-        .expect("core returned block with invalid header");
     let mut find_outputs = FindOutputs {
         scripthash,
+        fork,
         result: vec![],
         buffer: vec![],
         pos: 0,
     };
-    bsl::Block::visit(&synthetic_block, &mut find_outputs).expect("core returned invalid block");
+    // never stops early
+    let _ = tx::visit_block(&block, params, &mut find_outputs).expect("core returned invalid block");
     find_outputs.result
 }
 
@@ -767,12 +774,12 @@ fn filter_block_txs_inputs(
         pos: usize,
     }
 
-    impl Visitor for FindInputs<'_> {
-        fn visit_transaction(&mut self, tx: &bsl::Transaction) -> ControlFlow<()> {
+    impl tx::Visitor for FindInputs<'_> {
+        fn visit_transaction(&mut self, tx: &tx::Transaction) -> ControlFlow<()> {
             if !self.buffer.is_empty() {
                 self.result.push(FilteredTx::<OutPoint> {
-                    tx_bytes: tx.as_ref().into(),
-                    txid: bsl_txid(tx),
+                    tx_bytes: tx.as_bytes().into(),
+                    txid: tx.txid(),
                     pos: self.pos,
                     result: std::mem::take(&mut self.buffer),
                 });
@@ -780,8 +787,8 @@ fn filter_block_txs_inputs(
             self.pos += 1;
             ControlFlow::Continue(())
         }
-        fn visit_tx_in(&mut self, _vin: usize, tx_in: &bsl::TxIn) -> ControlFlow<()> {
-            let current: OutPoint = tx_in.prevout().into();
+        fn visit_tx_in(&mut self, _vin: usize, tx_in: &tx::TxIn) -> ControlFlow<()> {
+            let current: OutPoint = tx_in.prevout();
             if self.outpoints.contains(&current) {
                 self.buffer.push(current);
             }
@@ -789,15 +796,14 @@ fn filter_block_txs_inputs(
         }
     }
 
-    let (_header, synthetic_block) = neurai_to_bsl_block(block, params)
-        .expect("core returned block with invalid header");
     let mut find_inputs = FindInputs {
         outpoints,
         result: vec![],
         buffer: vec![],
         pos: 0,
     };
-    bsl::Block::visit(&synthetic_block, &mut find_inputs).expect("core returned invalid block");
+    // never stops early
+    let _ = tx::visit_block(block, params, &mut find_inputs).expect("core returned invalid block");
     find_inputs.result
 }
 
@@ -848,7 +854,7 @@ mod tests {
             .assume_checked();
         let scripthash = ScriptHash::new(&addr.script_pubkey());
 
-        let result = &super::filter_block_txs_outputs(block, scripthash, params)[0];
+        let result = &super::filter_block_txs_outputs(block, scripthash, params, false)[0];
         // The matching output is in transaction index 8 (see
         // `test_filters_attribute_matches_to_their_own_tx` for a full cross-check).
         assert_eq!(
@@ -890,10 +896,11 @@ mod tests {
         for (pos, tx) in block.txdata.iter().enumerate() {
             let txid = tx.compute_txid();
             for (vout, out) in tx.output.iter().enumerate() {
-                let sh = ScriptHash::hash(crate::neurai::asset::effective_script(
+                let sh = ScriptHash::hash(&crate::neurai::asset::effective_script(
                     out.script_pubkey.as_bytes(),
+                    false,
                 ));
-                let found = super::filter_block_txs_outputs(block_bytes.to_vec(), sh, params);
+                let found = super::filter_block_txs_outputs(block_bytes.to_vec(), sh, params, false);
                 assert!(
                     found.iter().any(|f| f.txid == txid
                         && f.pos == pos
@@ -927,7 +934,7 @@ mod tests {
 
         // tx #2 vout 0 pays this P2PKH and nothing else in the block does.
         let spk = Vec::<u8>::from_hex("76a914528f02193798914da2e61e5ab15b2c516436a29f88ac").unwrap();
-        let found = super::filter_block_txs_outputs(block, ScriptHash::hash(&spk), params);
+        let found = super::filter_block_txs_outputs(block, ScriptHash::hash(&spk), params, false);
         assert_eq!(found.len(), 1);
         assert_eq!(
             found[0].txid.to_string(),

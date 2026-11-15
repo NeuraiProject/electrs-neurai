@@ -13,6 +13,7 @@ use serde_json::{self, json, Value};
 
 use std::collections::{hash_map::Entry, BTreeSet, HashMap};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{
     cache::Cache,
@@ -232,10 +233,17 @@ pub(crate) fn assert_tx_hash(value: &Value) -> Result<Txid> {
 }
 
 /// ElectrumX `check_asset`.
+/// Longest asset name accepted by [`check_asset`]: ElectrumX's 32 characters,
+/// raised for the network when the RPC handler is created.
+static MAX_ASSET_NAME_LEN: AtomicUsize = AtomicUsize::new(32);
+
 pub(crate) fn check_asset(value: &Value) -> Result<String> {
+    let max_len = MAX_ASSET_NAME_LEN.load(Ordering::Relaxed);
     match value {
         Value::String(name) if name.is_empty() => bail!("asset name is empty!"),
-        Value::String(name) if name.len() > 32 => bail!("asset name greater than 32 characters"),
+        Value::String(name) if name.len() > max_len => {
+            bail!("asset name greater than {} characters", max_len)
+        }
         Value::String(name) => Ok(name.clone()),
         other => bail!(
             "the asset name must be a string ({}; {})",
@@ -618,6 +626,7 @@ impl Rpc {
         let genesis_hash = {
             use crate::neurai::NetworkParams;
             let params = NetworkParams::for_network(config.network);
+            MAX_ASSET_NAME_LEN.store(params.max_asset_name_len(), Ordering::Relaxed);
             if params.genesis_hash_le == [0u8; 32] {
                 // Dynamic genesis (testnet / regtest): fetch from daemon.
                 daemon.get_genesis_hash()?

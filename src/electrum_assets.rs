@@ -13,7 +13,6 @@
 
 use anyhow::{bail, Result};
 use bitcoin::{
-    consensus::deserialize,
     hashes::{sha256, Hash},
     BlockHash, Transaction, Txid,
 };
@@ -443,7 +442,29 @@ impl Rpc {
         {
             result.insert("source_ipfs".into(), source_json(&ipfs_source));
         }
+        if name.starts_with('&') {
+            // electrs-neurai extension, like the daemon's `getassetdata`
+            result.insert("transfer_state".into(), json!(self.depin_transfer_state(name)));
+        }
         Value::Object(result)
+    }
+
+    /// Transfer state of a DePIN asset at the tip, as `getassetdata` reports it:
+    /// the last confirmed state operation (the daemon validated each change),
+    /// "closed" before any.
+    fn depin_transfer_state(&self, name: &str) -> &'static str {
+        let state = self
+            .events(AssetEventKind::DepinState, name.as_bytes())
+            .last()
+            .and_then(|row| match row.payload {
+                AssetEventPayload::DepinState { state, .. } => Some(state),
+                _ => None,
+            });
+        match state {
+            Some(1) => "open",
+            Some(2) => "sealed",
+            _ => "closed",
+        }
     }
 
     /// ElectrumX `asset_status`.
@@ -813,11 +834,11 @@ impl Rpc {
             return *valid;
         }
         let valid = match self.transaction(row.txid) {
-            Some(tx) => tx.input.iter().any(|input| {
+            Some((tx, _)) => tx.input.iter().any(|input| {
                 let prevout = input.previous_output;
                 self.transaction(prevout.txid)
-                    .and_then(|prev| prev.output.get(prevout.vout as usize).cloned())
-                    .and_then(|output| parse_asset_script(output.script_pubkey.as_bytes()))
+                    .and_then(|(prev, fork)| Some((prev.output.get(prevout.vout as usize)?.clone(), fork)))
+                    .and_then(|(output, fork)| parse_asset_script(output.script_pubkey.as_bytes(), fork))
                     .is_some_and(|spent| {
                         crate::index::asset_name_of(&spent.data) == asset
                             && ScriptHash::hash(&spent.base_script) == scripthash
@@ -829,12 +850,17 @@ impl Rpc {
         valid
     }
 
-    fn transaction(&self, txid: Txid) -> Option<Transaction> {
+    /// A transaction, and whether the unified fork's rules applied to it.
+    fn transaction(&self, txid: Txid) -> Option<(Transaction, bool)> {
         if let Some(entry) = self.tracker.mempool().get(&txid) {
-            return Some(entry.tx.clone());
+            return Some((entry.tx.clone(), entry.fork));
         }
-        let (_, bytes) = self.tracker.lookup_transaction(&self.daemon, txid).ok()??;
-        deserialize(&bytes).ok()
+        let (blockhash, bytes) = self.tracker.lookup_transaction(&self.daemon, txid).ok()??;
+        let chain = self.tracker.chain();
+        let fork = chain
+            .get_block_height(&blockhash)
+            .is_some_and(|height| chain.params().fork_active(height));
+        Some((crate::neurai::tx::decode_transaction(&bytes).ok()?.tx, fork))
     }
 
     // ─── electrs-neurai extension ────────────────────────────────────────────

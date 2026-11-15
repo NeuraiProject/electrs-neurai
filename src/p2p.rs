@@ -390,10 +390,13 @@ fn build_version_message() -> NetworkMessage {
     //   1. nVersion < MIN_PEER_PROTO_VERSION (70025)            → always
     //   2. nVersion < MESSAGING_RESTRICTED_ASSETS_VERSION (70026) → if Rip5 active
     //   3. nVersion < KAWPOW_VERSION (70027)                    → if transfer scripts deployed
-    // All three softforks are active on mainnet and testnet. Match the daemon's own
-    // PROTOCOL_VERSION (70028) to satisfy them with margin.
+    // All three softforks are active on mainnet and testnet.
+    // Neurai 2.0 nodes also refuse peers below UNIFIED_FORK_VERSION (70031): the
+    // reset DePIN testnet from the first handshake, mainnet and regtest from the
+    // fork height. No message format depends on it (the version negotiated
+    // with 1.0.7, whose PROTOCOL_VERSION is 70028, stays capped at that).
     NetworkMessage::Version(message_network::VersionMessage {
-        version: 70028,
+        version: 70031,
         services,
         timestamp,
         receiver: address::Address::new(&addr, services),

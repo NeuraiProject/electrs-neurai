@@ -90,9 +90,30 @@ pub struct NetworkParams {
     /// Block hashes every [`anchors::INTERVAL`] blocks that authenticate the headers
     /// up to them, so their KAWPOW is not recomputed (see [`anchors`]).
     pub header_anchors: &'static [&'static str],
+    /// Height from which the unified fork's script rules apply (Neurai 2.0,
+    /// `nStrictAuthScriptHeight`): the "xna" asset marker, AuthScript asset and
+    /// tag forms, P2PKH-only classic asset prefix and 121-byte asset names.
+    /// `None`: not scheduled (mainnet so far, the v1.0.7 regtest).
+    pub unified_fork_height: Option<u32>,
 }
 
 impl NetworkParams {
+    /// Whether the unified fork's rules apply to a block at `height`.
+    pub fn fork_active(&self, height: usize) -> bool {
+        self.unified_fork_height
+            .is_some_and(|fork| height as u64 >= u64::from(fork))
+    }
+
+    /// Longest asset name the Electrum RPCs accept: ElectrumX's 32 characters,
+    /// or the daemon's 121 bytes where the unified fork is scheduled.
+    pub fn max_asset_name_len(&self) -> usize {
+        if self.unified_fork_height.is_some() {
+            121
+        } else {
+            32
+        }
+    }
+
     pub fn for_network(network: NeuraiNetwork) -> &'static NetworkParams {
         match network {
             NeuraiNetwork::Mainnet => LazyLock::force(&MAINNET),
@@ -170,6 +191,8 @@ static MAINNET: LazyLock<NetworkParams> = LazyLock::new(|| NetworkParams {
     genesis_version: 4,
     genesis_merkle_root_le: hex_be_to_le(&MERKLE_ROOT_BE),
     header_anchors: anchors::MAINNET,
+    // MAINNET_FORK_HEIGHT in Neurai 2.0 is not set yet.
+    unified_fork_height: None,
 });
 
 static TESTNET: LazyLock<NetworkParams> = LazyLock::new(|| NetworkParams {
@@ -200,6 +223,8 @@ static TESTNET: LazyLock<NetworkParams> = LazyLock::new(|| NetworkParams {
     genesis_version: 2,
     genesis_merkle_root_le: hex_be_to_le(&MERKLE_ROOT_BE),
     header_anchors: &[],
+    // TESTNET_FEATURES_HEIGHT
+    unified_fork_height: Some(10),
 });
 
 static REGTEST: LazyLock<NetworkParams> = LazyLock::new(|| NetworkParams {
@@ -227,6 +252,8 @@ static REGTEST: LazyLock<NetworkParams> = LazyLock::new(|| NetworkParams {
     genesis_version: 2,
     genesis_merkle_root_le: hex_be_to_le(&MERKLE_ROOT_BE),
     header_anchors: &[],
+    // nStrictAuthScriptHeight = 0 (-strictauthscriptheight moves it)
+    unified_fork_height: Some(0),
 });
 
 /// Neurai v1.0.7 regtest (`CRegTestParams` of the `main` branch).
@@ -256,6 +283,7 @@ static REGTEST_V1: LazyLock<NetworkParams> = LazyLock::new(|| NetworkParams {
     genesis_version: 4,
     genesis_merkle_root_le: hex_be_to_le(&MERKLE_ROOT_BE),
     header_anchors: &[],
+    unified_fork_height: None,
 });
 
 #[cfg(test)]

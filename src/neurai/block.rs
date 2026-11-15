@@ -281,24 +281,10 @@ pub fn decode_header<R: bitcoin::io::Read + ?Sized>(
     }
 }
 
-/// Convert a Neurai block (with 80- or 120-byte header) into a form that
-/// `bitcoin_slices::bsl::Block::visit` can process, by replacing the variable-size
-/// header with an 80-byte all-zeros dummy followed by the original transaction bytes.
-///
-/// Returns `(neurai_header, synthetic_block)` on success, `None` if the block is
-/// too short to contain a valid header.  Callers should use `neurai_header` directly
-/// for header data and ignore any `visit_block_header` callbacks from bsl.
-pub fn neurai_to_bsl_block(
-    block: &[u8],
-    params: &NetworkParams,
-) -> Option<(NeuraiBlockHeader, Vec<u8>)> {
+/// The header of a serialized block (80 or 120 bytes, by its `nTime`).
+pub fn block_header(block: &[u8], params: &NetworkParams) -> Option<NeuraiBlockHeader> {
     let hdr_len = header_len(block, params)?;
-    let header = decode_header(&mut &block[..hdr_len], params).ok()?;
-    let tx_bytes = &block[hdr_len..];
-    // 80-byte fake header (zeros) + original transaction bytes
-    let mut synthetic = vec![0u8; 80];
-    synthetic.extend_from_slice(tx_bytes);
-    Some((header, synthetic))
+    decode_header(&mut &block[..hdr_len], params).ok()
 }
 
 /// Fixed-size slice at the beginning of a serialized block that covers the header.

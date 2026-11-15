@@ -49,6 +49,29 @@ are verified in parallel, one epoch at a time, using ethash's shared,
 thread-safe epoch context. If a block's hash differs from its anchor, every
 header is verified.
 
+**Neurai 2.0 / DePIN-Test.** electrs-neurai works with the DePIN-Test testnet
+(checked against `/Neurai:2.0.0/` on testnet and on a regtest that uses every
+feature below), and is ready for the unified fork on mainnet:
+
+* The P2P handshake announces protocol 70031 (`UNIFIED_FORK_VERSION`): 2.0 nodes
+  refuse lower versions (the testnet from the first handshake), and 1.0.7 nodes
+  accept it.
+* NIP-014 reference inputs: transactions are read by a new Neurai parser that
+  knows the extended format's flag 2 and computes the txid like the daemon
+  (it commits to the reference inputs). They used to stop indexing.
+  `bitcoin_slices` is no longer used.
+* Asset scripts follow `CScript::IsAssetScript` of 2.0, which keeps the 1.0.7
+  rules below the fork: from the fork, the `"xna"` marker (NIP-040) and the
+  AuthScript forms `OP_1`/`OP_2`/`OP_3 <32 bytes> OP_XNA_ASSET ... OP_DROP` for
+  assets and tags; the payload is read to the end of the script as the daemon
+  does. This also fixes mainnet transfers with a doubled `OP_XNA_ASSET`
+  (block 1615824), which were indexed as plain outputs.
+* DePIN transfer states (`&NAME` open/closed/sealed) are indexed separately
+  from global freezes, and `get_meta` reports `transfer_state`.
+* Asset names up to 121 bytes on networks with the fork scheduled.
+* **DB format 6 — a full reindex runs automatically on upgrade** (about ten
+  minutes on mainnet).
+
 **TLS certificate reload.** electrs reloads `ssl_certfile` / `ssl_keyfile`
 when they change, so renewed certificates need no restart. A certificate whose
 key does not match yet (files half-replaced) is retried, and the current one is

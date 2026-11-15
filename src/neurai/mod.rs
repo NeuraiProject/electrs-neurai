@@ -8,6 +8,7 @@ pub mod anchors;
 pub mod asset;
 pub mod block;
 pub mod network;
+pub mod tx;
 
 #[allow(unused_imports)]
 pub use block::{BlockHashAlgo, NeuraiBlockHeader};

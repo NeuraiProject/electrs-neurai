@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use bitcoin::consensus::{deserialize, Encodable};
 use bitcoin::hashes::Hash;
 use bitcoin::{BlockHash, OutPoint, Txid};
-use bitcoin_slices::{bsl, Visit, Visitor};
 use std::ops::ControlFlow;
 use std::thread;
 
@@ -10,7 +9,8 @@ use crate::neurai::asset::{
     is_null_asset_script, parse_asset_script, parse_null_asset_script, AssetData, AssetOutput,
     IpfsRef, NullAssetScript, TaggedDestination,
 };
-use crate::neurai::block::neurai_to_bsl_block;
+use crate::neurai::block::block_header;
+use crate::neurai::tx;
 use crate::neurai::NetworkParams;
 use crate::{
     chain::{Chain, NewHeader},
@@ -19,7 +19,7 @@ use crate::{
     metrics::{self, Gauge, Histogram, Metrics},
     signals::ExitFlag,
     types::{
-        bsl_txid, verifier_qualifiers, AssetEventKind, AssetEventPayload, AssetEventRow,
+        verifier_qualifiers, AssetEventKind, AssetEventPayload, AssetEventRow,
         AssetFundingRow, AssetHistoryRow, AssetMetaEvent, AssetMetaEventRow,
         HashPrefixRow, HeaderRow, ScriptHash, ScriptHashRow, SerBlock, SpendingPrefixRow, TxidRow,
     },
@@ -475,10 +475,11 @@ impl TxAssetOutputs {
 
     /// Record an output if it is asset-related. Returns the scripthash the
     /// output is indexed under (base script for asset outputs), or `None` for
-    /// unspendable outputs (OP_RETURN and null-asset scripts).
-    pub(crate) fn add_output(&mut self, vout: u32, script_bytes: &[u8]) -> Option<ScriptHash> {
+    /// unspendable outputs (OP_RETURN and null-asset scripts). `fork`: whether
+    /// the unified fork's rules apply to the transaction.
+    pub(crate) fn add_output(&mut self, vout: u32, script_bytes: &[u8], fork: bool) -> Option<ScriptHash> {
         if is_null_asset_script(script_bytes) {
-            if let Some(null_asset) = parse_null_asset_script(script_bytes) {
+            if let Some(null_asset) = parse_null_asset_script(script_bytes, fork) {
                 self.null_assets.push((vout, null_asset));
             }
             return None;
@@ -489,7 +490,7 @@ impl TxAssetOutputs {
         // Asset-wrapped outputs hash on the *base* script (the P2PKH or
         // AuthScript prefix before OP_XNA_ASSET) so that a wallet subscribed to
         // the bare address sees the asset transfer.
-        match parse_asset_script(script_bytes) {
+        match parse_asset_script(script_bytes, fork) {
             Some(asset) => {
                 let scripthash = ScriptHash::hash(&asset.base_script);
                 self.assets.push((vout, scripthash, asset));
@@ -577,6 +578,14 @@ pub(crate) fn tx_asset_events(loc: TxLocation, outputs: TxAssetOutputs) -> TxAss
             // AuthScript (DePIN testnet) tags have no h160; ElectrumX doesn't
             // index them either.
             NullAssetScript::AddressTag { .. } => (),
+            // The same script sets the transfer state of a DePIN asset.
+            NullAssetScript::GlobalRestriction { asset_name, flag } if asset_name.starts_with('&') => {
+                let payload = AssetEventPayload::DepinState {
+                    asset: asset_name.clone(),
+                    state: flag,
+                };
+                result.events.push(event(vout, AssetEventKind::DepinState, asset_name.into_bytes(), payload));
+            }
             NullAssetScript::GlobalRestriction { asset_name, flag } => {
                 let payload = AssetEventPayload::Freeze {
                     asset: asset_name.clone(),
@@ -613,12 +622,7 @@ fn index_single_block(
     batch: &mut WriteBatch,
     params: &'static NetworkParams,
 ) {
-    // Parse the Neurai block header (80 or 120 bytes) and get a bsl-compatible
-    // synthetic block (80-byte fake header + original tx bytes).
-    let (neurai_header, synthetic_block) = neurai_to_bsl_block(&block, params)
-        .expect("core returned block with invalid header");
-
-    // Store the header directly (bypassing visit_block_header in the bsl visitor).
+    let neurai_header = block_header(&block, params).expect("core returned block with invalid header");
     batch
         .header_rows
         .push(HeaderRow::new(neurai_header).to_db_row());
@@ -628,16 +632,18 @@ fn index_single_block(
         height: usize,
         block_hash: BlockHash,
         tx_pos: u32,
-        /// Asset outputs of the transaction being parsed. `bitcoin_slices`
+        /// Whether the unified fork's rules apply to this block.
+        fork: bool,
+        /// Asset outputs of the transaction being parsed. `tx::visit_block`
         /// calls `visit_tx_out` for every output *before* `visit_transaction`
         /// (the txid is only known once the whole transaction is parsed), so
         /// they are indexed when `visit_transaction` runs.
         pending: TxAssetOutputs,
     }
 
-    impl Visitor for IndexBlockVisitor<'_> {
-        fn visit_transaction(&mut self, tx: &bsl::Transaction) -> ControlFlow<()> {
-            let txid = bsl_txid(tx);
+    impl tx::Visitor for IndexBlockVisitor<'_> {
+        fn visit_transaction(&mut self, tx: &tx::Transaction) -> ControlFlow<()> {
+            let txid = tx.txid();
             self.batch
                 .txid_rows
                 .push(TxidRow::row(txid, self.height).to_db_row());
@@ -671,10 +677,10 @@ fn index_single_block(
             ControlFlow::Continue(())
         }
 
-        fn visit_tx_out(&mut self, vout: usize, tx_out: &bsl::TxOut) -> ControlFlow<()> {
+        fn visit_tx_out(&mut self, vout: usize, tx_out: &tx::TxOut) -> ControlFlow<()> {
             // Unspendable outputs (OP_RETURN, null-asset scripts — mirrors
             // `CScript::IsUnspendable`) get no funding row.
-            if let Some(scripthash) = self.pending.add_output(vout as u32, tx_out.script_pubkey()) {
+            if let Some(scripthash) = self.pending.add_output(vout as u32, tx_out.script_pubkey(), self.fork) {
                 self.batch
                     .funding_rows
                     .push(ScriptHashRow::row(scripthash, self.height).to_db_row());
@@ -682,15 +688,14 @@ fn index_single_block(
             ControlFlow::Continue(())
         }
 
-        fn visit_tx_in(&mut self, _vin: usize, tx_in: &bsl::TxIn) -> ControlFlow<()> {
-            let prevout: OutPoint = tx_in.prevout().into();
+        fn visit_tx_in(&mut self, _vin: usize, tx_in: &tx::TxIn) -> ControlFlow<()> {
+            let prevout: OutPoint = tx_in.prevout();
             if !prevout.is_null() {
                 let row = SpendingPrefixRow::row(prevout, self.height);
                 self.batch.spending_rows.push(row.to_db_row());
             }
             ControlFlow::Continue(())
         }
-        // visit_block_header: default no-op (header already stored above)
     }
 
     let mut index_block = IndexBlockVisitor {
@@ -698,9 +703,11 @@ fn index_single_block(
         height,
         block_hash,
         tx_pos: 0,
+        fork: params.fork_active(height),
         pending: TxAssetOutputs::default(),
     };
-    bsl::Block::visit(&synthetic_block, &mut index_block).expect("core returned invalid block");
+    // never stops early
+    let _ = tx::visit_block(&block, params, &mut index_block).expect("core returned invalid block");
 
     let len = block_hash
         .consensus_encode(&mut (&mut batch.tip_row as &mut [u8]))
@@ -724,7 +731,7 @@ mod tests {
     use std::str::FromStr;
 
     /// Helper: construct a P2PKH + OP_XNA_ASSET payload script exactly as the
-    /// visitor would see it coming out of `bitcoin_slices::bsl::Block::visit`.
+    /// visitor would see it coming out of `tx::visit_block`.
     fn make_p2pkh_asset_script(type_byte: u8, tail: &[u8]) -> Vec<u8> {
         let mut payload = Vec::from(ASSET_MAGIC);
         payload.push(type_byte);
@@ -764,7 +771,7 @@ mod tests {
         body.push(0); // no ipfs
         let script = make_p2pkh_asset_script(TYPE_NEW, &body);
 
-        let asset = parse_asset_script(&script).expect("parse");
+        let asset = parse_asset_script(&script, false).expect("parse");
         assert_eq!(asset_name_of(&asset.data), "TOKEN");
 
         let event = asset_meta_event_of(&asset.data, &location(1_234)).expect("metadata");
@@ -789,7 +796,7 @@ mod tests {
         body.extend_from_slice(&1i64.to_le_bytes());
         let script = make_p2pkh_asset_script(TYPE_TRANSFER, &body);
 
-        let asset = parse_asset_script(&script).expect("parse");
+        let asset = parse_asset_script(&script, false).expect("parse");
         assert!(matches!(asset.data, AssetData::Transfer(_)));
         assert!(asset_meta_event_of(&asset.data, &location(1)).is_none());
     }

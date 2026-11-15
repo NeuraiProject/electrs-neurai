@@ -135,7 +135,10 @@ struct Config {
 // Format 5: owner-token events in `asset_meta`; new `asset_events` (tags,
 //           freezes, verifier strings, associations, broadcasts) and
 //           `asset_names` column families for ElectrumX-neurai compatibility.
-const CURRENT_FORMAT: u64 = 5;
+// Format 6: asset scripts read like the daemon (doubled OP_XNA_ASSET, any
+//           prefix below the unified fork, the Neurai 2.0 forms from it),
+//           NIP-014 transactions with reference inputs, DePIN transfer states.
+const CURRENT_FORMAT: u64 = 6;
 
 impl Default for Config {
     fn default() -> Self {

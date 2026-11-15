@@ -52,6 +52,11 @@ positional **and named** parameters, result shapes and error messages:
 
 Notes:
 
+* Neurai 2.0 (DePIN-Test): from the unified fork, asset outputs may carry the
+  `"xna"` marker (NIP-040) and an AuthScript prefix (`OP_1`/`OP_2`/`OP_3` and a
+  32-byte program); transactions with NIP-014 reference inputs are indexed with
+  their real txid. Tags addressed to an AuthScript program are not indexed
+  (ElectrumX's tag methods take an h160).
 * Asset outputs (`<P2PKH> OP_XNA_ASSET <payload> OP_DROP`) are indexed under
   the scripthash of their base script, so `blockchain.scripthash.*` of a plain
   address include its asset transactions. `get_balance` / `listunspent` take
@@ -64,6 +69,11 @@ Notes:
   to the supply; units `-1` and reissues without IPFS keep the previous values,
   whose outputs are then given as `source_divisions` / `source_ipfs`).
   IPFS and TXID references are the base58 encoding of their 34 bytes.
+* For a DePIN asset (`&NAME`), `get_meta` also has `"transfer_state"`:
+  `"closed"`, `"open"` or `"sealed"`, like the daemon's `getassetdata`
+  (an electrs-neurai extension).
+* Asset names may be up to 121 bytes where the unified fork is scheduled
+  (testnet, regtest); elsewhere ElectrumX's 32-character limit applies.
 * Mempool entries in asset and tag replies have `"height": -1`.
 * `blockchain.asset.list_addresses_by_asset` is answered by the daemon's
   `listaddressesbyasset`, which needs `assetindex=1` on the node.

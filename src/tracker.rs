@@ -2,10 +2,8 @@ use std::ops::ControlFlow;
 
 use anyhow::{Context, Result};
 use bitcoin::{BlockHash, Txid};
-use bitcoin_slices::{bsl, Error::VisitBreak, Visit, Visitor};
 
-use crate::neurai::block::neurai_to_bsl_block;
-use crate::neurai::NetworkParams;
+use crate::neurai::{tx, NetworkParams};
 use bitcoin::Amount;
 
 use crate::{
@@ -19,7 +17,7 @@ use crate::{
     metrics::Metrics,
     signals::ExitFlag,
     status::{Balance, ScriptHashStatus, UnspentEntry},
-    types::{bsl_txid, ScriptHash},
+    types::ScriptHash,
 };
 
 /// Returned by [`Tracker::get_asset_history`].
@@ -118,7 +116,9 @@ impl Tracker {
     pub(crate) fn sync(&mut self, daemon: &Daemon, exit_flag: &ExitFlag) -> Result<bool> {
         let done = self.index.sync(daemon, exit_flag)?;
         if done && !self.ignore_mempool {
-            self.mempool.sync(daemon, exit_flag);
+            let chain = self.index.chain();
+            let fork = chain.params().fork_active(chain.height() + 1);
+            self.mempool.sync(daemon, exit_flag, fork);
             // TODO: double check tip - and retry on diff
         }
         Ok(done)
@@ -230,12 +230,10 @@ impl Tracker {
                 return; // keep first matching transaction
             }
             let params = self.chain().params();
-            let (_, synthetic_block) = neurai_to_bsl_block(&block, params)
-                .expect("core returned block with invalid header");
             let mut visitor = FindTransaction::new(txid);
-            result = match bsl::Block::visit(&synthetic_block, &mut visitor) {
-                Ok(_) | Err(VisitBreak) => visitor.found.map(|tx| (blockhash, tx)),
-                Err(e) => panic!("core returned invalid block: {:?}", e),
+            result = match tx::visit_block(&block, params, &mut visitor) {
+                Ok(_) => visitor.found.map(|tx| (blockhash, tx)),
+                Err(e) => panic!("core returned invalid block: {:#}", e),
             };
         })?;
         Ok(result)
@@ -252,10 +250,10 @@ impl FindTransaction {
         Self { txid, found: None }
     }
 }
-impl Visitor for FindTransaction {
-    fn visit_transaction(&mut self, tx: &bsl::Transaction) -> ControlFlow<()> {
-        if self.txid == bsl_txid(tx) {
-            self.found = Some(tx.as_ref().into());
+impl tx::Visitor for FindTransaction {
+    fn visit_transaction(&mut self, tx: &tx::Transaction) -> ControlFlow<()> {
+        if self.txid == tx.txid() {
+            self.found = Some(tx.as_bytes().into());
             ControlFlow::Break(())
         } else {
             ControlFlow::Continue(())
