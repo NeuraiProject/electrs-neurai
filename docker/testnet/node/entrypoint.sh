@@ -29,6 +29,8 @@ addressindex=${NEURAI_ADDRESSINDEX:-1}
 timestampindex=${NEURAI_TIMESTAMPINDEX:-1}
 spentindex=${NEURAI_SPENTINDEX:-1}
 pubkeyindex=${NEURAI_PUBKEYINDEX:-1}
+silentpaymentindex=${NEURAI_SILENTPAYMENTINDEX:-1}
+channelmessageindex=${NEURAI_CHANNELMESSAGEINDEX:-1}
 
 # Wallet — disabled by default, set NEURAI_DISABLE_WALLET=0 to enable
 disablewallet=${NEURAI_DISABLE_WALLET:-1}
