@@ -49,6 +49,20 @@ are verified in parallel, one epoch at a time, using ethash's shared,
 thread-safe epoch context. If a block's hash differs from its anchor, every
 header is verified.
 
+**TLS certificate reload.** electrs reloads `ssl_certfile` / `ssl_keyfile`
+when they change, so renewed certificates need no restart. A certificate whose
+key does not match yet (files half-replaced) is retried, and the current one is
+kept meanwhile.
+
+**Docker.** The mainnet and testnet stacks are configured with a `.env` file
+(`.env.example` in each directory): RPC credentials shared by the node and
+electrs, ports, electrs options and a domain. With `DOMAIN` set, a `letsencrypt`
+service (certbot, HTTP-01, no DNS API) gets and renews a certificate for it.
+`docker/*/electrs/config.toml` is gone: set `NEURAI_RPC_PASSWORD` in `.env`. The
+testnet stack now builds (its node directory was misplaced), uses ports
+60001/60002/60004 so it can run next to mainnet, and publishes node RPC on
+127.0.0.1 only. See [docker/README.md](docker/README.md).
+
 **Testing.** `--network regtest-v1` indexes the regtest of the v1.0.7
 release (X16Rv2 headers, new `hasherx16r-sys` crate), so the mainnet consensus
 and asset code can be tested locally.

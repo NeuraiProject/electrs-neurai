@@ -1,66 +1,58 @@
+# Neurai mainnet node + electrs-neurai (tcp://, ssl://, wss://).
+# Settings live in .env:  cp .env.example .env  (see the comments there).
+
+x-logging: &logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   neuraid:
     # Official Neurai mainnet release image (v1.0.7), pinned by digest.
     # https://hub.docker.com/r/neuraiproject/neurai-node
-    # Replaces the previous local build of the `DePIN-Test` branch, which is the
-    # testnet development branch and not the mainnet release.
     image: neuraiproject/neurai-node:v1.0.7@sha256:59e863a068a51ec8e88f334ef1656a5bad8030662637ff8c4c27bcbd8ff983f3
     container_name: neurai-electrs-mainnet-node
     restart: unless-stopped
+    logging: *logging
 
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "5"
+    # Keeps rpcuser/rpcpassword of neurai.conf in step with .env, then runs the
+    # image's entrypoint (which writes neurai.conf only on the first start).
+    entrypoint: ["/bin/sh", "/usr/local/bin/node-entrypoint.sh"]
+    command: ["-printtoconsole"]
 
-    # The image's entrypoint writes /data/neurai.conf from these variables
-    # ONLY on the first start (the file is then persisted in the volume).
-    # To change settings later, edit neurai.conf inside the volume and restart.
     environment:
-      # ── Network ──────────────────────────────────────────────────────────
-      # NEURAI_LISTEN must be 1: electrs needs P2P to bulk-download blocks from the daemon.
+      # NEURAI_LISTEN must be 1: electrs bulk-downloads blocks over P2P.
       NEURAI_LISTEN: "1"
       NEURAI_P2P_PORT: "19000"
       NEURAI_REST: "1"
-
-      # ── RPC ──────────────────────────────────────────────────────────────
-      NEURAI_RPC_USER: "neurai"
-      NEURAI_RPC_PASSWORD: "changeme"
-      # The image binds RPC to 127.0.0.1 by default; electrs runs in another
-      # container, so RPC must listen on all interfaces of the container.
+      NEURAI_RPC_USER: "${NEURAI_RPC_USER:-neurai}"
+      NEURAI_RPC_PASSWORD: "${NEURAI_RPC_PASSWORD:?set NEURAI_RPC_PASSWORD in .env (cp .env.example .env)}"
+      # electrs runs in another container: RPC listens on the container's
+      # interfaces. The host only gets it on 127.0.0.1 (see ports).
       NEURAI_RPC_BIND: "0.0.0.0"
-      # NEURAI_RPC_ALLOW_IP: restrict in production (e.g. the neurai_net subnet)
       NEURAI_RPC_ALLOW_IP: "0.0.0.0/0"
       NEURAI_RPC_PORT: "19001"
       NEURAI_RPC_WORK_QUEUE: "64"
       NEURAI_RPC_THREADS: "8"
-
-      # ── Wallet ───────────────────────────────────────────────────────────
-      # NEURAI_DISABLE_WALLET: 1=disabled | 0=enabled
       NEURAI_DISABLE_WALLET: "1"
-
-      # ── Indexes ──────────────────────────────────────────────────────────
-      # electrs-neurai does not need any of them; kept for other consumers.
-      NEURAI_TXINDEX: "1"
-      NEURAI_ASSETINDEX: "1"
-      NEURAI_ADDRESSINDEX: "1"
-      NEURAI_TIMESTAMPINDEX: "1"
-      NEURAI_SPENTINDEX: "1"
-
-      # ── Extra neurai.conf lines (no dedicated variable in the image) ─────
+      NEURAI_TXINDEX: "${NEURAI_TXINDEX:-1}"
+      NEURAI_ASSETINDEX: "${NEURAI_ASSETINDEX:-1}"
+      NEURAI_ADDRESSINDEX: "${NEURAI_ADDRESSINDEX:-1}"
+      NEURAI_TIMESTAMPINDEX: "${NEURAI_TIMESTAMPINDEX:-1}"
+      NEURAI_SPENTINDEX: "${NEURAI_SPENTINDEX:-1}"
+      NEURAI_DB_CACHE: "${NEURAI_DB_CACHE:-450}"
+      NEURAI_MAX_CONNECTIONS: "${NEURAI_MAX_CONNECTIONS:-125}"
       NEURAI_EXTRA_CONF: |
         rpcservertimeout=240
 
     volumes:
-      # New volume name on purpose: data written by the old image is owned by
-      # root (this image runs neuraid as the `neurai` user), its neurai.conf
-      # would not be regenerated, and it was synced by the DePIN-Test branch.
       - neurai_mainnet_data:/data
+      - ../node-entrypoint.sh:/usr/local/bin/node-entrypoint.sh:ro
 
     ports:
-      - "19000:19000"             # mainnet P2P
-      - "127.0.0.1:19001:19001"   # mainnet RPC — host loopback only
+      - "${NODE_P2P_PORT:-19000}:19000"
+      - "127.0.0.1:${NODE_RPC_PORT:-19001}:19001"
 
     networks:
       - neurai_net
@@ -75,12 +67,11 @@ services:
 
   electrs:
     # ── Build mode: pick one ─────────────────────────────────────────────
-    # (1) LOCAL — copies the working tree at ../../ . Fast iteration without
-    #     pushing to GitHub. Active by default.
+    # (1) LOCAL — builds the working tree at ../../ (active by default).
     build:
       context: ../..
       dockerfile: Dockerfile
-    # (2) GITHUB — clones a published ref. Use for reproducible builds.
+    # (2) GITHUB — clones a published ref, for reproducible builds.
     #     Comment block (1) above and uncomment block (2) below to switch.
     # build:
     #   context: ./electrs
@@ -91,20 +82,28 @@ services:
     image: neuraiproject/electrs-neurai:mainnet-1.0.0
     container_name: neurai-mainnet-electrs
     restart: unless-stopped
+    logging: *logging
 
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "5"
+    environment:
+      # The entrypoint writes them to electrs' config file (`auth`).
+      DAEMON_RPC_USER: "${NEURAI_RPC_USER:-neurai}"
+      DAEMON_RPC_PASSWORD: "${NEURAI_RPC_PASSWORD:?set NEURAI_RPC_PASSWORD in .env (cp .env.example .env)}"
+      # Names the self-signed certificate and the reported services.
+      DOMAIN: "${DOMAIN:-}"
+      PUBLIC_TCP_PORT: "${ELECTRUM_TCP_PORT:-50001}"
+      PUBLIC_SSL_PORT: "${ELECTRUM_SSL_PORT:-50002}"
+      PUBLIC_WSS_PORT: "${ELECTRUM_WSS_PORT:-50004}"
+      # Any electrs option can be set as ELECTRS_<OPTION> (empty = default).
+      ELECTRS_LOG_FILTERS: "${ELECTRS_LOG_FILTERS:-INFO}"
+      ELECTRS_SERVER_BANNER: "${ELECTRS_SERVER_BANNER:-}"
+      ELECTRS_DONATION_ADDRESS: "${ELECTRS_DONATION_ADDRESS:-}"
+      ELECTRS_REPORT_SERVICES: "${ELECTRS_REPORT_SERVICES:-}"
 
-    # `auth` (RPC user:password) lives in ./electrs/config.toml because it
-    # cannot be passed via CLI args or env vars. All other settings are
-    # supplied via `command:` below to override the image's default CMD.
     volumes:
       - electrs_data:/var/lib/electrs-neurai
+      # cert.pem / key.pem: self-signed on the first start, replaced by the
+      # letsencrypt service when DOMAIN is set (electrs reloads them by itself).
       - electrs_tls_certs:/etc/electrs-tls
-      - ./electrs/config.toml:/etc/electrs/config.toml:ro
 
     command:
       - "--network"
@@ -117,9 +116,6 @@ services:
       - "neuraid:19000"
       - "--electrum-rpc-addr"
       - "0.0.0.0:50001"
-      # Native TLS (ssl://) and WebSocket over TLS (wss://, ElectrumX framing).
-      # A self-signed certificate is created in the electrs_tls_certs volume on
-      # first start; mount your own cert.pem / key.pem there to replace it.
       - "--electrum-ssl-addr"
       - "0.0.0.0:50002"
       - "--electrum-wss-addr"
@@ -128,13 +124,11 @@ services:
       - "/etc/electrs-tls/cert.pem"
       - "--ssl-keyfile"
       - "/etc/electrs-tls/key.pem"
-      - "--log-filters"
-      - "INFO"
 
     ports:
-      - "50001:50001"   # Electrum mainnet RPC
-      - "50002:50002"   # ssl://  (Electrum over TLS)
-      - "50004:50004"   # wss://  (Electrum over WebSocket + TLS, for browser wallets)
+      - "${ELECTRUM_TCP_PORT:-50001}:50001"   # tcp://
+      - "${ELECTRUM_SSL_PORT:-50002}:50002"   # ssl://  (Electrum desktop wallets)
+      - "${ELECTRUM_WSS_PORT:-50004}:50004"   # wss://  (browser wallets, indexers)
 
     networks:
       - neurai_net
@@ -143,12 +137,35 @@ services:
       neuraid:
         condition: service_healthy
 
+  letsencrypt:
+    # Gets and renews a Let's Encrypt certificate for DOMAIN (idle when DOMAIN
+    # is empty). See ../letsencrypt.sh.
+    image: certbot/certbot:v4.0.0
+    container_name: neurai-mainnet-letsencrypt
+    restart: unless-stopped
+    logging: *logging
+    # Host network: certbot binds port 80 only while a validation runs, so the
+    # port stays free the rest of the time.
+    network_mode: host
+    entrypoint: ["/bin/sh", "/letsencrypt.sh"]
+    environment:
+      DOMAIN: "${DOMAIN:-}"
+      LETSENCRYPT_EMAIL: "${LETSENCRYPT_EMAIL:-}"
+      LETSENCRYPT_STAGING: "${LETSENCRYPT_STAGING:-0}"
+      ACME_HTTP_PORT: "${ACME_HTTP_PORT:-80}"
+    volumes:
+      - ../letsencrypt.sh:/letsencrypt.sh:ro
+      - letsencrypt:/etc/letsencrypt
+      - electrs_tls_certs:/etc/electrs-tls
+
 volumes:
   neurai_mainnet_data:
     driver: local
   electrs_data:
     driver: local
   electrs_tls_certs:
+    driver: local
+  letsencrypt:
     driver: local
 
 networks:

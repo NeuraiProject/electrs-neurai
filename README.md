@@ -40,6 +40,10 @@ phase-by-phase log of the adaptation from upstream electrs.
 The repository ships with a production multi-stage `Dockerfile` and a
 regtest integration stack in `regtest/`.
 
+For a complete server (Neurai node + electrs, with an optional Let's Encrypt
+certificate for your domain), use the docker-compose stacks configured with a
+`.env` file: see [docker/README.md](docker/README.md).
+
 ```bash
 # Build the server image from the project root.
 cd NIP/software/electrs-neurai

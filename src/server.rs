@@ -18,7 +18,7 @@ use crate::{
     metrics::{self, Metrics},
     signals::ExitError,
     thread::spawn,
-    transport::{load_tls_config, Connection, Service, Writer},
+    transport::{Connection, Service, TlsCertificate, Writer},
 };
 
 struct Peer {
@@ -85,7 +85,7 @@ fn serve() -> Result<()> {
 
     let (server_tx, server_rx) = unbounded();
     let tls = match (&config.ssl_certfile, &config.ssl_keyfile) {
-        (Some(cert), Some(key)) => Some(load_tls_config(cert, key)?),
+        (Some(cert), Some(key)) => Some(Arc::new(TlsCertificate::load(cert, key)?)),
         _ => None,
     };
     let next_peer_id = Arc::new(AtomicUsize::new(0));
@@ -249,7 +249,7 @@ fn handle_peer_events(
 fn accept_loop(
     listener: TcpListener,
     service: Service,
-    tls: Option<Arc<rustls::ServerConfig>>,
+    tls: Option<Arc<TlsCertificate>>,
     next_peer_id: Arc<AtomicUsize>,
     server_tx: Sender<Event>,
 ) -> Result<()> {
@@ -263,7 +263,7 @@ fn accept_loop(
         };
         let peer_id = next_peer_id.fetch_add(1, Ordering::Relaxed);
         let tx = server_tx.clone();
-        let tls = tls.clone();
+        let tls = tls.as_ref().map(|certificate| certificate.config());
         spawn("recv_loop", move || {
             let conn = match Connection::accept(stream, service, tls.as_ref()) {
                 Ok(conn) => conn,

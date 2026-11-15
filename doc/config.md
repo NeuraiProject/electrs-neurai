@@ -102,7 +102,9 @@ $ electrum --oneserver --server=electrum.example.org:50002:s
 
 The WebSocket listeners use ElectrumX's framing: one JSON-RPC message per WebSocket text message, without a trailing newline.
 
-electrum-neurai accepts self-signed certificates (trust on first use). For clients that require a CA-signed certificate, obtain one with [certbot](https://certbot.eff.org/) and point `ssl_certfile` / `ssl_keyfile` at `/etc/letsencrypt/live/<your-domain>/fullchain.pem` and `privkey.pem`. The Docker images create a self-signed certificate on first start when the configured files don't exist.
+electrum-neurai accepts self-signed certificates (trust on first use). For clients that require a CA-signed certificate, obtain one with [certbot](https://certbot.eff.org/) and point `ssl_certfile` / `ssl_keyfile` at `/etc/letsencrypt/live/<your-domain>/fullchain.pem` and `privkey.pem`. The Docker images create a self-signed certificate on first start when the configured files don't exist, and the docker-compose stacks can get a Let's Encrypt certificate for a domain set in their `.env` file ([docker/README.md](../docker/README.md)).
+
+electrs reloads the certificate when `ssl_certfile` or `ssl_keyfile` change (checked at most every 10 seconds, when a client connects), so renewals need no restart. Connections opened before keep the previous certificate.
 
 ### Tor hidden service
 

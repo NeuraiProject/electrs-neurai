@@ -18,8 +18,9 @@ use parking_lot::Mutex;
 
 use std::io::{self, BufRead, Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
 /// Kind of Electrum listener.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,10 +62,7 @@ impl Service {
 }
 
 /// Load the PEM certificate chain and private key used by `ssl://` and `wss://`.
-pub(crate) fn load_tls_config(
-    certfile: &Path,
-    keyfile: &Path,
-) -> Result<Arc<rustls::ServerConfig>> {
+fn load_tls_config(certfile: &Path, keyfile: &Path) -> Result<Arc<rustls::ServerConfig>> {
     use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 
     let certs = CertificateDer::pem_file_iter(certfile)
@@ -84,6 +82,77 @@ pub(crate) fn load_tls_config(
         .with_single_cert(certs, key)
         .context("invalid TLS certificate or key")?;
     Ok(Arc::new(config))
+}
+
+/// The certificate of `ssl://` and `wss://`, reloaded when its files change (a
+/// renewal by certbot, for instance): connections accepted after that use the new
+/// certificate, open ones keep theirs. A certificate that fails to load (a key that
+/// does not match yet, while the files are being replaced) is retried later.
+pub(crate) struct TlsCertificate {
+    certfile: PathBuf,
+    keyfile: PathBuf,
+    /// How often a new connection checks the files.
+    check_every: Duration,
+    /// Files modified more recently than this may still be being written.
+    settle: Duration,
+    state: Mutex<TlsState>,
+}
+
+struct TlsState {
+    config: Arc<rustls::ServerConfig>,
+    /// Modification times of the files `config` was loaded from.
+    loaded: Option<(SystemTime, SystemTime)>,
+    next_check: Instant,
+}
+
+fn modification_times(certfile: &Path, keyfile: &Path) -> Option<(SystemTime, SystemTime)> {
+    let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    Some((modified(certfile)?, modified(keyfile)?))
+}
+
+impl TlsCertificate {
+    pub(crate) fn load(certfile: &Path, keyfile: &Path) -> Result<Self> {
+        let loaded = modification_times(certfile, keyfile);
+        let config = load_tls_config(certfile, keyfile)?;
+        let check_every = Duration::from_secs(10);
+        Ok(Self {
+            certfile: certfile.to_owned(),
+            keyfile: keyfile.to_owned(),
+            check_every,
+            settle: Duration::from_secs(2),
+            state: Mutex::new(TlsState {
+                config,
+                loaded,
+                next_check: Instant::now() + check_every,
+            }),
+        })
+    }
+
+    /// The TLS configuration for a new connection.
+    pub(crate) fn config(&self) -> Arc<rustls::ServerConfig> {
+        let mut state = self.state.lock();
+        let now = Instant::now();
+        if now >= state.next_check {
+            state.next_check = now + self.check_every;
+            let times = modification_times(&self.certfile, &self.keyfile);
+            let settled = times.is_some_and(|(cert, key)| {
+                [cert, key]
+                    .iter()
+                    .all(|t| t.elapsed().is_ok_and(|age| age >= self.settle))
+            });
+            if times != state.loaded && settled {
+                match load_tls_config(&self.certfile, &self.keyfile) {
+                    Ok(config) => {
+                        info!("loaded the new TLS certificate {}", self.certfile.display());
+                        state.config = config;
+                        state.loaded = times;
+                    }
+                    Err(e) => warn!("keeping the current TLS certificate: {:#}", e),
+                }
+            }
+        }
+        Arc::clone(&state.config)
+    }
 }
 
 // ─── TLS session shared by the reading thread and the writers ────────────────
@@ -524,6 +593,45 @@ mod tests {
     /// Self-signed P-256 certificate for `localhost`, valid until 2126 (tests only).
     const TEST_CERT: &str = "-----BEGIN CERTIFICATE-----\nMIIBkjCCATigAwIBAgIUDx0PAu2Spp9KUduzdxhs8HYCmCwwCgYIKoZIzj0EAwIw\nFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTExNDIzMjc0NVoYDzIxMjYxMDIx\nMjMyNzQ1WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO\nPQMBBwNCAARpVa33PlptV4TCEyf1/kmciLD/y58zq8oUQiHFQDUg+OGrb5NMEF+w\nU41QUIQu5b1r8U0R5GbIlq+3gVW4MPbmo2YwZDAdBgNVHQ4EFgQUeAywKP6DHgB5\nQoLePP0MZvF0RIgwHwYDVR0jBBgwFoAUeAywKP6DHgB5QoLePP0MZvF0RIgwFAYD\nVR0RBA0wC4IJbG9jYWxob3N0MAwGA1UdEwEB/wQCMAAwCgYIKoZIzj0EAwIDSAAw\nRQIhANFhrKcqGc6wOrdGOXkH8BkyL36FcuLi6A+pviLSUGb4AiAp3LPmKITvLVIM\n/ug2HOXlGBJpg8Ir77hvcn6IlXVBUw==\n-----END CERTIFICATE-----\n";
     const TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgeLAjFV+6QYuBlT5g\n9XuIw+oN0mgRViF6uEZWikLhTEahRANCAARpVa33PlptV4TCEyf1/kmciLD/y58z\nq8oUQiHFQDUg+OGrb5NMEF+wU41QUIQu5b1r8U0R5GbIlq+3gVW4MPbm\n-----END PRIVATE KEY-----\n";
+
+    /// A second certificate for `localhost`, to test reloading.
+    const TEST_CERT2: &str = "-----BEGIN CERTIFICATE-----\nMIIBkjCCATigAwIBAgIUAgzt/jD0ACSIt46/GLJn77cWMlowCgYIKoZIzj0EAwIw\nFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTExNTA4MjY1OVoYDzIxMjYxMDIy\nMDgyNjU5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO\nPQMBBwNCAARApk0jAIm4Ck7vJNUev1YhC8hi6BYDbbeJIrk9Jg5sEmBMFwi8B3hz\n3KmfiJC3sYts9Nq0Zv8x/aHlrY9bg7yro2YwZDAdBgNVHQ4EFgQU4+nzincwtNbi\nO7DAREhMadD/2cYwHwYDVR0jBBgwFoAU4+nzincwtNbiO7DAREhMadD/2cYwFAYD\nVR0RBA0wC4IJbG9jYWxob3N0MAwGA1UdEwEB/wQCMAAwCgYIKoZIzj0EAwIDSAAw\nRQIgGWjyNlzXStZu3omI4mDlWXuy9gTSReLXRss9lBV6v+QCIQDdiW48loWUMgNz\na2qhAb5ax91Qec7hImQLp2cAWJkU+A==\n-----END CERTIFICATE-----\n";
+    const TEST_KEY2: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgXaKTMglpwRhf6rP+\nKJ9z6R4ZPjnpqE7Ni1UaBi7KdPGhRANCAARApk0jAIm4Ck7vJNUev1YhC8hi6BYD\nbbeJIrk9Jg5sEmBMFwi8B3hz3KmfiJC3sYts9Nq0Zv8x/aHlrY9bg7yr\n-----END PRIVATE KEY-----\n";
+
+    #[test]
+    fn tls_certificate_reloads_when_its_files_change() {
+        let dir = std::env::temp_dir().join(format!("electrs-tls-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
+        let write = |path: &Path, pem: &str| {
+            std::thread::sleep(Duration::from_millis(20)); // a new modification time
+            std::fs::write(path, pem).unwrap();
+        };
+        write(&cert, TEST_CERT);
+        write(&key, TEST_KEY);
+        let mut tls = TlsCertificate::load(&cert, &key).unwrap();
+        tls.check_every = Duration::ZERO;
+        tls.settle = Duration::ZERO;
+        tls.state.lock().next_check = Instant::now();
+        let first = tls.config();
+        assert!(Arc::ptr_eq(&first, &tls.config()), "unchanged files");
+
+        // Half-replaced: the new certificate with the old key is rejected.
+        write(&cert, TEST_CERT2);
+        assert!(Arc::ptr_eq(&first, &tls.config()), "mismatched key");
+
+        write(&key, TEST_KEY2);
+        let second = tls.config();
+        assert!(!Arc::ptr_eq(&first, &second), "renewed certificate");
+        assert!(Arc::ptr_eq(&second, &tls.config()));
+
+        // Files still being written are left alone until they settle.
+        tls.settle = Duration::from_secs(3600);
+        write(&cert, TEST_CERT);
+        write(&key, TEST_KEY);
+        assert!(Arc::ptr_eq(&second, &tls.config()), "unsettled files");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     fn test_server_config() -> Arc<rustls::ServerConfig> {
         let dir = std::env::temp_dir().join(format!("electrs-tls-test-{}", std::process::id()));
