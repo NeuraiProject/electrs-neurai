@@ -79,8 +79,10 @@ kept meanwhile.
 
 **Docker.** The mainnet and testnet stacks are configured with a `.env` file
 (`.env.example` in each directory): RPC credentials shared by the node and
-electrs, ports, electrs options and a domain. With `DOMAIN` set, a `letsencrypt`
-service (certbot, HTTP-01, no DNS API) gets and renews a certificate for it.
+electrs, ports, electrs options and a domain. With `DOMAIN` and `CLOUDFLARE_API_TOKEN` set,
+a `letsencrypt` service (certbot, DNS-01 through the Cloudflare API, no port to
+open) checks that the domain is in a zone the token can see, then gets and
+renews a certificate for it.
 `docker/*/electrs/config.toml` is gone: set `NEURAI_RPC_PASSWORD` in `.env`. The
 testnet stack now builds (its node directory was misplaced), uses ports
 60001/60002/60004 so it can run next to mainnet, and publishes node RPC on

@@ -1,7 +1,8 @@
 # Docker stacks
 
 Each stack runs a Neurai node, electrs-neurai (`tcp://`, `ssl://`, `wss://`) and a
-`letsencrypt` service that gets a free certificate when a domain is configured.
+`letsencrypt` service that gets a free certificate through the Cloudflare API
+when a domain is configured.
 
 | Stack      | Node                                      | electrs ports (tcp / ssl / wss) | Node P2P / RPC |
 |------------|-------------------------------------------|---------------------------------|----------------|
@@ -43,19 +44,25 @@ Everything is set in `.env`; its comments describe each setting.
 Without `DOMAIN`, electrs creates a self-signed certificate. electrum-neurai
 accepts it on first use; browsers and most WebSocket clients do not.
 
-With `DOMAIN=electrum.example.org`, the `letsencrypt` service gets a Let's
-Encrypt certificate by proving control of the domain (HTTP-01 challenge). No
-DNS provider API is needed:
+With `DOMAIN=electrum.example.org` and `CLOUDFLARE_API_TOKEN`, the
+`letsencrypt` service gets a Let's Encrypt certificate through the Cloudflare
+API: certbot proves control of the domain with a TXT record (DNS-01), so no
+port needs to be open, and a web server already on port 80 is left alone.
 
-1. Point the domain's `A` record (and `AAAA`, if any) at the server. On
-   Cloudflare, set the record to **DNS only** (grey cloud): `ssl://` cannot go
-   through Cloudflare's proxy.
-2. Make sure port 80 of the server is reachable from the internet. certbot
-   uses the host network and only listens on it for the few seconds of each
-   validation.
-3. Optionally, test with `LETSENCRYPT_STAGING=1` first (untrusted certificates,
-   no rate limits), then set it back to `0`.
+1. The domain must be in your Cloudflare account. Point its `A` record (and
+   `AAAA`, if any) at the server, set to **DNS only** (grey cloud): `ssl://`
+   cannot go through Cloudflare's proxy.
+2. Create the token: dash.cloudflare.com → My Profile → API Tokens → Create
+   Token → template **Edit zone DNS** → Zone Resources: Include, Specific
+   zone, the zone of `DOMAIN`. Put it in `CLOUDFLARE_API_TOKEN`.
+3. Optionally, test with `LETSENCRYPT_STAGING=1` first (untrusted
+   certificates, no rate limits), then set it back to `0`.
 4. `docker compose up -d`, then check `docker compose logs letsencrypt`.
+
+Before each request the service checks, with the token, that `DOMAIN` is in a
+Cloudflare zone the token can see; if not, it says so and asks Let's Encrypt
+for nothing. It also warns when the domain has no `A`/`AAAA`/`CNAME` record, or
+when the record is proxied.
 
 The service checks the certificate twice a day and renews it when it is due.
 electrs reloads the certificate files when they change, without restarting:
@@ -79,7 +86,7 @@ and `wss://electrum.example.org:50004` from web clients, or
   image. It writes the RPC credentials to electrs' config file, derives the
   reported services from `DOMAIN`, and creates the self-signed certificate.
 * [letsencrypt.sh](letsencrypt.sh): the `letsencrypt` service, run in the
-  `certbot/certbot` image.
+  `certbot/dns-cloudflare` image.
 * [node-entrypoint.sh](node-entrypoint.sh): keeps the mainnet node's RPC
   credentials in step with `.env`.
 * `mainnet/electrs/Dockerfile`, `testnet/electrs/Dockerfile`: build electrs from

@@ -138,21 +138,20 @@ services:
         condition: service_healthy
 
   letsencrypt:
-    # Gets and renews a Let's Encrypt certificate for DOMAIN (idle when DOMAIN
-    # is empty). See ../letsencrypt.sh.
-    image: certbot/certbot:v4.0.0
+    # Gets and renews a Let's Encrypt certificate for DOMAIN through the
+    # Cloudflare API (DNS-01: no port needs to be open); idle when DOMAIN is
+    # empty. See ../letsencrypt.sh.
+    image: certbot/dns-cloudflare:v4.0.0
     container_name: neurai-mainnet-letsencrypt
     restart: unless-stopped
     logging: *logging
-    # Host network: certbot binds port 80 only while a validation runs, so the
-    # port stays free the rest of the time.
-    network_mode: host
     entrypoint: ["/bin/sh", "/letsencrypt.sh"]
     environment:
       DOMAIN: "${DOMAIN:-}"
+      CLOUDFLARE_API_TOKEN: "${CLOUDFLARE_API_TOKEN:-}"
+      CLOUDFLARE_PROPAGATION_SECONDS: "${CLOUDFLARE_PROPAGATION_SECONDS:-30}"
       LETSENCRYPT_EMAIL: "${LETSENCRYPT_EMAIL:-}"
       LETSENCRYPT_STAGING: "${LETSENCRYPT_STAGING:-0}"
-      ACME_HTTP_PORT: "${ACME_HTTP_PORT:-80}"
     volumes:
       - ../letsencrypt.sh:/letsencrypt.sh:ro
       - letsencrypt:/etc/letsencrypt
