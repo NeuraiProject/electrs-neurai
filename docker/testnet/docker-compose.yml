@@ -22,9 +22,9 @@ services:
     # ./node/entrypoint.sh rewrites neurai.conf from these on every start.
     environment:
       NEURAI_TESTNET: "1"
-      # NEURAI_LISTEN must be 1: electrs bulk-downloads blocks over P2P. Several
-      # nodes on one host don't collide inside their containers: give each
-      # stack its own NODE_P2P_PORT / NODE_P2P_LISTEN in .env instead.
+      # NEURAI_LISTEN must be 1: electrs bulk-downloads blocks over P2P, inside
+      # the stack. Whether other nodes can connect from outside is up to
+      # NODE_P2P_LISTEN in .env (127.0.0.1 by default: no).
       NEURAI_LISTEN: "1"
       NEURAI_REST: "1"
       NEURAI_RPC_USER: "${NEURAI_RPC_USER:-neurai}"
@@ -51,8 +51,10 @@ services:
       - neurai_data:/data
 
     ports:
+      # P2P on 127.0.0.1 unless NODE_P2P_LISTEN says otherwise: electrs reaches
+      # the node inside the stack, other nodes only need it to connect in.
       # An empty NODE_P2P_PORT / NODE_RPC_PORT: a free port chosen by Docker.
-      - "${NODE_P2P_LISTEN:+${NODE_P2P_LISTEN}:}${NODE_P2P_PORT-19100}:19100"
+      - "${NODE_P2P_LISTEN:-127.0.0.1}:${NODE_P2P_PORT-19100}:19100"
       - "127.0.0.1:${NODE_RPC_PORT-19101}:19101"
 
     networks:

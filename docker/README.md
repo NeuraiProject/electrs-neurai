@@ -9,8 +9,8 @@ when a domain is configured.
 | `mainnet/` | official `neuraiproject/neurai-node:v1.0.7` | 50001 / 50002 / 50004           | 19000 / 19001  |
 | `testnet/` | built from the `DePIN-Test` branch         | 60001 / 60002 / 60004           | 19100 / 19101  |
 
-The default ports differ, so both stacks can run on the same host. Node RPC is
-published on `127.0.0.1` only.
+The default ports differ, so both stacks can run on the same host. Node RPC and
+P2P are published on `127.0.0.1` only (see below to let other nodes connect in).
 
 ## Start
 
@@ -55,11 +55,17 @@ docker compose up -d --build
 
 Only the ports published on the host can collide, never the nodes or electrs
 inside their containers (the node must keep `listen=1`: electrs downloads
-blocks over P2P). Each stack needs its own ports, or its own address of the
-host: `ELECTRUM_LISTEN` and `NODE_P2P_LISTEN` publish the ports on one address
-only (e.g. `203.0.113.5`, `[2001:db8::5]` or `127.0.0.1`) instead of every
-address. An empty `NODE_P2P_PORT` or `NODE_RPC_PORT` lets Docker pick a free
-port.
+blocks over P2P inside the stack). Each stack needs its own ports, or its own
+address of the host: `ELECTRUM_LISTEN` publishes the Electrum ports on one
+address only (e.g. `203.0.113.5`, `[2001:db8::5]` or `127.0.0.1`) instead of
+every address. An empty `NODE_P2P_PORT` or `NODE_RPC_PORT` lets Docker pick a
+free port.
+
+The node's P2P port is published on `127.0.0.1` only (`NODE_P2P_LISTEN`):
+the node connects out to its peers, but other nodes can't connect in. Set
+`NODE_P2P_LISTEN=0.0.0.0` (or a public address of the host) to accept them.
+Docker's published ports are not filtered by the host's firewall (ufw), so
+this setting is what keeps the port closed.
 
 Setting `COMPOSE_PROJECT_NAME` on an existing stack starts it with new, empty
 volumes: the node syncs again. The containers used to be named
