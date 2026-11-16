@@ -175,10 +175,10 @@ renews a certificate for it.
 `docker/*/electrs/config.toml` is gone: set `NEURAI_RPC_PASSWORD` in `.env`. The
 testnet stack now builds (its node directory was misplaced), uses ports
 60001/60002/60004 so it can run next to mainnet, and publishes node RPC on
-127.0.0.1 only. The node's P2P port is now published on 127.0.0.1 too, unless
-`NODE_P2P_LISTEN` says otherwise (electrs reaches the node inside the stack,
-and Docker's published ports bypass the host's firewall). Container names come
-from `COMPOSE_PROJECT_NAME` (the directory's name by default) and
+127.0.0.1 only. Now only `ssl://` and `wss://` are published: electrs has no
+`tcp://` (plain text) listener, and the node's P2P and RPC ports are only used
+inside the stack, by electrs, so every stack uses the same ones there. Container names
+come from `COMPOSE_PROJECT_NAME` (the directory's name by default) and
 `ELECTRUM_LISTEN` picks the address of the Electrum ports, so several stacks
 can run on one host. See [docker/README.md](docker/README.md).
 

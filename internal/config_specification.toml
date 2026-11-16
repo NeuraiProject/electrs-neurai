@@ -189,7 +189,7 @@ doc = "Don't sync mempool - queries will show only confirmed transactions."
 
 [[switch]]
 name = "disable_electrum_rpc"
-doc = "Disable Electrum RPC server - only sync and index blocks."
+doc = "Disable the tcp:// listener (electrum_rpc_addr). The ssl://, ws:// and wss:// listeners, when set, keep working; without them, electrs only syncs and indexes blocks."
 
 [[switch]]
 name = "sync_once"

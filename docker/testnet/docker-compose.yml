@@ -1,4 +1,4 @@
-# Neurai testnet (DePIN-Test) node + electrs-neurai (tcp://, ssl://, wss://).
+# Neurai testnet (DePIN-Test) node + electrs-neurai (ssl://, wss://).
 # Settings live in .env:  cp .env.example .env  (see the comments there).
 
 x-logging: &logging
@@ -23,8 +23,7 @@ services:
     environment:
       NEURAI_TESTNET: "1"
       # NEURAI_LISTEN must be 1: electrs bulk-downloads blocks over P2P, inside
-      # the stack. Whether other nodes can connect from outside is up to
-      # NODE_P2P_LISTEN in .env (127.0.0.1 by default: no).
+      # the stack (the P2P port is not published on the host).
       NEURAI_LISTEN: "1"
       NEURAI_REST: "1"
       NEURAI_RPC_USER: "${NEURAI_RPC_USER:-neurai}"
@@ -50,12 +49,13 @@ services:
     volumes:
       - neurai_data:/data
 
-    ports:
-      # P2P on 127.0.0.1 unless NODE_P2P_LISTEN says otherwise: electrs reaches
-      # the node inside the stack, other nodes only need it to connect in.
-      # An empty NODE_P2P_PORT / NODE_RPC_PORT: a free port chosen by Docker.
-      - "${NODE_P2P_LISTEN:-127.0.0.1}:${NODE_P2P_PORT-19100}:19100"
-      - "127.0.0.1:${NODE_RPC_PORT-19101}:19101"
+    # P2P and RPC for electrs, inside this stack only (not published on the
+    # host): every stack on a host uses the same ports without colliding. The
+    # node connects out to its peers; its RPC is reachable with
+    # `docker compose exec neuraid neurai-cli -datadir=/data ...`.
+    expose:
+      - "19100"
+      - "19101"
 
     networks:
       - neurai_net
@@ -92,7 +92,6 @@ services:
       DAEMON_RPC_PASSWORD: "${NEURAI_RPC_PASSWORD:?set NEURAI_RPC_PASSWORD in .env (cp .env.example .env)}"
       # Names the self-signed certificate and the reported services.
       DOMAIN: "${DOMAIN:-}"
-      PUBLIC_TCP_PORT: "${ELECTRUM_TCP_PORT:-60001}"
       PUBLIC_SSL_PORT: "${ELECTRUM_SSL_PORT:-60002}"
       PUBLIC_WSS_PORT: "${ELECTRUM_WSS_PORT:-60004}"
       # Any electrs option can be set as ELECTRS_<OPTION> (empty = default).
@@ -116,8 +115,8 @@ services:
       - "neuraid:19101"
       - "--daemon-p2p-addr"
       - "neuraid:19100"
-      - "--electrum-rpc-addr"
-      - "0.0.0.0:60001"
+      # no tcp:// (plain text): only ssl:// and wss://
+      - "--disable-electrum-rpc"
       - "--electrum-ssl-addr"
       - "0.0.0.0:60002"
       - "--electrum-wss-addr"
@@ -128,7 +127,6 @@ services:
       - "/etc/electrs-tls/key.pem"
 
     ports:
-      - "${ELECTRUM_LISTEN:+${ELECTRUM_LISTEN}:}${ELECTRUM_TCP_PORT:-60001}:60001"   # tcp://
       - "${ELECTRUM_LISTEN:+${ELECTRUM_LISTEN}:}${ELECTRUM_SSL_PORT:-60002}:60002"   # ssl://  (Electrum desktop wallets)
       - "${ELECTRUM_LISTEN:+${ELECTRUM_LISTEN}:}${ELECTRUM_WSS_PORT:-60004}:60004"   # wss://  (browser wallets, indexers)
 
