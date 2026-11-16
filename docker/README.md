@@ -39,6 +39,36 @@ Everything is set in `.env`; its comments describe each setting.
   the `electrs` service (see `electrs-neurai --help`). Empty values keep
   electrs' default.
 
+## Several stacks on one host
+
+Each stack is named after its directory (`mainnet`, `testnet`), or after
+`COMPOSE_PROJECT_NAME` in its `.env`: its containers are `<name>-node`,
+`<name>-electrs` and `<name>-letsencrypt`, and its volumes and network are
+prefixed with `<name>`. A copy of a directory is therefore another stack:
+
+```bash
+cp -r docker/mainnet docker/mainnet-b
+cd docker/mainnet-b && cp .env.example .env
+# edit .env: other ports (ELECTRUM_*_PORT, NODE_P2P_PORT, NODE_RPC_PORT)
+docker compose up -d --build
+```
+
+Only the ports published on the host can collide, never the nodes or electrs
+inside their containers (the node must keep `listen=1`: electrs downloads
+blocks over P2P). Each stack needs its own ports, or its own address of the
+host: `ELECTRUM_LISTEN` and `NODE_P2P_LISTEN` publish the ports on one address
+only (e.g. `203.0.113.5`, `[2001:db8::5]` or `127.0.0.1`) instead of every
+address. An empty `NODE_P2P_PORT` or `NODE_RPC_PORT` lets Docker pick a free
+port.
+
+Setting `COMPOSE_PROJECT_NAME` on an existing stack starts it with new, empty
+volumes: the node syncs again. The containers used to be named
+`neurai-electrs-mainnet-node`, `neurai-mainnet-electrs`, ...; the next
+`docker compose up -d` replaces them with the new names, keeping the volumes.
+
+Several electrs can also share one node (each with its own DB volume and
+ports), pointing `--daemon-rpc-addr` and `--daemon-p2p-addr` at it.
+
 ## Domain and certificate
 
 Without `DOMAIN`, electrs creates a self-signed certificate. electrum-neurai

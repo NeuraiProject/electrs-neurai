@@ -88,6 +88,48 @@ type = "crate::config::ResolvAddr"
 doc = "Electrum server 'addr:port' to listen on for WebSocket over TLS (wss://) connections (disabled unless set; requires ssl_certfile and ssl_keyfile)"
 
 [[param]]
+name = "rpc_max_connections"
+type = "usize"
+doc = "Most Electrum connections at once, from all IPs (0 - no limit)"
+default = "1000"
+
+[[param]]
+name = "rpc_max_connections_per_ip"
+type = "usize"
+doc = "Most Electrum connections at once from one IP, or one /64 network for IPv6 (0 - no limit)"
+default = "32"
+
+[[param]]
+name = "rpc_cost_soft_limit"
+type = "u64"
+doc = "Cost over which the requests of an IP are slowed down. A request costs 1, plus 1 per 10 ms of work and per 64 KiB of reply; each IP's cost decays by rpc_cost_decay_per_sec"
+default = "5000"
+
+[[param]]
+name = "rpc_cost_hard_limit"
+type = "u64"
+doc = "Cost over which an IP is banned for rpc_ban_secs: its connections are closed and new ones refused (0 - never ban)"
+default = "50000"
+
+[[param]]
+name = "rpc_cost_decay_per_sec"
+type = "u64"
+doc = "Cost forgiven to each IP per second"
+default = "100"
+
+[[param]]
+name = "rpc_ban_secs"
+type = "u64"
+doc = "How long an IP stays banned"
+default = "600"
+
+[[param]]
+name = "rpc_limits_exempt"
+type = "String"
+doc = "Comma-separated IPs without connection or cost limits (local monitoring, a trusted proxy)"
+default = "String::new()"
+
+[[param]]
 name = "ssl_certfile"
 type = "std::path::PathBuf"
 doc = "PEM file with the TLS certificate chain for the ssl:// and wss:// listeners"

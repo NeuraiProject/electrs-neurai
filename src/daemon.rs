@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use bitcoin::hashes::hex::FromHex;
 use bitcoin::{Amount, BlockHash, Transaction, Txid};
 use bitcoincore_rpc::{jsonrpc, Auth, Client, RpcApi};
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, Sender};
 use parking_lot::Mutex;
 use serde::Serialize;
 use serde_json::{json, value::RawValue, Value};
@@ -169,9 +169,74 @@ fn rpc_connect(config: &Config) -> Result<Client> {
     )))
 }
 
+/// P2P connections for the clients' queries, apart from the indexer's: a
+/// query reading thousands of blocks doesn't hold back new blocks, and a few
+/// run at once.
+const QUERY_CONNECTIONS: usize = 3;
+
 pub struct Daemon {
+    /// The indexer's: headers, new blocks and their notifications.
     p2p: Mutex<Connection>,
+    queries: QueryConnections,
     rpc: Client,
+}
+
+/// A pool of P2P connections, each used by one query at a time. A connection
+/// that failed is replaced by a new one when next needed.
+struct QueryConnections {
+    put: Sender<Option<Connection>>,
+    take: Receiver<Option<Connection>>,
+    address: std::net::SocketAddr,
+    metrics: Metrics,
+    params: &'static NetworkParams,
+}
+
+impl QueryConnections {
+    fn connect(
+        address: std::net::SocketAddr,
+        metrics: &Metrics,
+        params: &'static NetworkParams,
+    ) -> Result<Self> {
+        let (put, take) = crossbeam_channel::bounded(QUERY_CONNECTIONS);
+        for _ in 0..QUERY_CONNECTIONS {
+            let conn = Connection::connect(address, metrics, params)?;
+            put.send(Some(conn)).expect("room for every connection");
+        }
+        Ok(Self {
+            put,
+            take,
+            address,
+            metrics: metrics.clone(),
+            params,
+        })
+    }
+
+    fn for_blocks<B, F>(&self, blockhashes: B, func: F) -> Result<()>
+    where
+        B: IntoIterator<Item = BlockHash>,
+        F: FnMut(BlockHash, SerBlock),
+    {
+        let blockhashes: Vec<BlockHash> = blockhashes.into_iter().collect();
+        if blockhashes.is_empty() {
+            return Ok(());
+        }
+        let conn = crate::limits::waiting(|| self.take.recv()).expect("the pool keeps a sender");
+        let mut conn = match conn {
+            Some(conn) => conn,
+            None => match Connection::connect(self.address, &self.metrics, self.params) {
+                Ok(conn) => conn,
+                Err(e) => {
+                    self.put.send(None).expect("room for the connection");
+                    return Err(e.context("p2p query connection failed"));
+                }
+            },
+        };
+        let result = conn.for_blocks(blockhashes, func);
+        // after an error, the blocks still on their way would go to the next query
+        let conn = result.is_ok().then_some(conn);
+        self.put.send(conn).expect("room for the connection");
+        result
+    }
 }
 
 impl Daemon {
@@ -215,7 +280,8 @@ impl Daemon {
             metrics,
             params,
         )?);
-        Ok(Self { p2p, rpc })
+        let queries = QueryConnections::connect(config.daemon_p2p_addr, metrics, params)?;
+        Ok(Self { p2p, queries, rpc })
     }
 
     /// `estimatesmartfee` as ElectrumX calls it: the daemon's `feerate` float
@@ -379,7 +445,17 @@ impl Daemon {
         self.p2p.lock().get_new_headers(chain)
     }
 
+    /// Blocks for a client query, over one of the query connections.
     pub(crate) fn for_blocks<B, F>(&self, blockhashes: B, func: F) -> Result<()>
+    where
+        B: IntoIterator<Item = BlockHash>,
+        F: FnMut(BlockHash, SerBlock),
+    {
+        self.queries.for_blocks(blockhashes, func)
+    }
+
+    /// Blocks to index, over the indexer's connection.
+    pub(crate) fn for_blocks_to_index<B, F>(&self, blockhashes: B, func: F) -> Result<()>
     where
         B: IntoIterator<Item = BlockHash>,
         F: FnMut(BlockHash, SerBlock),

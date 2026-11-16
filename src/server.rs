@@ -1,39 +1,58 @@
 use anyhow::{Context, Result};
-use crossbeam_channel::{select, unbounded, Sender};
-use rayon::prelude::*;
+use crossbeam_channel::select;
+use parking_lot::Mutex;
 
 use std::{
     collections::hash_map::HashMap,
-    iter::once,
-    net::{SocketAddr, TcpListener},
+    net::{IpAddr, SocketAddr, TcpListener},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
+    time::Instant,
 };
 
 use crate::{
     config::Config,
     electrum::{Client, Rpc},
+    limits::{take_waited, waiting, IpKey, RateLimits, Refusal, Verdict},
     metrics::{self, Metrics},
     signals::ExitError,
     thread::spawn,
     transport::{Connection, Service, TlsCertificate, Writer},
 };
 
+/// Threads sending notifications: a client that doesn't read can hold one
+/// for a while (see `Connection::accept`), never the indexer.
+const NOTIFY_THREADS: usize = 4;
+
+/// A connected client. Its requests are handled by its own thread, one at a
+/// time; notifications are sent by the notification threads when it is idle,
+/// otherwise by its thread after the request it is busy with.
 struct Peer {
     id: usize,
-    client: Client,
+    ip: IpAddr,
+    client: Mutex<Client>,
     writer: Writer,
+    /// New blocks or mempool transactions may bring it notifications.
+    pending: AtomicBool,
+    /// A notification thread is going to look at it.
+    queued: AtomicBool,
 }
 
 impl Peer {
-    fn new(id: usize, writer: Writer) -> Self {
-        let client = Client::default();
-        Self { id, client, writer }
+    fn new(id: usize, ip: IpAddr, writer: Writer) -> Self {
+        Self {
+            id,
+            ip,
+            client: Mutex::new(Client::default()),
+            writer,
+            pending: AtomicBool::new(false),
+            queued: AtomicBool::new(false),
+        }
     }
 
-    fn send(&mut self, values: Vec<String>) -> Result<()> {
+    fn send(&self, values: Vec<String>) -> Result<()> {
         for value in values {
             debug!("{}: send {}", self.id, value);
             self.writer
@@ -43,8 +62,50 @@ impl Peer {
         Ok(())
     }
 
-    fn disconnect(self) {
+    /// Sends the pending notifications, with `client` locked.
+    fn notify(&self, rpc: &Rpc, client: &mut Client) -> Result<()> {
+        if !self.pending.swap(false, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let notifications = rpc
+            .update_client(client)
+            .context("failed to generate notifications")?;
+        if client.take_notify_again() {
+            // checked again at the next round, or after its next request
+            self.pending.store(true, Ordering::SeqCst);
+        }
+        self.send(notifications)
+            .context("failed to send notifications")
+    }
+
+    fn disconnect(&self) {
         self.writer.close();
+    }
+}
+
+type Peers = Arc<Mutex<HashMap<usize, Arc<Peer>>>>;
+
+/// Everything a connection thread needs.
+#[derive(Clone)]
+struct Shared {
+    rpc: Arc<Rpc>,
+    peers: Peers,
+    limits: Arc<RateLimits>,
+}
+
+impl Shared {
+    /// Closes every connection of `ip` (or of its IPv6 /64).
+    fn disconnect_ip(&self, ip: IpAddr) {
+        let key = IpKey::of(ip);
+        let peers: Vec<Arc<Peer>> = self
+            .peers
+            .lock()
+            .values()
+            .filter(|peer| IpKey::of(peer.ip) == key)
+            .cloned()
+            .collect();
+        // not under the lock: closing waits for a send in progress
+        peers.iter().for_each(|peer| peer.disconnect());
     }
 }
 
@@ -79,15 +140,42 @@ pub fn run() -> Result<()> {
     result.context("electrs failed")
 }
 
+/// Saves what is worth keeping for the next run, whatever way `serve` ends.
+struct SaveOnExit(Arc<Rpc>);
+
+impl Drop for SaveOnExit {
+    fn drop(&mut self) {
+        self.0.save_utxo_snapshots();
+    }
+}
+
 fn serve() -> Result<()> {
     let config = Config::from_args();
     let metrics = Metrics::new(config.monitoring_addr)?;
 
-    let (server_tx, server_rx) = unbounded();
     let tls = match (&config.ssl_certfile, &config.ssl_keyfile) {
         (Some(cert), Some(key)) => Some(Arc::new(TlsCertificate::load(cert, key)?)),
         _ => None,
     };
+    let duration = metrics.histogram_vec(
+        "server_loop_duration",
+        "server loop duration",
+        "step",
+        metrics::default_duration_buckets(),
+    );
+    let rpc = Arc::new(Rpc::new(&config, metrics)?);
+    let _save = SaveOnExit(Arc::clone(&rpc));
+    let shared = Shared {
+        rpc: Arc::clone(&rpc),
+        peers: Default::default(),
+        limits: Arc::new(RateLimits::new(config.limits.clone())),
+    };
+    let notifier = rayon::ThreadPoolBuilder::new()
+        .num_threads(NOTIFY_THREADS)
+        .thread_name(|i| format!("notify_{}", i))
+        .build()
+        .context("failed to start the notification threads")?;
+
     let next_peer_id = Arc::new(AtomicUsize::new(0));
     for (service, addr) in listeners(&config) {
         let listener = TcpListener::bind(addr)
@@ -97,35 +185,22 @@ fn serve() -> Result<()> {
             service.scheme(),
             listener.local_addr()?
         );
-        let tx = server_tx.clone();
         let tls = tls.clone();
         let ids = Arc::clone(&next_peer_id);
-        spawn("accept_loop", move || accept_loop(listener, service, tls, ids, tx)); // detach accepting thread
+        let shared = shared.clone();
+        spawn("accept_loop", move || {
+            accept_loop(listener, service, tls, ids, shared)
+        }); // detach accepting thread
     }
-    // `server_tx` stays alive here, so the channel never disconnects even when
-    // no listener is enabled (`disable_electrum_rpc`).
 
-    let server_batch_size = metrics.histogram_vec(
-        "server_batch_size",
-        "# of server events handled in a single batch",
-        "type",
-        metrics::default_size_buckets(),
-    );
-    let duration = metrics.histogram_vec(
-        "server_loop_duration",
-        "server loop duration",
-        "step",
-        metrics::default_duration_buckets(),
-    );
-    let mut rpc = Rpc::new(&config, metrics)?;
-
+    // Client requests are handled by their connections' threads: this one
+    // only indexes new blocks and the mempool, and queues notifications.
     let new_block_rx = rpc.new_block_notification();
-    let mut peers = HashMap::<usize, Peer>::new();
     loop {
         // initial sync and compaction may take a few hours
-        while server_rx.is_empty() {
-            let done = duration.observe_duration("sync", || rpc.sync().context("sync failed"))?; // sync a batch of blocks
-            peers = duration.observe_duration("notify", || notify_peers(&rpc, peers)); // peers are disconnected on error
+        loop {
+            let done = duration.observe_duration("sync", || rpc.sync().context("sync failed"))?;
+            duration.observe_duration("notify", || notify_peers(&shared, &notifier));
             if !done {
                 continue; // more blocks to sync
             }
@@ -149,14 +224,6 @@ fn serve() -> Result<()> {
                         return Ok(());
                     }
                 },
-                // Handle Electrum RPC requests
-                recv(server_rx) -> event => {
-                    let first = once(event.context("server disconnected")?);
-                    let rest = server_rx.iter().take(server_rx.len());
-                    let events: Vec<Event> = first.chain(rest).collect();
-                    server_batch_size.observe("recv", events.len() as f64);
-                    duration.observe_duration("handle", || handle_events(&rpc, &mut peers, events));
-                },
                 default(config.wait_duration) => (), // sync and update
             };
             Ok(())
@@ -164,85 +231,26 @@ fn serve() -> Result<()> {
     }
 }
 
-fn notify_peers(rpc: &Rpc, peers: HashMap<usize, Peer>) -> HashMap<usize, Peer> {
-    peers
-        .into_par_iter()
-        .filter_map(|(_, mut peer)| match notify_peer(rpc, &mut peer) {
-            Ok(()) => Some((peer.id, peer)),
-            Err(e) => {
-                error!("failed to notify peer {}: {}", peer.id, e);
-                peer.disconnect();
-                None
-            }
-        })
-        .collect()
-}
-
-fn notify_peer(rpc: &Rpc, peer: &mut Peer) -> Result<()> {
-    let notifications = rpc
-        .update_client(&mut peer.client)
-        .context("failed to generate notifications")?;
-    peer.send(notifications)
-        .context("failed to send notifications")
-}
-
-struct Event {
-    peer_id: usize,
-    msg: Message,
-}
-
-enum Message {
-    New(Writer),
-    Request(String),
-    Done,
-}
-
-fn handle_events(rpc: &Rpc, peers: &mut HashMap<usize, Peer>, events: Vec<Event>) {
-    let mut events_by_peer = HashMap::<usize, Vec<Message>>::new();
-    events
-        .into_iter()
-        .for_each(|e| events_by_peer.entry(e.peer_id).or_default().push(e.msg));
-    for (peer_id, messages) in events_by_peer {
-        handle_peer_events(rpc, peers, peer_id, messages);
-    }
-}
-
-fn handle_peer_events(
-    rpc: &Rpc,
-    peers: &mut HashMap<usize, Peer>,
-    peer_id: usize,
-    messages: Vec<Message>,
-) {
-    let mut lines = vec![];
-    let mut done = false;
-    for msg in messages {
-        match msg {
-            Message::New(writer) => {
-                debug!("{}: connected", peer_id);
-                peers.insert(peer_id, Peer::new(peer_id, writer));
-            }
-            Message::Request(line) => lines.push(line),
-            Message::Done => {
-                done = true;
-                break;
-            }
+/// Marks every peer as having pending notifications, and has the
+/// notification threads send them to the idle ones (without waiting).
+fn notify_peers(shared: &Shared, notifier: &rayon::ThreadPool) {
+    let peers: Vec<Arc<Peer>> = shared.peers.lock().values().cloned().collect();
+    for peer in peers {
+        peer.pending.store(true, Ordering::SeqCst);
+        if peer.queued.swap(true, Ordering::SeqCst) {
+            continue; // a notification thread is about to look at it
         }
-    }
-    let result = match peers.get_mut(&peer_id) {
-        Some(peer) => {
-            let responses = rpc.handle_requests(&mut peer.client, &lines);
-            peer.send(responses)
-        }
-        None => return, // unknown peer
-    };
-    if let Err(e) = result {
-        error!("{}: disconnecting due to {}", peer_id, e);
-        peers.remove(&peer_id).unwrap().disconnect();
-    } else if peers.get(&peer_id).is_some_and(|p| p.client.should_disconnect()) {
-        debug!("{}: disconnecting after reply", peer_id);
-        peers.remove(&peer_id).unwrap().disconnect();
-    } else if done {
-        peers.remove(&peer_id); // already disconnected, just remove from peers' map
+        let rpc = Arc::clone(&shared.rpc);
+        notifier.spawn(move || {
+            peer.queued.store(false, Ordering::SeqCst);
+            // a busy peer gets them from its own thread, after its request
+            if let Some(mut client) = peer.client.try_lock() {
+                if let Err(e) = peer.notify(&rpc, &mut client) {
+                    error!("failed to notify peer {}: {:#}", peer.id, e);
+                    peer.disconnect();
+                }
+            }
+        });
     }
 }
 
@@ -251,7 +259,7 @@ fn accept_loop(
     service: Service,
     tls: Option<Arc<TlsCertificate>>,
     next_peer_id: Arc<AtomicUsize>,
-    server_tx: Sender<Event>,
+    shared: Shared,
 ) -> Result<()> {
     for conn in listener.incoming() {
         let stream = match conn {
@@ -261,54 +269,136 @@ fn accept_loop(
                 continue;
             }
         };
+        let ip = match stream.peer_addr() {
+            Ok(addr) => addr.ip(),
+            Err(e) => {
+                debug!(
+                    "failed to get the address of a {} peer: {}",
+                    service.scheme(),
+                    e
+                );
+                continue;
+            }
+        };
+        match shared.limits.connect(ip) {
+            Ok(()) => (),
+            Err(Refusal::Banned) => {
+                debug!("{}: refused, banned", ip);
+                continue;
+            }
+            Err(Refusal::TooManyConnections) => {
+                debug!("{}: refused, too many connections", ip);
+                continue;
+            }
+            Err(Refusal::Ban) => {
+                warn!(
+                    "banning {} for {:?}: too many connections",
+                    IpKey::of(ip),
+                    shared.limits.ban_duration()
+                );
+                shared.disconnect_ip(ip);
+                continue;
+            }
+        }
         let peer_id = next_peer_id.fetch_add(1, Ordering::Relaxed);
-        let tx = server_tx.clone();
         let tls = tls.as_ref().map(|certificate| certificate.config());
+        let shared = shared.clone();
         spawn("recv_loop", move || {
-            let conn = match Connection::accept(stream, service, tls.as_ref()) {
-                Ok(conn) => conn,
+            let result = match Connection::accept(stream, service, tls.as_ref()) {
+                Ok(conn) => recv_loop(peer_id, ip, conn, &shared),
                 Err(e) => {
-                    debug!("{}: {} connection setup failed: {:#}", peer_id, service.scheme(), e);
-                    return Ok(());
+                    debug!(
+                        "{}: {} connection setup failed: {:#}",
+                        peer_id,
+                        service.scheme(),
+                        e
+                    );
+                    Ok(())
                 }
             };
-            recv_loop(peer_id, conn, tx)
+            shared.limits.disconnect(ip);
+            result
         });
     }
     Ok(())
 }
 
-fn recv_loop(peer_id: usize, mut conn: Connection, server_tx: Sender<Event>) -> Result<()> {
-    let msg = Message::New(conn.writer.clone());
-    server_tx.send(Event { peer_id, msg })?;
+fn recv_loop(peer_id: usize, ip: IpAddr, conn: Connection, shared: &Shared) -> Result<()> {
+    let peer = Arc::new(Peer::new(peer_id, ip, conn.writer.clone()));
+    debug!("{}: connected from {}", peer_id, ip);
+    shared.peers.lock().insert(peer_id, Arc::clone(&peer));
+    let result = serve_peer(&peer, conn, shared);
+    shared.peers.lock().remove(&peer_id);
+    peer.disconnect();
+    debug!("{}: disconnected", peer_id);
+    result
+}
 
+fn serve_peer(peer: &Peer, mut conn: Connection, shared: &Shared) -> Result<()> {
     let mut first = true;
     loop {
-        match conn.recv() {
-            Ok(Some(request)) => {
-                debug!("{}: recv {}", peer_id, request);
-                if first && is_http_request(&request) {
-                    // web scanners: no Electrum client sends HTTP here
-                    debug!("{}: HTTP request, disconnecting", peer_id);
-                    break;
-                }
-                first = false;
-                let msg = Message::Request(request);
-                server_tx.send(Event { peer_id, msg })?;
-            }
+        let request = match conn.recv() {
+            Ok(Some(request)) => request,
             Ok(None) => break,
             Err(e) => {
                 // the client's doing: a reset connection, or binary data
                 // (TLS or other protocols sent to tcp://, scanners)
-                debug!("{}: recv failed: {:#}", peer_id, e);
+                debug!("{}: recv failed: {:#}", peer.id, e);
+                break;
+            }
+        };
+        debug!("{}: recv {}", peer.id, request);
+        if first && is_http_request(&request) {
+            // web scanners: no Electrum client sends HTTP here
+            debug!("{}: HTTP request, disconnecting", peer.id);
+            break;
+        }
+        first = false;
+        if shared.limits.is_banned(peer.ip) {
+            break;
+        }
+
+        take_waited();
+        let start = Instant::now();
+        // a notification thread may hold it: waiting, not work
+        let mut client = waiting(|| peer.client.lock());
+        let (response, calls) = shared.rpc.handle_request(&mut client, &request);
+        let work = start.elapsed().saturating_sub(take_waited());
+        let bytes = response.len();
+        if let Err(e) = peer.send(vec![response]) {
+            error!("{}: disconnecting due to {}", peer.id, e);
+            break;
+        }
+        if client.should_disconnect() {
+            debug!("{}: disconnecting after reply", peer.id);
+            break;
+        }
+        if let Err(e) = peer.notify(&shared.rpc, &mut client) {
+            error!("failed to notify peer {}: {:#}", peer.id, e);
+            break;
+        }
+        drop(client);
+
+        match shared
+            .limits
+            .charge(peer.ip, RateLimits::request_cost(calls, work, bytes))
+        {
+            Verdict::Proceed => (),
+            Verdict::Throttle(delay) => {
+                debug!("{}: {} throttled for {:?}", peer.id, peer.ip, delay);
+                std::thread::sleep(delay);
+            }
+            Verdict::Ban => {
+                warn!(
+                    "banning {} for {:?}: over the cost hard limit",
+                    IpKey::of(peer.ip),
+                    shared.limits.ban_duration()
+                );
+                shared.disconnect_ip(peer.ip);
                 break;
             }
         }
     }
-
-    debug!("{}: disconnected", peer_id);
-    let msg = Message::Done;
-    server_tx.send(Event { peer_id, msg })?;
     Ok(())
 }
 

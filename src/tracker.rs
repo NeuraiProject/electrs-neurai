@@ -1,4 +1,6 @@
+use parking_lot::RwLock;
 use std::ops::ControlFlow;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bitcoin::{BlockHash, Txid};
@@ -66,7 +68,8 @@ pub(crate) struct AssetFundingEntry {
 /// Electrum protocol subscriptions' tracker
 pub struct Tracker {
     index: Index,
-    mempool: Mempool,
+    /// Replaced by `sync`, never changed in place (like the chain of `Index`).
+    mempool: RwLock<Arc<Mempool>>,
     metrics: Metrics,
     ignore_mempool: bool,
 }
@@ -95,13 +98,14 @@ impl Tracker {
                 config.reindex_last_blocks,
             )
             .context("failed to open index")?,
-            mempool: Mempool::new(&metrics),
+            mempool: RwLock::new(Arc::new(Mempool::new(&metrics))),
             metrics,
             ignore_mempool: config.ignore_mempool,
         })
     }
 
-    pub(crate) fn chain(&self) -> &Chain {
+    /// The current chain, which doesn't change while the caller keeps it.
+    pub(crate) fn chain(&self) -> Arc<Chain> {
         self.index.chain()
     }
 
@@ -110,16 +114,23 @@ impl Tracker {
     }
 
     pub(crate) fn get_unspent(&self, status: &ScriptHashStatus) -> Vec<UnspentEntry> {
-        status.get_unspent(self.index.chain())
+        status.get_unspent(&self.index.chain())
     }
 
-    pub(crate) fn sync(&mut self, daemon: &Daemon, exit_flag: &ExitFlag) -> Result<bool> {
+    /// Indexes new blocks and updates the mempool. The RPC handlers keep
+    /// working meanwhile, on the chain and mempool they already have.
+    pub(crate) fn sync(&self, daemon: &Daemon, exit_flag: &ExitFlag) -> Result<bool> {
         let done = self.index.sync(daemon, exit_flag)?;
         if done && !self.ignore_mempool {
             let chain = self.index.chain();
             let fork = chain.params().fork_active(chain.height() + 1);
-            self.mempool.sync(daemon, exit_flag, fork);
-            // TODO: double check tip - and retry on diff
+            let current = self.mempool();
+            // asking the daemon takes most of the time: done without a lock
+            if let Some(update) = current.poll(daemon, exit_flag, fork) {
+                let mut next = Mempool::clone(&current);
+                next.apply(update);
+                *self.mempool.write() = Arc::new(next);
+            }
         }
         Ok(done)
     }
@@ -137,25 +148,37 @@ impl Tracker {
         daemon: &Daemon,
         cache: &Cache,
     ) -> Result<bool> {
+        self.update_scripthash_status_on(status, &self.chain(), daemon, cache)
+    }
+
+    /// `update_scripthash_status` up to the tip of `chain`.
+    pub(crate) fn update_scripthash_status_on(
+        &self,
+        status: &mut ScriptHashStatus,
+        chain: &Chain,
+        daemon: &Daemon,
+        cache: &Cache,
+    ) -> Result<bool> {
         let prev_statushash = status.statushash();
-        status.sync(&self.index, &self.mempool, daemon, cache)?;
+        status.sync(&self.index, chain, &self.mempool(), daemon, cache)?;
         Ok(prev_statushash != status.statushash())
     }
 
     pub(crate) fn get_balance(&self, status: &ScriptHashStatus) -> Balance {
-        status.get_balance(self.chain())
+        status.get_balance(&self.chain())
     }
 
     pub(crate) fn index(&self) -> &Index {
         &self.index
     }
 
-    pub(crate) fn mempool(&self) -> &Mempool {
-        &self.mempool
+    /// The current mempool, which doesn't change while the caller keeps it.
+    pub(crate) fn mempool(&self) -> Arc<Mempool> {
+        Arc::clone(&self.mempool.read())
     }
 
-    pub(crate) fn compact_fee_histogram(&self) -> &[(f64, u64)] {
-        self.mempool.compact_fee_histogram()
+    pub(crate) fn compact_fee_histogram(&self) -> Vec<(f64, u64)> {
+        self.mempool().compact_fee_histogram().to_vec()
     }
 
     /// One entry per row in `asset_history` — so multiple events in the same block
@@ -174,8 +197,8 @@ impl Tracker {
         confirmed.sort_by_key(|e| (e.height, e.tx_prefix));
         confirmed.dedup_by(|a, b| a.height == b.height && a.tx_prefix == b.tx_prefix);
 
-        let mut mempool: Vec<AssetMempoolEntry> = self
-            .mempool
+        let current = self.mempool();
+        let mut mempool: Vec<AssetMempoolEntry> = current
             .filter_by_asset_name(name)
             .into_iter()
             .map(|entry| AssetMempoolEntry {

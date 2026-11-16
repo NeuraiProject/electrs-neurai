@@ -106,6 +106,34 @@ electrum-neurai accepts self-signed certificates (trust on first use). For clien
 
 electrs reloads the certificate when `ssl_certfile` or `ssl_keyfile` change (checked at most every 10 seconds, when a client connects), so renewals need no restart. Connections opened before keep the previous certificate.
 
+### Limits per IP
+
+Each IP (IPv6: each /64 network) has a cost: every request costs 1, plus 1
+per 10 ms of work for it (time spent waiting for other clients excluded) and
+per 64 KiB of reply, and the cost decays with time. Over the soft limit, the
+IP's requests wait until its cost is back to the limit; over the hard limit,
+the IP is banned: its connections are closed and new ones refused.
+
+```toml
+rpc_max_connections = 1000         # all IPs together (0: no limit)
+rpc_max_connections_per_ip = 32    # 0: no limit
+rpc_cost_soft_limit = 5000         # slowed down over it
+rpc_cost_hard_limit = 50000        # banned over it (0: never)
+rpc_cost_decay_per_sec = 100
+rpc_ban_secs = 600
+rpc_limits_exempt = "127.0.0.1"    # comma-separated IPs without limits
+```
+
+With the defaults, one wallet downloading the 90 MB UTXO set of a huge
+address in chunks (`utxo_sync`, about 2,000) or subscribing to thousands of
+addresses is not slowed down. Ten such downloads at once from the same IP are,
+and an IP gets banned when it keeps several heavy queries running at once, or
+tries many more connections than allowed.
+
+Behind a reverse proxy, every client has the proxy's IP: the native TLS and
+WebSocket listeners don't need one. A proxy that must be used can be exempted,
+but then its clients are not limited.
+
 ### Tor hidden service
 
 Install Tor on your server and client machines (assuming Ubuntu/Debian):

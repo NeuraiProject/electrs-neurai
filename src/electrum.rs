@@ -14,6 +14,7 @@ use serde_json::{self, json, Value};
 use std::collections::{hash_map::Entry, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use crate::{
     cache::Cache,
@@ -23,13 +24,15 @@ use crate::{
     merkle::Proof,
     metrics::{self, Histogram, Metrics},
     signals::Signal,
+    limits::{waiting, Semaphore},
     status::{
-        has_long_history, Balance, ScriptHashStatus, UnspentEntry, UnspentStatus, UtxoSnapshot,
-        UtxoSnapshots, NATIVE_ASSET_KEY,
+        has_long_history, Balance, ScriptHashStatus, SnapshotSlot, UnspentEntry, UnspentStatus,
+        UtxoSnapshot, UtxoSnapshots, NATIVE_ASSET_KEY,
     },
     tracker::Tracker,
     transport::Service,
     types::ScriptHash,
+    utxo::{self, Changes, Chunked, MempoolPart, Replies, Sum256, SyncState},
 };
 
 /// Protocol range of ElectrumX-neurai (`session.py` `PROTOCOL_MIN`/`PROTOCOL_MAX`).
@@ -45,14 +48,24 @@ const MAX_HISTORY: usize = MAX_SEND / 99;
 
 const UNSUBSCRIBED_QUERY_MESSAGE: &str = "your wallet uses less efficient method of querying electrs, consider contacting the developer of your wallet. Reason:";
 
+/// Heavy queries (UTXO snapshots of long histories) running at once: the
+/// others wait, the light ones don't.
+const MAX_HEAVY_QUERIES: usize = 2;
+/// `blockchain.scripthash.utxo_subscribe` subscriptions of a client (ElectrumX's
+/// `MAX_SESSION_SUBS` for `subscribe`).
+const MAX_UTXO_SUBSCRIPTIONS: usize = 50_000;
+
 /// Per-client Electrum protocol state
 #[derive(Default)]
 pub struct Client {
     tip: Option<BlockHash>,
     scripthashes: HashMap<ScriptHash, ScriptHashStatus>,
+    utxo_subscriptions: HashMap<ScriptHash, UtxoSubscription>,
     pub(crate) assets: AssetSubscriptions,
     version_sent: bool,
     disconnect: bool,
+    /// Some notifications could not be checked (a snapshot was busy).
+    notify_again: bool,
 }
 
 impl Client {
@@ -61,6 +74,55 @@ impl Client {
     pub(crate) fn should_disconnect(&self) -> bool {
         self.disconnect
     }
+
+    /// Whether some notifications are still to be checked.
+    pub(crate) fn take_notify_again(&mut self) -> bool {
+        std::mem::take(&mut self.notify_again)
+    }
+}
+
+/// A `blockchain.scripthash.utxo_subscribe` subscription.
+struct UtxoSubscription {
+    /// For short histories: kept synced, like `blockchain.scripthash.subscribe`
+    /// ones. Long histories use the shared `UtxoSnapshot` instead.
+    status: Option<ScriptHashStatus>,
+    /// The hash of its confirmed set, at the block of `status`.
+    set_hash: Option<(BlockHash, Sum256, usize)>,
+    /// The status last sent.
+    last: Sum256,
+}
+
+/// An error with its own JSON-RPC code.
+#[derive(Debug)]
+struct CodedError {
+    code: i64,
+    message: String,
+}
+
+impl std::fmt::Display for CodedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CodedError {}
+
+/// Error 10 of `doc/utxo-chunks.md`: the client starts again with `utxo_sync`.
+fn snapshot_expired() -> anyhow::Error {
+    CodedError {
+        code: 10,
+        message: "snapshot expired".into(),
+    }
+    .into()
+}
+
+/// What `Rpc::snapshot_of` found.
+enum SnapshotOf<T> {
+    Done(T),
+    /// A short history: no snapshot.
+    Short,
+    /// Another query is busy with the snapshot (only when not waiting).
+    Busy,
 }
 
 #[derive(Deserialize)]
@@ -93,6 +155,7 @@ enum RpcError {
     BadRequest(anyhow::Error),
     DaemonError(daemon::RpcError),
     UnavailableIndex,
+    Coded(i64, String),
 }
 
 impl RpcError {
@@ -124,6 +187,7 @@ impl RpcError {
                 // Internal JSON-RPC error (https://www.jsonrpc.org/specification#error_object)
                 json!({"code": -32603, "message": "unavailable index"})
             }
+            RpcError::Coded(code, message) => json!({"code": code, "message": message}),
         }
     }
 }
@@ -225,6 +289,13 @@ pub(crate) fn parse_scripthash(value: &Value) -> Result<ScriptHash> {
     match hex_hash(value) {
         Some(bytes) => Ok(ScriptHash::from_byte_array(bytes)),
         None => bail!("{} is not a valid script hash", py_str(value)),
+    }
+}
+
+fn parse_block_hash(value: &Value) -> Result<BlockHash> {
+    match hex_hash(value) {
+        Some(bytes) => Ok(BlockHash::from_byte_array(bytes)),
+        None => bail!("{} is not a valid block hash", py_str(value)),
     }
 }
 
@@ -597,12 +668,12 @@ type EstimateFeeKey = (u64, Option<String>);
 
 /// UTXO snapshots saved by the previous run (see `Rpc::drop`).
 fn load_utxo_snapshots(tracker: &Tracker) -> UtxoSnapshots {
-    let mut snapshots = UtxoSnapshots::default();
+    let snapshots = UtxoSnapshots::default();
     let rows = tracker.index().store().utxo_snapshots();
     let count = rows.len();
     for (scripthash, value) in rows {
         match UtxoSnapshot::from_bytes(ScriptHash::from_byte_array(scripthash), &value) {
-            Some(snapshot) => snapshots.put(snapshot),
+            Some(snapshot) => snapshots.insert(snapshot),
             None => warn!("ignoring an unreadable UTXO snapshot"),
         }
     }
@@ -610,21 +681,6 @@ fn load_utxo_snapshots(tracker: &Tracker) -> UtxoSnapshots {
         info!("loaded {} UTXO snapshots", count);
     }
     snapshots
-}
-
-/// Saves the UTXO snapshots for the next run, which then only reads the
-/// blocks found since. Runs on every exit of `server::serve`.
-impl Drop for Rpc {
-    fn drop(&mut self) {
-        let snapshots = self.utxo_snapshots.lock();
-        let store = self.tracker.index().store();
-        store.set_utxo_snapshots(
-            snapshots
-                .iter()
-                .map(|s| (s.scripthash().to_byte_array(), s.to_bytes())),
-        );
-        info!("saved {} UTXO snapshots", snapshots.iter().count());
-    }
 }
 
 /// Electrum RPC handler
@@ -641,7 +697,10 @@ pub struct Rpc {
     /// Broadcast candidates already checked against their transaction inputs.
     pub(crate) broadcast_checks: Mutex<HashMap<(Txid, u32), bool>>,
     /// UTXOs of the scripthashes with long histories, shared by all clients.
-    utxo_snapshots: Mutex<UtxoSnapshots>,
+    utxo_snapshots: UtxoSnapshots,
+    /// `utxo_sync` replies of several chunks, shared by all clients.
+    utxo_replies: Replies,
+    heavy_queries: Semaphore,
 }
 
 impl Rpc {
@@ -692,7 +751,9 @@ impl Rpc {
             services,
             estimatefee_cache: Mutex::new(HashMap::new()),
             broadcast_checks: Mutex::new(HashMap::new()),
-            utxo_snapshots: Mutex::new(utxo_snapshots),
+            utxo_snapshots,
+            utxo_replies: Replies::default(),
+            heavy_queries: Semaphore::new(MAX_HEAVY_QUERIES),
         })
     }
 
@@ -704,8 +765,22 @@ impl Rpc {
         self.daemon.new_block_notification()
     }
 
-    pub fn sync(&mut self) -> Result<bool> {
+    pub fn sync(&self) -> Result<bool> {
         self.tracker.sync(&self.daemon, self.signal.exit_flag())
+    }
+
+    /// Saves the UTXO snapshots for the next run, which then only reads the
+    /// blocks found since. Runs on every exit of `server::serve`.
+    pub(crate) fn save_utxo_snapshots(&self) {
+        let mut rows = Vec::new();
+        self.utxo_snapshots
+            .for_each(|s| rows.push((s.scripthash().to_byte_array(), s.to_bytes())));
+        let count = rows.len();
+        self.tracker
+            .index()
+            .store()
+            .set_utxo_snapshots(rows.into_iter());
+        info!("saved {} UTXO snapshots", count);
     }
 
     pub fn update_client(&self, client: &mut Client) -> Result<Vec<String>> {
@@ -730,6 +805,22 @@ impl Rpc {
             .context("failed to update status")?;
 
         notifications.extend(self.update_asset_subscriptions(&mut client.assets)?);
+
+        let mut notify_again = false;
+        for (scripthash, subscription) in client.utxo_subscriptions.iter_mut() {
+            match self.update_utxo_subscription(*scripthash, subscription)? {
+                SnapshotOf::Done(Some(status)) => notifications.push(notification(
+                    "blockchain.scripthash.utxo_subscribe",
+                    &[json!(scripthash), json!(status.to_hex())],
+                )),
+                SnapshotOf::Done(None) => (),
+                // another query is updating it: look again later
+                SnapshotOf::Busy => notify_again = true,
+                // its snapshot became too large to keep: the next query builds it
+                SnapshotOf::Short => notify_again = true,
+            }
+        }
+        client.notify_again |= notify_again;
 
         if let Some(old_tip) = client.tip {
             let new_tip = self.tracker.chain().tip();
@@ -959,37 +1050,330 @@ impl Rpc {
         scripthash: ScriptHash,
         method: &str,
     ) -> Result<UnspentStatus> {
-        let index = self.tracker.index();
-        let mempool = self.tracker.mempool();
-        let snapshot = self.utxo_snapshots.lock().take(&scripthash);
-        if let Some(mut snapshot) = snapshot {
-            if snapshot.update(index, &self.daemon)? {
-                let status = snapshot.unspent_status(mempool, &self.cache);
-                if snapshot.save_due() {
-                    self.save_utxo_snapshot(&mut snapshot);
-                }
-                self.utxo_snapshots.lock().put(snapshot);
-                return Ok(status);
-            }
-        }
-        if has_long_history(index, scripthash) {
-            info!(
-                "{} {} called for unsubscribed scripthash",
-                UNSUBSCRIBED_QUERY_MESSAGE, method
-            );
-            let mut snapshot = UtxoSnapshot::build(scripthash, index, &self.daemon)?;
-            let status = snapshot.unspent_status(mempool, &self.cache);
-            self.save_utxo_snapshot(&mut snapshot);
-            self.utxo_snapshots.lock().put(snapshot);
+        let found = self.snapshot_of(scripthash, true, method, |snapshot| {
+            snapshot.unspent_status(&self.tracker.mempool(), &self.cache)
+        })?;
+        if let SnapshotOf::Done(status) = found {
             return Ok(status);
         }
         let status = self.status_of(client, scripthash, method)?;
         let chain = self.tracker.chain();
-        if let Some(mut snapshot) = UtxoSnapshot::of_long_history(&status, chain) {
+        self.keep_long_history(&status, &chain);
+        Ok(status.unspent_status(&chain, &self.tracker.mempool()))
+    }
+
+    /// Keeps a snapshot of `status` if its history is long.
+    fn keep_long_history(&self, status: &ScriptHashStatus, chain: &crate::chain::Chain) {
+        if let Some(mut snapshot) = UtxoSnapshot::of_long_history(status, chain) {
             self.save_utxo_snapshot(&mut snapshot);
-            self.utxo_snapshots.lock().put(snapshot);
+            let slot = self.utxo_snapshots.slot(snapshot.scripthash());
+            let mut guard = waiting(|| slot.snapshot.lock());
+            if guard.is_none() {
+                *guard = Some(snapshot);
+                self.utxo_snapshots.update(&slot, &guard);
+            }
         }
-        Ok(status.unspent_status(chain, mempool))
+    }
+
+    /// Runs `f` on the up-to-date `UtxoSnapshot` of `scripthash`, building it
+    /// first for a long history. Only one query builds or updates a snapshot:
+    /// the others wait for it, or get `Busy` when not `wait`ing.
+    fn snapshot_of<T>(
+        &self,
+        scripthash: ScriptHash,
+        wait: bool,
+        method: &str,
+        f: impl FnOnce(&mut UtxoSnapshot) -> T,
+    ) -> Result<SnapshotOf<T>> {
+        let index = self.tracker.index();
+        if !self.utxo_snapshots.contains(&scripthash) && !has_long_history(index, scripthash) {
+            return Ok(SnapshotOf::Short);
+        }
+        let slot = self.utxo_snapshots.slot(scripthash);
+        let mut guard = if wait {
+            waiting(|| slot.snapshot.lock())
+        } else {
+            match slot.snapshot.try_lock() {
+                Some(guard) => guard,
+                None => return Ok(SnapshotOf::Busy),
+            }
+        };
+        if !self.refresh_snapshot(&slot, &mut guard, scripthash, method)? {
+            return Ok(SnapshotOf::Short);
+        }
+        Ok(SnapshotOf::Done(f(guard.as_mut().expect("refreshed"))))
+    }
+
+    /// Brings the snapshot of `slot` up to date, building it if needed.
+    /// `false` for a short history.
+    fn refresh_snapshot(
+        &self,
+        slot: &SnapshotSlot,
+        snapshot: &mut Option<UtxoSnapshot>,
+        scripthash: ScriptHash,
+        method: &str,
+    ) -> Result<bool> {
+        let index = self.tracker.index();
+        if let Some(current) = snapshot.as_mut() {
+            if current.update(index, &self.daemon)? {
+                if current.save_due() {
+                    self.save_utxo_snapshot(current);
+                }
+                self.utxo_snapshots.update(slot, snapshot);
+                return Ok(snapshot.is_some());
+            }
+            *snapshot = None; // rebuilt below
+        }
+        if !has_long_history(index, scripthash) {
+            self.utxo_snapshots.update(slot, snapshot);
+            return Ok(false);
+        }
+        info!(
+            "{} {} called for unsubscribed scripthash",
+            UNSUBSCRIBED_QUERY_MESSAGE, method
+        );
+        let mut built = {
+            let _permit = self.heavy_queries.acquire();
+            UtxoSnapshot::build(scripthash, index, &self.daemon)?
+        };
+        self.save_utxo_snapshot(&mut built);
+        *snapshot = Some(built);
+        self.utxo_snapshots.update(slot, snapshot);
+        // too large to keep: answered once anyway
+        Ok(true)
+    }
+
+    // ─── Chunked UTXO sets (doc/utxo-chunks.md) ─────────────────────────────
+
+    fn scripthash_utxo_sync(&self, client: &mut Client, args: &Args) -> Result<Value> {
+        let scripthash = parse_scripthash(args.req(0))?;
+        let from = match args.get(1) {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(parse_block_hash(value)?),
+        };
+        let method = "blockchain.scripthash.utxo_sync";
+        // long histories: the shared snapshot and its journal
+        let found = self.snapshot_of(scripthash, true, method, |snapshot| {
+            let from_block = from.filter(|from| snapshot.knows(from));
+            let state = SyncState {
+                from_block,
+                height: snapshot.tip_height(),
+                block_hash: snapshot.tip(),
+                count: snapshot.count(),
+                set_hash: snapshot.set_hash(),
+            };
+            let mempool = snapshot.mempool_part(&self.tracker.mempool());
+            let id = utxo::reply_id(scripthash, from_block, state.block_hash);
+            // computed once for every client asking the same
+            let changes = match self.utxo_replies.get(&id) {
+                Some(_) => None,
+                None => Some(match from_block {
+                    Some(from) => snapshot.changes_since(&from).expect("known: knows() said so"),
+                    None => Changes {
+                        removed: Vec::new(),
+                        added: snapshot.utxo_list(),
+                    },
+                }),
+            };
+            (state, mempool, id, changes)
+        })?;
+        if let SnapshotOf::Done((state, mempool, id, changes)) = found {
+            return Ok(self.utxo_sync_reply(scripthash, id, state, changes, mempool));
+        }
+
+        // short histories: from their status, synced with this chain
+        let chain = self.tracker.chain();
+        let fresh;
+        let status = match client
+            .utxo_subscriptions
+            .get_mut(&scripthash)
+            .and_then(|sub| sub.status.as_mut())
+        {
+            Some(status) => {
+                self.tracker
+                    .update_scripthash_status_on(status, &chain, &self.daemon, &self.cache)?;
+                &*status
+            }
+            None => {
+                fresh = self.new_status_on(scripthash, &chain)?;
+                &fresh
+            }
+        };
+        let block_hash = status.tip();
+        let height = chain
+            .get_block_height(&block_hash)
+            .context("synced with another chain")?;
+        let now = status.utxos_at(&chain, Some(height));
+        let from_height = from
+            .and_then(|from| chain.get_block_height(&from))
+            .filter(|from| *from <= height);
+        let (from_block, changes) = match from_height {
+            Some(from_height) => (
+                from,
+                Changes::between(&status.utxos_at(&chain, Some(from_height)), &now),
+            ),
+            None => (
+                None,
+                Changes {
+                    removed: Vec::new(),
+                    added: now.values().cloned().collect(),
+                },
+            ),
+        };
+        let state = SyncState {
+            from_block,
+            height,
+            block_hash,
+            count: now.len(),
+            set_hash: utxo::set_hash(now.values()),
+        };
+        let mempool = status.mempool_part(&chain);
+        let id = utxo::reply_id(scripthash, from_block, block_hash);
+        Ok(self.utxo_sync_reply(scripthash, id, state, Some(changes), mempool))
+    }
+
+    /// The reply to `utxo_sync`: inline for a single chunk, otherwise kept for
+    /// `utxo_chunk` (`changes` is `None` when it is already kept).
+    fn utxo_sync_reply(
+        &self,
+        scripthash: ScriptHash,
+        id: String,
+        state: SyncState,
+        changes: Option<Changes>,
+        mempool: MempoolPart,
+    ) -> Value {
+        if let Some(kept) = self.utxo_replies.get(&id) {
+            return utxo::sync_reply(&kept.state, Some(&id), &kept.hashes, None, &mempool);
+        }
+        let changes = changes.unwrap_or_default(); // dropped meanwhile: not likely
+        let (chunks, hashes) = utxo::split(changes, utxo::CHUNK_BYTES);
+        if chunks.len() == 1 {
+            return utxo::sync_reply(&state, None, &hashes, chunks.first(), &mempool);
+        }
+        let reply = utxo::sync_reply(&state, Some(&id), &hashes, None, &mempool);
+        self.utxo_replies.put(Arc::new(Chunked {
+            id,
+            scripthash,
+            state,
+            chunks,
+            hashes,
+        }));
+        reply
+    }
+
+    fn scripthash_utxo_chunk(&self, args: &Args) -> Result<Value> {
+        let scripthash = parse_scripthash(args.req(0))?;
+        let id = match args.req(1) {
+            Value::String(id) => id,
+            other => bail!("{} is not a valid id", py_str(other)),
+        };
+        let index = non_negative_integer(args.req(2))?;
+        let reply = self
+            .utxo_replies
+            .get(id)
+            .filter(|reply| reply.scripthash == scripthash)
+            .ok_or_else(snapshot_expired)?;
+        match usize::try_from(index).ok().and_then(|i| reply.chunks.get(i)) {
+            Some(chunk) => Ok(chunk.to_json()),
+            None => Err(CodedError {
+                code: -32602,
+                message: format!("chunk {} out of range", index),
+            }
+            .into()),
+        }
+    }
+
+    fn scripthash_utxo_subscribe(&self, client: &mut Client, args: &Args) -> Result<Value> {
+        let scripthash = parse_scripthash(args.req(0))?;
+        if client.utxo_subscriptions.len() >= MAX_UTXO_SUBSCRIPTIONS
+            && !client.utxo_subscriptions.contains_key(&scripthash)
+        {
+            bail!("too many UTXO subscriptions");
+        }
+        let method = "blockchain.scripthash.utxo_subscribe";
+        let found = self.snapshot_of(scripthash, true, method, |snapshot| {
+            utxo::status(snapshot.set_hash(), &snapshot.mempool_part(&self.tracker.mempool()))
+        })?;
+        let subscription = match found {
+            SnapshotOf::Done(status) => UtxoSubscription {
+                status: None,
+                set_hash: None,
+                last: status,
+            },
+            _ => {
+                let chain = self.tracker.chain();
+                let mut subscription = UtxoSubscription {
+                    status: Some(self.new_status_on(scripthash, &chain)?),
+                    set_hash: None,
+                    last: Sum256::default(),
+                };
+                subscription.last = self.short_utxo_status(&mut subscription, &chain)?;
+                subscription
+            }
+        };
+        let status = subscription.last;
+        client.utxo_subscriptions.insert(scripthash, subscription);
+        Ok(json!(status.to_hex()))
+    }
+
+    fn scripthash_utxo_unsubscribe(&self, client: &mut Client, args: &Args) -> Result<Value> {
+        let scripthash = parse_scripthash(args.req(0))?;
+        Ok(json!(client.utxo_subscriptions.remove(&scripthash).is_some()))
+    }
+
+    /// The `utxo_subscribe` status of a short history, from its status synced
+    /// with `chain`.
+    fn short_utxo_status(
+        &self,
+        subscription: &mut UtxoSubscription,
+        chain: &crate::chain::Chain,
+    ) -> Result<Sum256> {
+        let status = subscription.status.as_ref().expect("a short history");
+        let tip = status.tip();
+        let set_hash = match subscription.set_hash {
+            Some((block, set_hash, _)) if block == tip => set_hash,
+            _ => {
+                let height = chain
+                    .get_block_height(&tip)
+                    .context("synced with another chain")?;
+                let utxos = status.utxos_at(chain, Some(height));
+                let set_hash = utxo::set_hash(utxos.values());
+                subscription.set_hash = Some((tip, set_hash, utxos.len()));
+                set_hash
+            }
+        };
+        Ok(utxo::status(set_hash, &status.mempool_part(chain)))
+    }
+
+    /// The new status of a `utxo_subscribe` subscription, if it changed.
+    fn update_utxo_subscription(
+        &self,
+        scripthash: ScriptHash,
+        subscription: &mut UtxoSubscription,
+    ) -> Result<SnapshotOf<Option<Sum256>>> {
+        let status = match subscription.status.as_mut() {
+            Some(status) => {
+                let chain = self.tracker.chain();
+                self.tracker
+                    .update_scripthash_status_on(status, &chain, &self.daemon, &self.cache)?;
+                self.short_utxo_status(subscription, &chain)?
+            }
+            None => {
+                let method = "blockchain.scripthash.utxo_subscribe";
+                match self.snapshot_of(scripthash, false, method, |snapshot| {
+                    utxo::status(snapshot.set_hash(), &snapshot.mempool_part(&self.tracker.mempool()))
+                })? {
+                    SnapshotOf::Done(status) => status,
+                    SnapshotOf::Busy => return Ok(SnapshotOf::Busy),
+                    SnapshotOf::Short => return Ok(SnapshotOf::Short),
+                }
+            }
+        };
+        if status == subscription.last {
+            return Ok(SnapshotOf::Done(None));
+        }
+        subscription.last = status;
+        Ok(SnapshotOf::Done(Some(status)))
     }
 
     /// Saved when built too, and every `UTXO_SNAPSHOT_SAVE_BLOCKS`: a crash
@@ -1076,6 +1460,18 @@ impl Rpc {
         if status.get_history().len() >= MAX_HISTORY {
             bail!("history too large");
         }
+        Ok(status)
+    }
+
+    /// A status synced up to the tip of `chain`.
+    fn new_status_on(
+        &self,
+        scripthash: ScriptHash,
+        chain: &crate::chain::Chain,
+    ) -> Result<ScriptHashStatus> {
+        let mut status = ScriptHashStatus::new(scripthash);
+        self.tracker
+            .update_scripthash_status_on(&mut status, chain, &self.daemon, &self.cache)?;
         Ok(status)
     }
 
@@ -1358,19 +1754,21 @@ impl Rpc {
             "genesis_hash": self.tracker.chain().get_block_hash(0),
             "hash_function": "sha256",
             "services": services,
+            // electrs-neurai extension (doc/utxo-chunks.md)
+            "utxo_chunks": utxo::PROTOCOL_VERSION,
         }))
     }
 
-    pub fn handle_requests(&self, client: &mut Client, lines: &[String]) -> Vec<String> {
-        lines
-            .iter()
-            .map(|line| {
-                parse_requests(line)
-                    .map(Calls::parse)
-                    .map_err(error_msg_no_id)
-            })
-            .map(|calls| self.handle_calls(client, calls).to_string())
-            .collect()
+    /// The reply to a request (or batch of requests) and its number of calls.
+    pub(crate) fn handle_request(&self, client: &mut Client, line: &str) -> (String, usize) {
+        let calls = parse_requests(line)
+            .map(Calls::parse)
+            .map_err(error_msg_no_id);
+        let count = match &calls {
+            Ok(Calls::Batch(batch)) => batch.len().max(1),
+            _ => 1,
+        };
+        (self.handle_calls(client, calls).to_string(), count)
     }
 
     fn handle_calls(&self, client: &mut Client, calls: Result<Calls, Value>) -> Value {
@@ -1454,6 +1852,10 @@ impl Rpc {
                 Method::ScriptHashListUnspent => self.scripthash_list_unspent(client, args),
                 Method::ScriptHashSubscribe => self.scripthash_subscribe(client, args),
                 Method::ScriptHashUnsubscribe => self.scripthash_unsubscribe(client, args),
+                Method::ScriptHashUtxoSync => self.scripthash_utxo_sync(client, args),
+                Method::ScriptHashUtxoChunk => self.scripthash_utxo_chunk(args),
+                Method::ScriptHashUtxoSubscribe => self.scripthash_utxo_subscribe(client, args),
+                Method::ScriptHashUtxoUnsubscribe => self.scripthash_utxo_unsubscribe(client, args),
                 Method::TransactionBroadcast => self.transaction_broadcast(args),
                 Method::TransactionGet => self.transaction_get(args),
                 Method::TransactionGetMerkle => self.transaction_get_merkle(args),
@@ -1495,8 +1897,12 @@ pub(crate) enum Method {
     TransactionGetMerkle,
     TransactionGetTscMerkle,
     TransactionIdFromPos,
-    /// electrs-neurai extension
+    /// electrs-neurai extensions
     AddressGetScripthash,
+    ScriptHashUtxoSync,
+    ScriptHashUtxoChunk,
+    ScriptHashUtxoSubscribe,
+    ScriptHashUtxoUnsubscribe,
     Asset(crate::electrum_assets::AssetMethod),
 }
 
@@ -1554,6 +1960,18 @@ impl Method {
                 2,
             ),
             "blockchain.address.get_scripthash" => (Method::AddressGetScripthash, &["address"], 1),
+            "blockchain.scripthash.utxo_sync" => {
+                (Method::ScriptHashUtxoSync, &["scripthash", "from_block"], 1)
+            }
+            "blockchain.scripthash.utxo_chunk" => {
+                (Method::ScriptHashUtxoChunk, &["scripthash", "id", "index"], 3)
+            }
+            "blockchain.scripthash.utxo_subscribe" => {
+                (Method::ScriptHashUtxoSubscribe, &["scripthash"], 1)
+            }
+            "blockchain.scripthash.utxo_unsubscribe" => {
+                (Method::ScriptHashUtxoUnsubscribe, &["scripthash"], 1)
+            }
             other => {
                 let (method, names, required) = AssetMethod::lookup(other)?;
                 (Method::Asset(method), names, required)
@@ -1615,6 +2033,10 @@ impl Call {
         match result {
             Ok(value) => result_msg(&self.id, value),
             Err(err) => {
+                if let Some(coded) = err.downcast_ref::<CodedError>() {
+                    debug!("RPC {} failed: {}", self.name, coded);
+                    return error_msg(&self.id, RpcError::Coded(coded.code, coded.message.clone()));
+                }
                 warn!("RPC {} failed: {:#}", self.name, err);
                 match err
                     .downcast_ref::<bitcoincore_rpc::Error>()

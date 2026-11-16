@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::{BlockHash, TxMerkleNode};
@@ -28,11 +29,27 @@ impl NewHeader {
     }
 }
 
-/// Current blockchain headers' list
+/// Headers per chunk of `Chain::chunks`: a new block copies at most one chunk.
+const CHUNK: usize = 4096;
+/// Shards of `Chain::heights`, by the first byte of the block hash.
+const SHARDS: usize = 256;
+
+/// Current blockchain headers' list.
+///
+/// Cloning it is cheap (a few hundred `Arc`s): the headers and their heights
+/// are kept in shared chunks, copied only when a clone changes them. Readers
+/// keep a clone for as long as they need, while the indexer makes the next
+/// one (see `Index::chain`).
+#[derive(Clone)]
 pub struct Chain {
-    headers: Vec<(BlockHash, NeuraiBlockHeader)>,
-    heights: HashMap<BlockHash, usize>,
+    chunks: Vec<Arc<Vec<(BlockHash, NeuraiBlockHeader)>>>,
+    len: usize,
+    heights: Vec<Arc<HashMap<BlockHash, usize>>>,
     params: &'static NetworkParams,
+}
+
+fn shard(hash: &BlockHash) -> usize {
+    usize::from(hash.as_byte_array()[0]) % SHARDS
 }
 
 impl Chain {
@@ -49,11 +66,14 @@ impl Chain {
             params.genesis_bits,
             params.genesis_nonce,
         );
-        Self {
-            headers: vec![(genesis_hash, genesis_header)],
-            heights: std::iter::once((genesis_hash, 0)).collect(),
+        let mut chain = Self {
+            chunks: Vec::new(),
+            len: 0,
+            heights: (0..SHARDS).map(|_| Arc::new(HashMap::new())).collect(),
             params,
-        }
+        };
+        chain.push(genesis_hash, genesis_header);
+        chain
     }
 
     /// Build a chain using the genesis hash hardcoded in `params` (mainnet only).
@@ -67,12 +87,47 @@ impl Chain {
         self.params
     }
 
+    fn entry(&self, height: usize) -> Option<&(BlockHash, NeuraiBlockHeader)> {
+        self.chunks.get(height / CHUNK)?.get(height % CHUNK)
+    }
+
+    /// Appends the header of height `self.len`.
+    fn push(&mut self, hash: BlockHash, header: NeuraiBlockHeader) {
+        let height = self.len;
+        if height % CHUNK == 0 {
+            self.chunks.push(Arc::new(Vec::with_capacity(CHUNK)));
+        }
+        let chunk = self.chunks.last_mut().expect("a chunk for the new header");
+        Arc::make_mut(chunk).push((hash, header));
+        let previous = Arc::make_mut(&mut self.heights[shard(&hash)]).insert(hash, height);
+        assert!(previous.is_none(), "duplicate header {}", hash);
+        self.len += 1;
+    }
+
+    /// Keeps the first `len` headers.
+    fn truncate(&mut self, len: usize) {
+        for height in len..self.len {
+            let (hash, _header) = *self.entry(height).expect("height below len");
+            let removed = Arc::make_mut(&mut self.heights[shard(&hash)]).remove(&hash);
+            assert!(removed.is_some());
+        }
+        if len >= self.len {
+            return;
+        }
+        self.chunks.truncate(len.div_ceil(CHUNK));
+        if len % CHUNK != 0 {
+            let last = self.chunks.last_mut().expect("a chunk below len");
+            Arc::make_mut(last).truncate(len % CHUNK);
+        }
+        self.len = len;
+    }
+
     pub(crate) fn drop_last_headers(&mut self, n: usize) {
         if n == 0 {
             return;
         }
         let new_height = self.height().saturating_sub(n);
-        let (hash, header) = self.headers[new_height];
+        let (hash, header) = *self.entry(new_height).expect("height within the chain");
         self.update(vec![NewHeader::new(header, hash, new_height)]);
     }
 
@@ -88,7 +143,7 @@ impl Chain {
         headers: impl Iterator<Item = NeuraiBlockHeader>,
         tip: BlockHash,
     ) {
-        let genesis_hash = self.headers[0].0;
+        let genesis_hash = self.entry(0).expect("genesis").0;
         let params = self.params;
 
         let headers: Vec<NeuraiBlockHeader> = headers.collect();
@@ -119,21 +174,14 @@ impl Chain {
         drop(positions);
         info!("loading {} headers, tip={}", chain.len(), tip);
 
-        for (hash, _header) in self.headers.drain(1..) {
-            self.heights.remove(&hash);
+        self.truncate(1);
+        for heights in &mut self.heights {
+            Arc::make_mut(heights).reserve(chain.len() / SHARDS + 1);
         }
-        self.headers.reserve_exact(chain.len());
-        self.headers.extend(
-            chain
-                .iter()
-                .rev()
-                .map(|&position| (hashes[position as usize], headers[position as usize])),
-        );
+        for &position in chain.iter().rev() {
+            self.push(hashes[position as usize], headers[position as usize]);
+        }
         drop((chain, hashes, headers));
-        self.heights.reserve(self.headers.len());
-        for (height, (hash, _header)) in self.headers.iter().enumerate().skip(1) {
-            self.heights.insert(*hash, height);
-        }
         info!(
             "chain updated: tip={}, height={}",
             self.tip(),
@@ -143,59 +191,52 @@ impl Chain {
 
     /// Get the block hash at specified height (if exists)
     pub(crate) fn get_block_hash(&self, height: usize) -> Option<BlockHash> {
-        self.headers.get(height).map(|(hash, _header)| *hash)
+        self.entry(height).map(|(hash, _header)| *hash)
     }
 
     /// Get the block header at specified height (if exists)
     pub(crate) fn get_block_header(&self, height: usize) -> Option<&NeuraiBlockHeader> {
-        self.headers.get(height).map(|(_hash, header)| header)
+        self.entry(height).map(|(_hash, header)| header)
     }
 
     /// Get the block height given the specified hash (if exists)
     pub(crate) fn get_block_height(&self, blockhash: &BlockHash) -> Option<usize> {
-        self.heights.get(blockhash).copied()
+        self.heights[shard(blockhash)].get(blockhash).copied()
     }
 
     /// Update the chain with a list of new headers (possibly a reorg)
     pub(crate) fn update(&mut self, headers: Vec<NewHeader>) {
         if let Some(first_height) = headers.first().map(|h| h.height) {
-            for (hash, _header) in self.headers.drain(first_height..) {
-                assert!(self.heights.remove(&hash).is_some());
-            }
+            self.truncate(first_height);
             for (h, height) in headers.into_iter().zip(first_height..) {
                 assert_eq!(h.height, height);
-                assert!(self.heights.insert(h.hash, h.height).is_none());
-                self.headers.push((h.hash, h.header));
+                self.push(h.hash, h.header);
             }
-            info!(
-                "chain updated: tip={}, height={}",
-                self.headers.last().unwrap().0,
-                self.headers.len() - 1
-            );
+            info!("chain updated: tip={}, height={}", self.tip(), self.height());
         }
     }
 
     /// Best block hash
     pub(crate) fn tip(&self) -> BlockHash {
-        self.headers.last().expect("empty chain").0
+        self.entry(self.len - 1).expect("empty chain").0
     }
 
     /// Number of blocks (excluding genesis block)
     pub(crate) fn height(&self) -> usize {
-        self.headers.len() - 1
+        self.len - 1
     }
 
     /// List of block hashes for efficient fork detection and block/header sync
     /// see https://en.bitcoin.it/wiki/Protocol_documentation#getblocks
     pub(crate) fn locator(&self) -> Vec<BlockHash> {
         let mut result = vec![];
-        let mut index = self.headers.len() - 1;
+        let mut index = self.len - 1;
         let mut step = 1;
         loop {
             if result.len() >= 10 {
                 step *= 2;
             }
-            result.push(self.headers[index].0);
+            result.push(self.entry(index).expect("height within the chain").0);
             if index == 0 {
                 break;
             }

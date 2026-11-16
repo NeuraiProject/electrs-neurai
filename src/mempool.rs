@@ -4,6 +4,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::convert::TryFrom;
 use std::iter::FromIterator;
 use std::ops::Bound;
+use std::sync::Arc;
 
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, Transaction, Txid};
@@ -20,7 +21,7 @@ use crate::{
 };
 
 /// Asset events found in mempool transactions, by name / logical key.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct MempoolAssets {
     pub meta: HashMap<Vec<u8>, Vec<AssetMetaEventRow>>,
     pub events: HashMap<(AssetEventKind, Vec<u8>), Vec<AssetEventRow>>,
@@ -53,8 +54,11 @@ pub(crate) struct Entry {
 }
 
 /// Mempool current state
+/// Cloned for each update (`Tracker::sync`), so that readers keep the one
+/// they have: the transactions themselves are shared.
+#[derive(Clone)]
 pub(crate) struct Mempool {
-    entries: HashMap<Txid, Entry>,
+    entries: HashMap<Txid, Arc<Entry>>,
     by_funding: BTreeSet<(ScriptHash, Txid)>,
     by_spending: BTreeSet<(OutPoint, Txid)>,
     /// Asset-name → txids that touched it in mempool.
@@ -271,7 +275,17 @@ impl Mempool {
     }
 
     pub(crate) fn get(&self, txid: &Txid) -> Option<&Entry> {
-        self.entries.get(txid)
+        self.entries.get(txid).map(|entry| &**entry)
+    }
+
+    /// Number of mempool transaction inputs.
+    pub(crate) fn spends_count(&self) -> usize {
+        self.by_spending.len()
+    }
+
+    /// Outpoints spent by mempool transactions, with the spending txid.
+    pub(crate) fn spends(&self) -> impl Iterator<Item = &(OutPoint, Txid)> {
+        self.by_spending.iter()
     }
 
     pub(crate) fn filter_by_funding(&self, scripthash: &ScriptHash) -> Vec<&Entry> {
@@ -345,32 +359,36 @@ impl Mempool {
     }
 
     /// `fork`: whether the unified fork's rules apply to the next block.
-    pub fn sync(&mut self, daemon: &Daemon, exit_flag: &ExitFlag, fork: bool) {
+    /// Asks the daemon what changed in its mempool since `self` (`None` when
+    /// it failed, or nothing changed). Doesn't change `self`: see `apply`.
+    pub fn poll(&self, daemon: &Daemon, exit_flag: &ExitFlag, fork: bool) -> Option<MempoolSyncUpdate> {
         let loaded = match daemon.get_mempool_info() {
             Ok(info) => info.loaded.unwrap_or(true),
             Err(e) => {
                 warn!("mempool sync failed: {}", e);
-                return;
+                return None;
             }
         };
         if !loaded {
             warn!("mempool not loaded");
-            return;
+            return None;
         }
 
         let old_txids = HashSet::<Txid>::from_iter(self.entries.keys().copied());
 
-        let poll_result = MempoolSyncUpdate::poll(daemon, old_txids, exit_flag, fork);
-
-        let sync_update = match poll_result {
-            Ok(sync_update) => sync_update,
+        match MempoolSyncUpdate::poll(daemon, old_txids, exit_flag, fork) {
+            Ok(update) if update.new_entries.is_empty() && update.removed_entries.is_empty() => None,
+            Ok(update) => Some(update),
             Err(e) => {
                 warn!("mempool sync failed: {}", e);
-                return;
+                None
             }
-        };
+        }
+    }
 
-        self.apply_sync_update(sync_update);
+    /// Applies an update from `poll`.
+    pub fn apply(&mut self, update: MempoolSyncUpdate) {
+        self.apply_sync_update(update);
     }
 
     /// Add a transaction entry to the mempool and update the fee histogram.
@@ -402,7 +420,7 @@ impl Mempool {
         self.modify_fee_histogram(entry.fee, entry.vsize as i64);
 
         assert!(
-            self.entries.insert(entry.txid, entry).is_none(),
+            self.entries.insert(entry.txid, Arc::new(entry)).is_none(),
             "duplicate mempool txid"
         );
     }
@@ -410,10 +428,10 @@ impl Mempool {
     /// Remove a transaction entry from the mempool and update the fee histogram.
     fn remove_entry(&mut self, txid: Txid) {
         let entry = self.entries.remove(&txid).expect("missing tx from mempool");
-        for txi in entry.tx.input {
+        for txi in &entry.tx.input {
             self.by_spending.remove(&(txi.previous_output, txid));
         }
-        for txo in entry.tx.output {
+        for txo in &entry.tx.output {
             let bytes = txo.script_pubkey.as_bytes();
             let asset = parse_asset_script(bytes, entry.fork);
             let scripthash = match &asset {
@@ -478,6 +496,7 @@ fn compress_histogram(histogram: &[(f64, u64)], mut bin_size: f64) -> Vec<(f64, 
     compact
 }
 
+#[derive(Clone)]
 pub(crate) struct FeeHistogram {
     /// bins[64-i] contains transactions' statistics inside the fee band of [2**(i-1), 2**i).
     /// bins[64] = [0, 1)

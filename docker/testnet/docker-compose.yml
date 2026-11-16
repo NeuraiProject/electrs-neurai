@@ -15,14 +15,16 @@ services:
       args:
         BRANCH: "${NEURAI_BRANCH:-DePIN-Test}"
     image: neuraiproject/neuraid:testnet-1.0.0
-    container_name: neurai-electrs-testnet-node
+    container_name: ${COMPOSE_PROJECT_NAME:-neurai-testnet}-node
     restart: unless-stopped
     logging: *logging
 
     # ./node/entrypoint.sh rewrites neurai.conf from these on every start.
     environment:
       NEURAI_TESTNET: "1"
-      # NEURAI_LISTEN must be 1: electrs bulk-downloads blocks over P2P.
+      # NEURAI_LISTEN must be 1: electrs bulk-downloads blocks over P2P. Several
+      # nodes on one host don't collide inside their containers: give each
+      # stack its own NODE_P2P_PORT / NODE_P2P_LISTEN in .env instead.
       NEURAI_LISTEN: "1"
       NEURAI_REST: "1"
       NEURAI_RPC_USER: "${NEURAI_RPC_USER:-neurai}"
@@ -49,8 +51,9 @@ services:
       - neurai_data:/data
 
     ports:
-      - "${NODE_P2P_PORT:-19100}:19100"
-      - "127.0.0.1:${NODE_RPC_PORT:-19101}:19101"
+      # An empty NODE_P2P_PORT / NODE_RPC_PORT: a free port chosen by Docker.
+      - "${NODE_P2P_LISTEN:+${NODE_P2P_LISTEN}:}${NODE_P2P_PORT-19100}:19100"
+      - "127.0.0.1:${NODE_RPC_PORT-19101}:19101"
 
     networks:
       - neurai_net
@@ -77,7 +80,7 @@ services:
     #     REPO_URL: https://github.com/NeuraiProject/electrs-neurai.git
     #     REPO_REF: master
     image: neuraiproject/electrs-neurai:testnet-1.0.0
-    container_name: neurai-testnet-electrs
+    container_name: ${COMPOSE_PROJECT_NAME:-neurai-testnet}-electrs
     restart: unless-stopped
     logging: *logging
 
@@ -123,9 +126,9 @@ services:
       - "/etc/electrs-tls/key.pem"
 
     ports:
-      - "${ELECTRUM_TCP_PORT:-60001}:60001"   # tcp://
-      - "${ELECTRUM_SSL_PORT:-60002}:60002"   # ssl://  (Electrum desktop wallets)
-      - "${ELECTRUM_WSS_PORT:-60004}:60004"   # wss://  (browser wallets, indexers)
+      - "${ELECTRUM_LISTEN:+${ELECTRUM_LISTEN}:}${ELECTRUM_TCP_PORT:-60001}:60001"   # tcp://
+      - "${ELECTRUM_LISTEN:+${ELECTRUM_LISTEN}:}${ELECTRUM_SSL_PORT:-60002}:60002"   # ssl://  (Electrum desktop wallets)
+      - "${ELECTRUM_LISTEN:+${ELECTRUM_LISTEN}:}${ELECTRUM_WSS_PORT:-60004}:60004"   # wss://  (browser wallets, indexers)
 
     networks:
       - neurai_net
@@ -139,7 +142,7 @@ services:
     # Cloudflare API (DNS-01: no port needs to be open); idle when DOMAIN is
     # empty. See ../letsencrypt.sh.
     image: certbot/dns-cloudflare:v4.0.0
-    container_name: neurai-testnet-letsencrypt
+    container_name: ${COMPOSE_PROJECT_NAME:-neurai-testnet}-letsencrypt
     restart: unless-stopped
     logging: *logging
     entrypoint: ["/bin/sh", "/letsencrypt.sh"]

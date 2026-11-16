@@ -149,6 +149,7 @@ pub struct Config {
     pub skip_block_download_wait: bool,
     pub disable_electrum_rpc: bool,
     pub server_banner: String,
+    pub limits: crate::limits::LimitsConfig,
 }
 
 pub struct SensitiveAuth(pub Auth);
@@ -310,6 +311,28 @@ impl Config {
             std::process::exit(0);
         }
 
+        let exempt = config
+            .rpc_limits_exempt
+            .split(',')
+            .map(str::trim)
+            .filter(|ip| !ip.is_empty())
+            .map(|ip| {
+                ip.parse::<std::net::IpAddr>().unwrap_or_else(|e| {
+                    eprintln!("Error: invalid IP {:?} in rpc_limits_exempt: {}", ip, e);
+                    std::process::exit(1);
+                })
+            })
+            .collect();
+        let limits = crate::limits::LimitsConfig {
+            max_connections: config.rpc_max_connections,
+            max_connections_per_ip: config.rpc_max_connections_per_ip,
+            cost_soft_limit: config.rpc_cost_soft_limit as f64,
+            cost_hard_limit: config.rpc_cost_hard_limit as f64,
+            cost_decay_per_sec: config.rpc_cost_decay_per_sec as f64,
+            ban_duration: Duration::from_secs(config.rpc_ban_secs),
+            exempt,
+        };
+
         let config = Config {
             network,
             db_path: config.db_dir,
@@ -338,6 +361,7 @@ impl Config {
             skip_block_download_wait: config.skip_block_download_wait,
             disable_electrum_rpc: config.disable_electrum_rpc,
             server_banner: config.server_banner,
+            limits,
         };
         eprintln!(
             "Starting electrs {} on {} {} with {:?}",

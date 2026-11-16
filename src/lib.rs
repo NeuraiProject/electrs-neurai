@@ -15,6 +15,7 @@ mod db;
 mod electrum;
 mod electrum_assets;
 mod index;
+mod limits;
 mod mempool;
 mod merkle;
 mod metrics;
@@ -27,5 +28,6 @@ mod thread;
 mod tracker;
 mod transport;
 mod types;
+mod utxo;
 
 pub use server::run;

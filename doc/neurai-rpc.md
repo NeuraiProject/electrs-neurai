@@ -134,6 +134,31 @@ touched an asset. Confirmed entries: `{"height", "block_hash", "tx_prefix"}`
 where `tx_prefix` is the last 16 hex characters of the displayed txid; mempool
 entries: `{"height": 0 or -1, "tx_hash", "fee"}`.
 
+### Chunked UTXO sets
+
+`blockchain.scripthash.utxo_sync`, `blockchain.scripthash.utxo_chunk`,
+`blockchain.scripthash.utxo_subscribe` and
+`blockchain.scripthash.utxo_unsubscribe` let wallets handle addresses with
+hundreds of thousands of UTXOs: the set (XNA and assets) comes in chunks of at
+most 128 KB with a hash each, then only what changed since the wallet's block,
+and notifications work whatever the size of the address. `server.features`
+advertises them as `"utxo_chunks": 1`. See [utxo-chunks.md](utxo-chunks.md).
+
+## Concurrency and limits
+
+Each connection handles its requests in its own thread, in order; the
+indexer, the mempool and the other connections don't wait for it. A heavy
+query (the UTXOs of an address paid in thousands of blocks) only delays its
+own client. At most two UTXO snapshots are built at once, and clients asking
+for the same address share the one being built.
+
+Each IP (IPv6: /64) has at most `rpc_max_connections_per_ip` connections and
+a cost that grows with its requests (their number, the work done and the size
+of the replies) and decays with time. Over `rpc_cost_soft_limit` its requests
+are slowed down; over `rpc_cost_hard_limit` it is banned for `rpc_ban_secs`:
+its connections are closed and new ones refused. See
+[config.md](config.md#limits-per-ip).
+
 ## Behaviour during initial sync
 
 Until the first index compaction completes, index-dependent methods return

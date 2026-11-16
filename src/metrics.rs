@@ -8,12 +8,21 @@ mod metrics_impl {
     use prometheus::{self, Encoder, HistogramOpts, HistogramVec, Registry, TEXT_FORMAT};
     use tiny_http::{Header as HttpHeader, Response, Server};
 
+    use parking_lot::Mutex;
+
+    use std::collections::HashMap;
     use std::net::SocketAddr;
+    use std::sync::Arc;
 
     use crate::thread::spawn;
 
+    /// Asking twice for the same metric (several P2P connections...) gives the
+    /// same one.
+    #[derive(Clone)]
     pub struct Metrics {
         reg: Registry,
+        histograms: Arc<Mutex<HashMap<String, HistogramVec>>>,
+        gauges: Arc<Mutex<HashMap<String, prometheus::GaugeVec>>>,
     }
 
     impl Metrics {
@@ -24,7 +33,11 @@ mod metrics_impl {
             reg.register(Box::new(ProcessCollector::for_self()))
                 .expect("failed to register ProcessCollector");
 
-            let result = Self { reg };
+            let result = Self {
+                reg,
+                histograms: Default::default(),
+                gauges: Default::default(),
+            };
             let reg = result.reg.clone();
 
             let server = match Server::http(addr) {
@@ -51,6 +64,16 @@ mod metrics_impl {
             Ok(result)
         }
 
+        /// Metrics that nobody reads.
+        #[cfg(test)]
+        pub fn dummy() -> Self {
+            Self {
+                reg: Registry::new(),
+                histograms: Default::default(),
+                gauges: Default::default(),
+            }
+        }
+
         pub fn histogram_vec(
             &self,
             name: &str,
@@ -59,21 +82,31 @@ mod metrics_impl {
             buckets: Vec<f64>,
         ) -> Histogram {
             let name = String::from("electrs_") + name;
-            let opts = HistogramOpts::new(name, desc).buckets(buckets);
+            let mut histograms = self.histograms.lock();
+            if let Some(hist) = histograms.get(&name) {
+                return Histogram { hist: hist.clone() };
+            }
+            let opts = HistogramOpts::new(name.clone(), desc).buckets(buckets);
             let hist = HistogramVec::new(opts, &[label]).unwrap();
             self.reg
                 .register(Box::new(hist.clone()))
                 .expect("failed to register Histogram");
+            histograms.insert(name, hist.clone());
             Histogram { hist }
         }
 
         pub fn gauge(&self, name: &str, desc: &str, label: &str) -> Gauge {
             let name = String::from("electrs_") + name;
-            let opts = prometheus::Opts::new(name, desc);
+            let mut gauges = self.gauges.lock();
+            if let Some(gauge) = gauges.get(&name) {
+                return Gauge { gauge: gauge.clone() };
+            }
+            let opts = prometheus::Opts::new(name.clone(), desc);
             let gauge = prometheus::GaugeVec::new(opts, &[label]).unwrap();
             self.reg
                 .register(Box::new(gauge.clone()))
                 .expect("failed to register Gauge");
+            gauges.insert(name, gauge.clone());
             Gauge { gauge }
         }
     }
@@ -119,9 +152,15 @@ mod metrics_fake {
 
     use std::net::SocketAddr;
 
+    #[derive(Clone)]
     pub struct Metrics {}
 
     impl Metrics {
+        #[cfg(test)]
+        pub fn dummy() -> Self {
+            Self {}
+        }
+
         pub fn new(_addr: SocketAddr) -> Result<Self> {
             debug!("metrics collection is disabled");
             Ok(Self {})

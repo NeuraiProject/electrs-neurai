@@ -2,7 +2,12 @@ use anyhow::{Context, Result};
 use bitcoin::consensus::{deserialize, Encodable};
 use bitcoin::hashes::Hash;
 use bitcoin::{BlockHash, OutPoint, Txid};
+use parking_lot::RwLock;
 use std::ops::ControlFlow;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread;
 
 use crate::neurai::asset::{
@@ -98,10 +103,12 @@ pub struct Index {
     store: DBStore,
     batch_size: usize,
     lookup_limit: Option<usize>,
-    chain: Chain,
+    /// Replaced by `sync`, never changed in place: a reader's clone of the
+    /// `Arc` stays the same chain for as long as it keeps it.
+    chain: RwLock<Arc<Chain>>,
     stats: Stats,
-    is_ready: bool,
-    flush_needed: bool,
+    is_ready: AtomicBool,
+    flush_needed: AtomicBool,
     params: &'static NetworkParams,
 }
 
@@ -131,15 +138,17 @@ impl Index {
             batch_size,
             lookup_limit,
             params,
-            chain,
+            chain: RwLock::new(Arc::new(chain)),
             stats,
-            is_ready: false,
-            flush_needed: false,
+            is_ready: AtomicBool::new(false),
+            flush_needed: AtomicBool::new(false),
         })
     }
 
-    pub(crate) fn chain(&self) -> &Chain {
-        &self.chain
+    /// The current chain. It doesn't change while the caller keeps it, even if
+    /// new blocks are indexed meanwhile.
+    pub(crate) fn chain(&self) -> Arc<Chain> {
+        Arc::clone(&self.chain.read())
     }
 
     pub(crate) fn store(&self) -> &DBStore {
@@ -159,18 +168,11 @@ impl Index {
     }
 
     pub(crate) fn filter_by_txid(&self, txid: Txid) -> impl Iterator<Item = BlockHash> + '_ {
+        let chain = self.chain();
         self.store
             .iter_txid(TxidRow::scan_prefix(txid))
             .map(|row| HashPrefixRow::from_db_row(row).height())
-            .filter_map(move |height| self.chain.get_block_hash(height))
-    }
-
-    pub(crate) fn filter_by_funding(
-        &self,
-        scripthash: ScriptHash,
-    ) -> impl Iterator<Item = BlockHash> + '_ {
-        self.funding_heights(scripthash)
-            .filter_map(move |height| self.chain.get_block_hash(height))
+            .filter_map(move |height| chain.get_block_hash(height))
     }
 
     /// Heights of the blocks with outputs to `scripthash`, in no particular
@@ -185,14 +187,12 @@ impl Index {
             .map(|row| HashPrefixRow::from_db_row(row).height())
     }
 
-    pub(crate) fn filter_by_spending(
-        &self,
-        outpoint: OutPoint,
-    ) -> impl Iterator<Item = BlockHash> + '_ {
+    /// Heights of the blocks spending `outpoint` (rows of stale blocks and of
+    /// other outpoints with the same prefix may add a few more).
+    pub(crate) fn spending_heights(&self, outpoint: OutPoint) -> impl Iterator<Item = usize> + '_ {
         self.store
             .iter_spending(SpendingPrefixRow::scan_prefix(outpoint))
             .map(|row| HashPrefixRow::from_db_row(row).height())
-            .filter_map(move |height| self.chain.get_block_hash(height))
     }
 
     /// Yield one entry per `(asset, tx, height)` row stored in the asset history CF,
@@ -202,11 +202,12 @@ impl Index {
         &self,
         name: &[u8],
     ) -> impl Iterator<Item = (BlockHash, usize, [u8; 8])> + '_ {
+        let chain = self.chain();
         self.store
             .iter_asset_history(AssetHistoryRow::scan_prefix(name))
             .filter_map(move |row| {
                 let height = AssetHistoryRow::height(&row);
-                let block_hash = self.chain.get_block_hash(height)?;
+                let block_hash = chain.get_block_hash(height)?;
                 let mut tx_prefix = [0u8; 8];
                 tx_prefix.copy_from_slice(&row[8..16]);
                 Some((block_hash, height, tx_prefix))
@@ -220,11 +221,12 @@ impl Index {
         &self,
         scripthash: ScriptHash,
     ) -> impl Iterator<Item = (BlockHash, usize, [u8; 8])> + '_ {
+        let chain = self.chain();
         self.store
             .iter_asset_funding(AssetFundingRow::scan_prefix_by_scripthash(scripthash))
             .filter_map(move |row| {
                 let height = AssetFundingRow::height(&row);
-                let block_hash = self.chain.get_block_hash(height)?;
+                let block_hash = chain.get_block_hash(height)?;
                 let mut name_prefix = [0u8; 8];
                 name_prefix.copy_from_slice(&row[8..16]);
                 Some((block_hash, height, name_prefix))
@@ -235,6 +237,7 @@ impl Index {
     /// chain, in chain order. Events from blocks that were reorged away are
     /// dropped by checking their block hash against the chain at their height.
     pub(crate) fn asset_meta_events(&self, name: &[u8]) -> Vec<AssetMetaEventRow> {
+        let chain = self.chain();
         self.store
             .iter_asset_meta(AssetMetaEventRow::scan_prefix(name))
             .into_iter()
@@ -246,13 +249,14 @@ impl Index {
                 }
             })
             .filter(|row| row.name == name) // 8-byte name prefixes may collide
-            .filter(|row| self.chain.get_block_hash(row.height as usize) == Some(row.block_hash))
+            .filter(|row| chain.get_block_hash(row.height as usize) == Some(row.block_hash))
             .collect()
     }
 
     /// `asset_events` rows of one kind and logical key on the active chain,
     /// in chain order.
     pub(crate) fn asset_events(&self, kind: AssetEventKind, key: &[u8]) -> Vec<AssetEventRow> {
+        let chain = self.chain();
         self.store
             .iter_asset_events(crate::types::asset_event_prefix(kind, key))
             .into_iter()
@@ -264,12 +268,13 @@ impl Index {
                 }
             })
             .filter(|row| row.kind == kind && row.key == key)
-            .filter(|row| self.chain.get_block_hash(row.height as usize) == Some(row.block_hash))
+            .filter(|row| chain.get_block_hash(row.height as usize) == Some(row.block_hash))
             .collect()
     }
 
     /// Names of the assets created on the active chain that start with `prefix`.
     pub(crate) fn assets_with_prefix(&self, prefix: &[u8]) -> Vec<String> {
+        let chain = self.chain();
         self.store
             .iter_asset_names(prefix)
             .into_iter()
@@ -277,7 +282,7 @@ impl Index {
                 value.len() == 36 && {
                     let height = u32::from_be_bytes(value[..4].try_into().expect("4 bytes"));
                     let hash = BlockHash::from_slice(&value[4..]).expect("32 bytes");
-                    self.chain.get_block_hash(height as usize) == Some(hash)
+                    chain.get_block_hash(height as usize) == Some(hash)
                 }
             })
             .map(|(name, _)| String::from_utf8_lossy(&name).into_owned())
@@ -285,10 +290,11 @@ impl Index {
     }
 
     // Return `Ok(true)` when the chain is fully synced and the index is compacted.
-    pub(crate) fn sync(&mut self, daemon: &Daemon, exit_flag: &ExitFlag) -> Result<bool> {
+    pub(crate) fn sync(&self, daemon: &Daemon, exit_flag: &ExitFlag) -> Result<bool> {
+        let chain = self.chain();
         let new_headers = self
             .stats
-            .observe_duration("headers", || daemon.get_new_headers(&self.chain))?;
+            .observe_duration("headers", || daemon.get_new_headers(&chain))?;
         match (new_headers.first(), new_headers.last()) {
             (Some(first), Some(last)) => {
                 let count = new_headers.len();
@@ -300,11 +306,10 @@ impl Index {
                 );
             }
             _ => {
-                if self.flush_needed {
+                if self.flush_needed.swap(false, Ordering::Relaxed) {
                     self.store.flush(); // full compaction is performed on the first flush call
-                    self.flush_needed = false;
                 }
-                self.is_ready = true;
+                self.is_ready.store(true, Ordering::Relaxed);
                 return Ok(true); // no more blocks to index (done for now)
             }
         }
@@ -349,9 +354,12 @@ impl Index {
             writer.join().expect("writer thread panic");
             Ok(())
         })?;
-        self.chain.update(new_headers);
-        self.stats.observe_chain(&self.chain);
-        self.flush_needed = true;
+        // the next chain: readers keep the one they have
+        let mut next = Chain::clone(&chain);
+        next.update(new_headers);
+        self.stats.observe_chain(&next);
+        *self.chain.write() = Arc::new(next);
+        self.flush_needed.store(true, Ordering::Relaxed);
         Ok(false) // sync is not done
     }
 
@@ -362,7 +370,7 @@ impl Index {
         let mut batch = WriteBatch::default();
         let params = self.params;
 
-        daemon.for_blocks(blockhashes, |blockhash, block| {
+        daemon.for_blocks_to_index(blockhashes, |blockhash, block| {
             let height = heights.next().expect("unexpected block");
             self.stats.observe_duration("block", || {
                 index_single_block(blockhash, block, height, &mut batch, params);
@@ -379,7 +387,7 @@ impl Index {
     }
 
     pub(crate) fn is_ready(&self) -> bool {
-        self.is_ready
+        self.is_ready.load(Ordering::Relaxed)
     }
 }
 

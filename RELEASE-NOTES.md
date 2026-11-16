@@ -61,8 +61,9 @@ per query, while every other client waited:
 * `listunspent`, `get_balance` and `get_mempool` of an unsubscribed address
   in 10,000 blocks or more keep its confirmed UTXOs in memory, shared by all
   clients (least recently used dropped first, up to 1,000 addresses and
-  1,000,000 UTXOs). The next queries only read the blocks found since: 60 ms
-  instead of 65–85 s for that address. A reorg below the kept tip rebuilds it.
+  2,000,000 UTXOs). The next queries only read the blocks found since: 60 ms
+  instead of 65–85 s for that address. A reorg is undone with the journal of
+  the snapshot (see below); only one older than the journal rebuilds it.
   They are saved in the DB (config CF, so older versions still open it) when
   built, every 1,000 new blocks and on shutdown: after a restart, the first
   query is fast too.
@@ -78,6 +79,55 @@ per query, while every other client waited:
   that address added ~950,000 transactions (430 MB).
 * At every block, a subscription only looks up the spends of its unspent
   outputs, not of every output it ever received (one index lookup each).
+
+**Clients in parallel.** Requests used to be handled one at a time by the
+thread that also indexes new blocks: a heavy query (the UTXOs of a long
+history) held back every other client and the indexer. On a regtest address
+with 663,161 UTXOs, a `listunspent` kept the other clients and a new block
+waiting 11.6 s. Now:
+
+* Each connection handles its requests in its own thread, one at a time; the
+  main thread only indexes blocks and polls the mempool. During that same
+  query, the other clients got their replies in a few milliseconds, and the new block
+  was indexed and notified 0.2 s after it was mined.
+* The chain and the mempool are replaced, not changed in place: a query keeps
+  the ones it started with while the indexer makes the next ones (the chain is
+  kept in shared chunks, so a copy costs a few hundred pointers).
+* Blocks for client queries come through 3 P2P connections of their own; the
+  indexer keeps its connection.
+* Notifications are sent by 4 threads of their own; a client busy with a
+  request gets them after it. A client that doesn't read can't hold back the
+  indexer anymore.
+* At most 2 UTXO snapshots are built at once, and clients asking for the same
+  address wait for the one being built instead of building it again.
+
+**Limits per IP.** Connections and the cost of requests are limited per IP
+(IPv6: per /64), ElectrumX-style. A request costs 1, plus 1 per 10 ms of work
+and per 64 KiB of reply; an IP's cost decays by 100 per second. Over 5,000 its
+requests wait until its cost is back to 5,000; over 50,000 it is banned for 10
+minutes (its connections closed, new ones refused). At most 32 connections
+per IP and 1,000 in all; trying many more also gets an IP banned. New options:
+`rpc_max_connections`, `rpc_max_connections_per_ip`, `rpc_cost_soft_limit`,
+`rpc_cost_hard_limit`, `rpc_cost_decay_per_sec`, `rpc_ban_secs` and
+`rpc_limits_exempt` (see [doc/config.md](doc/config.md)).
+
+**Chunked UTXO sets.** New methods for wallets that handle addresses with
+hundreds of thousands of UTXOs, specified in
+[doc/utxo-chunks.md](doc/utxo-chunks.md) and advertised as `"utxo_chunks": 1`
+in `server.features`. No existing method changes.
+
+* `blockchain.scripthash.utxo_sync(scripthash, from_block)`: the confirmed
+  UTXOs (XNA and assets) as changes from `from_block`, or the whole set, in
+  chunks of at most 128 KB with a hash each (`utxo_chunk`), plus what the
+  mempool does to them. The 663,161 UTXOs above (90 MB) come in 691 chunks in
+  about 5 s; ten clients at once took 18–24 s, the server under 230 MB.
+* Afterwards, only the changes since the wallet's block: the UTXO snapshot of
+  a long history keeps a journal of the UTXOs each block added and removed
+  (about 30 days of blocks), saved with it (format 2; format 1 is still read).
+  It also undoes reorgs, and keeps the blocks they took out of the chain, so a
+  wallet on such a block gets back to the chain with ordinary changes.
+* `blockchain.scripthash.utxo_subscribe`: notifications for addresses of any
+  size, which `blockchain.scripthash.subscribe` refuses beyond `MAX_HISTORY`.
 
 **Memory at start.** Loading mainnet's 1.87M headers peaked at ~1.6 GB (a map
 of the headers and two intermediate copies of the chain); they are now indexed
