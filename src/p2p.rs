@@ -34,6 +34,12 @@ use crate::{
     metrics::{default_duration_buckets, default_size_buckets, Histogram, Metrics},
 };
 
+/// Most blocks asked in one `getdata`. Neurai core ignores a `getdata` of more
+/// than `MAX_INV_SZ` (50000) entries, and drops the connection on a message
+/// over `MAX_PROTOCOL_MESSAGE_LENGTH` (4 MB, ~111000 entries), which made
+/// electrs exit on the history of an address in that many blocks.
+const MAX_GETDATA_BLOCKS: usize = 50_000;
+
 enum Request {
     GetNewHeaders(GetHeadersMessage),
     GetBlocks(Vec<Inventory>),
@@ -154,39 +160,49 @@ impl Connection {
             if blockhashes.is_empty() {
                 return Ok(());
             }
-            self.blocks_duration.observe_duration("request", || {
-                debug!("loading {} blocks", blockhashes.len());
-                self.req_send.send(Request::get_blocks(&blockhashes))
-            })?;
-
-            let params = self.params;
-            for hash in blockhashes {
-                let block = self.blocks_duration.observe_duration("response", || {
-                    let block = self
-                        .blocks_recv
-                        .recv()
-                        .with_context(|| format!("failed to get block {}", hash))?;
-
-                    // Verify the block hash using the Neurai-appropriate algorithm.
-                    let hdr_len = header_len(&block, params)
-                        .with_context(|| format!("short block received for {}", hash))?;
-                    let neurai_hdr = decode_header(&mut &block[..hdr_len], params)
-                        .with_context(|| format!("invalid header in block {}", hash))?;
-                    let computed = neurai_hdr
-                        .block_hash(params)
-                        .with_context(|| format!("cannot compute hash for block {}", hash))?;
-                    // `hash` belongs to a header that `get_new_headers` already verified,
-                    // and the KAWPOW block hash takes the `mix_hash` as input, so an equal
-                    // hash means the same mix: no need to recompute the mix again here.
-                    ensure!(computed == hash, "got unexpected block");
-
-                    Ok(block)
+            debug!("loading {} blocks", blockhashes.len());
+            for chunk in blockhashes.chunks(MAX_GETDATA_BLOCKS) {
+                self.blocks_duration.observe_duration("request", || {
+                    self.req_send.send(Request::get_blocks(chunk))
                 })?;
-                self.blocks_duration
-                    .observe_duration("process", || func(hash, block));
+                self.receive_blocks(chunk, &mut func)?;
             }
             Ok(())
         })
+    }
+
+    /// Receive the blocks of one `getdata` (in the requested order).
+    fn receive_blocks<F>(&self, blockhashes: &[BlockHash], func: &mut F) -> Result<()>
+    where
+        F: FnMut(BlockHash, SerBlock),
+    {
+        let params = self.params;
+        for &hash in blockhashes {
+            let block = self.blocks_duration.observe_duration("response", || {
+                let block = self
+                    .blocks_recv
+                    .recv()
+                    .with_context(|| format!("failed to get block {}", hash))?;
+
+                // Verify the block hash using the Neurai-appropriate algorithm.
+                let hdr_len = header_len(&block, params)
+                    .with_context(|| format!("short block received for {}", hash))?;
+                let neurai_hdr = decode_header(&mut &block[..hdr_len], params)
+                    .with_context(|| format!("invalid header in block {}", hash))?;
+                let computed = neurai_hdr
+                    .block_hash(params)
+                    .with_context(|| format!("cannot compute hash for block {}", hash))?;
+                // `hash` belongs to a header that `get_new_headers` already verified,
+                // and the KAWPOW block hash takes the `mix_hash` as input, so an equal
+                // hash means the same mix: no need to recompute the mix again here.
+                ensure!(computed == hash, "got unexpected block");
+
+                Ok(block)
+            })?;
+            self.blocks_duration
+                .observe_duration("process", || func(hash, block));
+        }
+        Ok(())
     }
 
     pub(crate) fn new_block_notification(&self) -> Receiver<()> {
