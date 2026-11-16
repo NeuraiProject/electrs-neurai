@@ -165,10 +165,20 @@ impl Index {
         &self,
         scripthash: ScriptHash,
     ) -> impl Iterator<Item = BlockHash> + '_ {
+        self.funding_heights(scripthash)
+            .filter_map(move |height| self.chain.get_block_hash(height))
+    }
+
+    /// Heights of the blocks with outputs to `scripthash`, in no particular
+    /// order (rows of stale blocks and of other scripthashes with the same
+    /// prefix may add a few more).
+    pub(crate) fn funding_heights(
+        &self,
+        scripthash: ScriptHash,
+    ) -> impl Iterator<Item = usize> + '_ {
         self.store
             .iter_funding(ScriptHashRow::scan_prefix(scripthash))
             .map(|row| HashPrefixRow::from_db_row(row).height())
-            .filter_map(move |height| self.chain.get_block_hash(height))
     }
 
     pub(crate) fn filter_by_spending(

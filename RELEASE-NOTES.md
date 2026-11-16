@@ -49,6 +49,23 @@ are verified in parallel, one epoch at a time, using ethash's shared,
 thread-safe epoch context. If a block's hash differs from its anchor, every
 header is verified.
 
+**Addresses with long histories.** A mining pool address paid in ~926,000
+blocks made electrs exit: its blocks were asked for in one 33 MB `getdata`, and
+the node drops a peer sending a message over 4 MB. Blocks are now asked for in
+batches of 50,000 (the node's `MAX_INV_SZ`). Such an address also took a minute
+per query, while every other client waited:
+
+* `get_history` and `subscribe` (batched ones too, which were not limited
+  before) answer "history too large" from the index, before downloading any
+  block, when the address is in `MAX_HISTORY` blocks or more.
+* `listunspent`, `get_balance` and `get_mempool` of an unsubscribed address
+  in 10,000 blocks or more keep its confirmed UTXOs in memory, shared by all
+  clients (least recently used dropped first, up to 1,000 addresses and
+  1,000,000 UTXOs). The next queries only read the blocks found since: 60 ms
+  instead of 65–85 s for that address. A reorg below the kept tip rebuilds it.
+* `get_mempool` answers whatever the size of the confirmed history, like
+  ElectrumX.
+
 **Neurai 2.0 / DePIN-Test.** electrs-neurai works with the DePIN-Test testnet
 (checked against `/Neurai:2.0.0/` on testnet and on a regtest that uses every
 feature below), and is ready for the unified fork on mainnet:

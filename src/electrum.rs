@@ -23,7 +23,10 @@ use crate::{
     merkle::Proof,
     metrics::{self, Histogram, Metrics},
     signals::Signal,
-    status::{Balance, ScriptHashStatus, UnspentEntry, NATIVE_ASSET_KEY},
+    status::{
+        Balance, ScriptHashStatus, UnspentEntry, UnspentStatus, UtxoSnapshot, UtxoSnapshots,
+        NATIVE_ASSET_KEY,
+    },
     tracker::Tracker,
     transport::Service,
     types::ScriptHash,
@@ -605,6 +608,8 @@ pub struct Rpc {
     estimatefee_cache: Mutex<HashMap<EstimateFeeKey, (BlockHash, f64)>>,
     /// Broadcast candidates already checked against their transaction inputs.
     pub(crate) broadcast_checks: Mutex<HashMap<(Txid, u32), bool>>,
+    /// UTXOs of the scripthashes with long histories, shared by all clients.
+    utxo_snapshots: Mutex<UtxoSnapshots>,
 }
 
 impl Rpc {
@@ -654,6 +659,7 @@ impl Rpc {
             services,
             estimatefee_cache: Mutex::new(HashMap::new()),
             broadcast_checks: Mutex::new(HashMap::new()),
+            utxo_snapshots: Mutex::new(UtxoSnapshots::default()),
         })
     }
 
@@ -844,36 +850,91 @@ impl Rpc {
         };
         let balance = match client.scripthashes.get(&scripthash) {
             Some(status) => self.tracker.get_balance(status),
-            None => self.tracker.get_balance(&self.status_of(
-                client,
-                scripthash,
-                "blockchain.scripthash.get_balance",
-            )?),
+            None => self
+                .unspent_status_of(client, scripthash, "blockchain.scripthash.get_balance")?
+                .balance()
+                .clone(),
         };
         Ok(balance_to_json(&balance, &filter))
     }
 
-    fn history_json(&self, status: &ScriptHashStatus, mempool_only: bool) -> Result<Value> {
+    fn history_json(&self, status: &ScriptHashStatus) -> Result<Value> {
         let history = status.get_history();
         if history.len() >= MAX_HISTORY {
             bail!("history too large");
         }
-        let entries: Vec<&crate::status::HistoryEntry> = history
-            .iter()
-            .filter(|e| !mempool_only || e.is_unconfirmed())
-            .collect();
-        Ok(json!(entries))
+        Ok(json!(history))
     }
 
-    fn scripthash_get_history(&self, client: &Client, args: &Args, mempool_only: bool) -> Result<Value> {
+    fn scripthash_get_history(&self, client: &Client, args: &Args) -> Result<Value> {
         let scripthash = parse_scripthash(args.req(0))?;
         match client.scripthashes.get(&scripthash) {
-            Some(status) => self.history_json(status, mempool_only),
-            None => self.history_json(
-                &self.status_of(client, scripthash, "blockchain.scripthash.get_history")?,
-                mempool_only,
-            ),
+            Some(status) => self.history_json(status),
+            None => {
+                self.check_history_size(scripthash)?;
+                self.history_json(&self.status_of(
+                    client,
+                    scripthash,
+                    "blockchain.scripthash.get_history",
+                )?)
+            }
         }
+    }
+
+    /// Like ElectrumX, whatever the size of the confirmed history.
+    fn scripthash_get_mempool(&self, client: &Client, args: &Args) -> Result<Value> {
+        let scripthash = parse_scripthash(args.req(0))?;
+        match client.scripthashes.get(&scripthash) {
+            Some(status) => {
+                let entries: Vec<&crate::status::HistoryEntry> = status
+                    .get_history()
+                    .iter()
+                    .filter(|e| e.is_unconfirmed())
+                    .collect();
+                Ok(json!(entries))
+            }
+            None => Ok(json!(self
+                .unspent_status_of(client, scripthash, "blockchain.scripthash.get_mempool")?
+                .mempool_history())),
+        }
+    }
+
+    /// ElectrumX refuses histories of `MAX_HISTORY` transactions or more. Every
+    /// block with an output to the scripthash adds at least one, so the index
+    /// tells about the longest ones before their blocks are downloaded.
+    fn check_history_size(&self, scripthash: ScriptHash) -> Result<()> {
+        let height = self.tracker.chain().height();
+        let blocks = self
+            .tracker
+            .index()
+            .funding_heights(scripthash)
+            .filter(|&h| h <= height)
+            .take(MAX_HISTORY)
+            .count();
+        if blocks >= MAX_HISTORY {
+            bail!("history too large");
+        }
+        Ok(())
+    }
+
+    /// Unspent outputs, balance and mempool history of an unsubscribed
+    /// scripthash. Those of long histories are kept in `utxo_snapshots`, so
+    /// that the next queries only read the blocks found since.
+    fn unspent_status_of(&self, client: &Client, scripthash: ScriptHash, method: &str) -> Result<UnspentStatus> {
+        let snapshot = self.utxo_snapshots.lock().take(&scripthash);
+        if let Some(mut snapshot) = snapshot {
+            if snapshot.update(self.tracker.index(), &self.daemon, &self.cache)? {
+                let status = snapshot.unspent_status(self.tracker.mempool(), &self.cache);
+                self.utxo_snapshots.lock().put(snapshot);
+                return Ok(status);
+            }
+        }
+        let status = self.status_of(client, scripthash, method)?;
+        let chain = self.tracker.chain();
+        if let Some(snapshot) = UtxoSnapshot::of_long_history(&status, chain) {
+            self.utxo_snapshots.lock().put(snapshot);
+        }
+        Ok(status.unspent_status(chain, self.tracker.mempool()))
     }
 
     fn scripthash_list_unspent(&self, client: &Client, args: &Args) -> Result<Value> {
@@ -884,11 +945,9 @@ impl Rpc {
         };
         let unspent_entries = match client.scripthashes.get(&scripthash) {
             Some(status) => self.tracker.get_unspent(status),
-            None => self.tracker.get_unspent(&self.status_of(
-                client,
-                scripthash,
-                "blockchain.scripthash.listunspent",
-            )?),
+            None => self
+                .unspent_status_of(client, scripthash, "blockchain.scripthash.listunspent")?
+                .into_unspent(),
         };
         Ok(unspent_to_json(unspent_entries, &filter))
     }
@@ -927,7 +986,7 @@ impl Rpc {
 
         let mut results: HashMap<ScriptHash, Result<ScriptHashStatus>> = new_scripthashes
             .into_par_iter()
-            .map(|scripthash| (scripthash, self.new_status(scripthash)))
+            .map(|scripthash| (scripthash, self.subscription_status(scripthash)))
             .collect();
 
         scripthashes.iter().map(move |scripthash| {
@@ -942,6 +1001,16 @@ impl Rpc {
             };
             Ok(json!(statushash))
         })
+    }
+
+    /// Status of a new subscription: like ElectrumX, not for histories too large.
+    fn subscription_status(&self, scripthash: ScriptHash) -> Result<ScriptHashStatus> {
+        self.check_history_size(scripthash)?;
+        let status = self.new_status(scripthash)?;
+        if status.get_history().len() >= MAX_HISTORY {
+            bail!("history too large");
+        }
+        Ok(status)
     }
 
     pub(crate) fn new_status(&self, scripthash: ScriptHash) -> Result<ScriptHashStatus> {
@@ -1314,8 +1383,8 @@ impl Rpc {
                 Method::RelayFee => self.relayfee(),
                 Method::MempoolFeeHistogram => self.get_fee_histogram(),
                 Method::ScriptHashGetBalance => self.scripthash_get_balance(client, args),
-                Method::ScriptHashGetHistory => self.scripthash_get_history(client, args, false),
-                Method::ScriptHashGetMempool => self.scripthash_get_history(client, args, true),
+                Method::ScriptHashGetHistory => self.scripthash_get_history(client, args),
+                Method::ScriptHashGetMempool => self.scripthash_get_mempool(client, args),
                 Method::ScriptHashListUnspent => self.scripthash_list_unspent(client, args),
                 Method::ScriptHashSubscribe => self.scripthash_subscribe(client, args),
                 Method::ScriptHashUnsubscribe => self.scripthash_unsubscribe(client, args),

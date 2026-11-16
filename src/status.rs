@@ -207,7 +207,7 @@ pub(crate) struct AssetBalance {
 /// switches to the multi-asset map shape (`{"rvn": {...}, "TOKEN": {...}}`).
 ///
 /// https://electrum-protocol.readthedocs.io/en/latest/protocol-methods.html#blockchain-scripthash-get-balance
-#[derive(Default, Eq, PartialEq, Debug)]
+#[derive(Default, Clone, Eq, PartialEq, Debug)]
 pub(crate) struct Balance {
     pub by_asset: BTreeMap<String, AssetBalance>,
 }
@@ -264,7 +264,7 @@ impl UnspentEntry {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct OutputInfo {
     height: usize,
     /// XNA sats for native, asset min-units for asset outputs.
@@ -276,7 +276,7 @@ struct OutputInfo {
     seq: usize,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Unspent {
     // mapping an outpoint to its (value, height, asset) tuple
     outpoints: HashMap<OutPoint, OutputInfo>,
@@ -286,6 +286,11 @@ struct Unspent {
 
 impl Unspent {
     fn build(status: &ScriptHashStatus, chain: &Chain) -> Self {
+        Self::confirmed(status, chain).with_mempool(&status.mempool)
+    }
+
+    /// Confirmed unspent outputs of `status` (`balance` is not set).
+    fn confirmed(status: &ScriptHashStatus, chain: &Chain) -> Self {
         let mut unspent = Unspent::default();
         // First, add all relevant entries' funding outputs to the outpoints' map,
         // in chain order (entries are already sorted by position within a block).
@@ -298,11 +303,16 @@ impl Unspent {
         status
             .confirmed_entries(chain)
             .for_each(|e| unspent.remove(e));
+        unspent
+    }
 
+    /// Applies the mempool `entries` to confirmed unspent outputs, and sets the balance.
+    fn with_mempool(mut self, entries: &[TxEntry]) -> Self {
+        let unspent = &mut self;
         let confirmed = unspent.balance_by_asset();
         // Apply mempool effects (first fundings, then spends).
-        status.mempool.iter().for_each(|e| unspent.insert(e, 0)); // mempool height = 0
-        status.mempool.iter().for_each(|e| unspent.remove(e));
+        entries.iter().for_each(|e| unspent.insert(e, 0)); // mempool height = 0
+        entries.iter().for_each(|e| unspent.remove(e));
 
         let total = unspent.balance_by_asset();
 
@@ -323,8 +333,8 @@ impl Unspent {
                 },
             );
         }
-        unspent.balance = Balance { by_asset };
-        unspent
+        self.balance = Balance { by_asset };
+        self
     }
 
     /// UTXOs in ElectrumX order: confirmed by (height, position in block,
@@ -468,18 +478,17 @@ impl ScriptHashStatus {
             .collect()
     }
 
-    /// Collect all mempool history entries (keeping transactions with unconfirmed parents last).
-    fn get_mempool_history(&self, mempool: &Mempool) -> Vec<HistoryEntry> {
-        let mut entries = self
-            .mempool
-            .iter()
-            .filter_map(|e| mempool.get(&e.txid))
-            .collect::<Vec<_>>();
-        entries.sort_by_key(|e| (e.has_unconfirmed_inputs, e.txid));
-        entries
-            .into_iter()
-            .map(|e| HistoryEntry::unconfirmed(e.txid, e.has_unconfirmed_inputs, e.fee))
-            .collect()
+    /// Unspent outputs, balance and mempool history, as of the last `sync`.
+    pub(crate) fn unspent_status(&self, chain: &Chain, mempool: &Mempool) -> UnspentStatus {
+        UnspentStatus {
+            unspent: Unspent::build(self, chain),
+            mempool_history: mempool_history(&self.mempool, mempool),
+        }
+    }
+
+    /// Number of blocks with relevant transactions (including stale ones).
+    pub(crate) fn confirmed_blocks(&self) -> usize {
+        self.confirmed.len()
     }
 
     /// Apply `func` only on the new blocks (to be fetched via p2p interface).
@@ -521,7 +530,8 @@ impl ScriptHashStatus {
             let block_entries = result.entry(blockhash).or_default();
 
             let fork = fork_active(&blockhash);
-            for filtered_outputs in filter_block_txs_outputs(block, self.scripthash, params, fork) {
+            for filtered_outputs in filter_block_txs_outputs(&block, self.scripthash, params, fork)
+            {
                 cache.add_tx(filtered_outputs.txid, move || filtered_outputs.tx_bytes);
                 outpoints.extend(make_outpoints(
                     filtered_outputs.txid,
@@ -562,42 +572,6 @@ impl ScriptHashStatus {
             .collect())
     }
 
-    /// Get funding and spending entries from current mempool.
-    /// Also cache relevant transactions.
-    fn sync_mempool(
-        &self,
-        mempool: &Mempool,
-        cache: &Cache,
-        outpoints: &mut HashSet<OutPoint>,
-    ) -> Vec<TxEntry> {
-        let mut result = HashMap::<Txid, TxEntry>::new();
-        // extract relevant funding transactions
-        for entry in mempool.filter_by_funding(&self.scripthash) {
-            let funding_outputs = filter_outputs(&entry.tx, self.scripthash, entry.fork);
-            assert!(!funding_outputs.is_empty());
-            // store funded outpoints (to check for spending later)
-            outpoints.extend(make_outpoints(entry.txid, &funding_outputs));
-            result
-                .entry(entry.txid) // the transaction may already exist
-                .or_insert_with(|| TxEntry::new(entry.txid))
-                .outputs = funding_outputs;
-            cache.add_tx(entry.txid, || entry.raw.clone());
-        }
-        for entry in outpoints
-            .iter()
-            .flat_map(|outpoint| mempool.filter_by_spending(outpoint))
-        {
-            let spent_outpoints = filter_inputs(&entry.tx, outpoints);
-            assert!(!spent_outpoints.is_empty());
-            result
-                .entry(entry.txid) // the transaction may already exist
-                .or_insert_with(|| TxEntry::new(entry.txid))
-                .spent = spent_outpoints;
-            cache.add_tx(entry.txid, || entry.raw.clone());
-        }
-        result.into_values().collect()
-    }
-
     /// Sync with currently confirmed txs and mempool, downloading non-cached transactions via p2p protocol.
     /// After a successful sync, script-hash status is updated.
     pub(crate) fn sync(
@@ -622,7 +596,7 @@ impl ScriptHashStatus {
                 self.confirmed.len()
             );
         }
-        self.mempool = self.sync_mempool(mempool, cache, &mut outpoints);
+        self.mempool = mempool_entries(self.scripthash, mempool, cache, &mut outpoints);
         if !self.mempool.is_empty() {
             debug!("{} mempool transactions", self.mempool.len());
         }
@@ -630,7 +604,7 @@ impl ScriptHashStatus {
         self.history.clear();
         self.history
             .extend(self.get_confirmed_history(index.chain()));
-        self.history.extend(self.get_mempool_history(mempool));
+        self.history.extend(mempool_history(&self.mempool, mempool));
 
         self.statushash = compute_status_hash(&self.history);
         Ok(())
@@ -639,6 +613,246 @@ impl ScriptHashStatus {
     /// Get current status hash.
     pub fn statushash(&self) -> Option<StatusHash> {
         self.statushash
+    }
+}
+
+/// Get funding and spending entries of `scripthash` from current mempool, given
+/// its confirmed `outpoints` (to which the funded mempool outpoints are added).
+/// Also cache relevant transactions.
+fn mempool_entries(
+    scripthash: ScriptHash,
+    mempool: &Mempool,
+    cache: &Cache,
+    outpoints: &mut HashSet<OutPoint>,
+) -> Vec<TxEntry> {
+    let mut result = HashMap::<Txid, TxEntry>::new();
+    // extract relevant funding transactions
+    for entry in mempool.filter_by_funding(&scripthash) {
+        let funding_outputs = filter_outputs(&entry.tx, scripthash, entry.fork);
+        assert!(!funding_outputs.is_empty());
+        // store funded outpoints (to check for spending later)
+        outpoints.extend(make_outpoints(entry.txid, &funding_outputs));
+        result
+            .entry(entry.txid) // the transaction may already exist
+            .or_insert_with(|| TxEntry::new(entry.txid))
+            .outputs = funding_outputs;
+        cache.add_tx(entry.txid, || entry.raw.clone());
+    }
+    for entry in outpoints
+        .iter()
+        .flat_map(|outpoint| mempool.filter_by_spending(outpoint))
+    {
+        let spent_outpoints = filter_inputs(&entry.tx, outpoints);
+        assert!(!spent_outpoints.is_empty());
+        result
+            .entry(entry.txid) // the transaction may already exist
+            .or_insert_with(|| TxEntry::new(entry.txid))
+            .spent = spent_outpoints;
+        cache.add_tx(entry.txid, || entry.raw.clone());
+    }
+    result.into_values().collect()
+}
+
+/// History entries of mempool `entries` (keeping transactions with unconfirmed parents last).
+fn mempool_history(entries: &[TxEntry], mempool: &Mempool) -> Vec<HistoryEntry> {
+    let mut entries = entries
+        .iter()
+        .filter_map(|e| mempool.get(&e.txid))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|e| (e.has_unconfirmed_inputs, e.txid));
+    entries
+        .into_iter()
+        .map(|e| HistoryEntry::unconfirmed(e.txid, e.has_unconfirmed_inputs, e.fee))
+        .collect()
+}
+
+/// Unspent outputs, balance and mempool history of a scripthash: what
+/// `listunspent`, `get_balance` and `get_mempool` answer.
+pub(crate) struct UnspentStatus {
+    unspent: Unspent,
+    mempool_history: Vec<HistoryEntry>,
+}
+
+impl UnspentStatus {
+    pub(crate) fn into_unspent(self) -> Vec<UnspentEntry> {
+        self.unspent.into_entries()
+    }
+
+    pub(crate) fn balance(&self) -> &Balance {
+        &self.unspent.balance
+    }
+
+    pub(crate) fn mempool_history(&self) -> &[HistoryEntry] {
+        &self.mempool_history
+    }
+}
+
+/// Histories of at least this many blocks get a `UtxoSnapshot`.
+const UTXO_SNAPSHOT_MIN_BLOCKS: usize = 10_000;
+/// Bounds of `UtxoSnapshots`.
+const MAX_UTXO_SNAPSHOTS: usize = 1_000;
+const MAX_UTXO_SNAPSHOT_OUTPOINTS: usize = 1_000_000;
+
+/// Confirmed unspent outputs of a scripthash with a long history, kept between
+/// queries so that `listunspent`, `get_balance` and `get_mempool` only read the
+/// blocks after `tip` instead of every block of the history again.
+pub(crate) struct UtxoSnapshot {
+    scripthash: ScriptHash,
+    tip: BlockHash,
+    unspent: Unspent,
+    /// Blocks read to build it: past that many new blocks, rebuilding is cheaper.
+    history_blocks: usize,
+}
+
+impl UtxoSnapshot {
+    /// Snapshot of a synced `status`, if its history is long enough to keep one.
+    pub(crate) fn of_long_history(status: &ScriptHashStatus, chain: &Chain) -> Option<Self> {
+        let history_blocks = status.confirmed_blocks();
+        if history_blocks < UTXO_SNAPSHOT_MIN_BLOCKS {
+            return None;
+        }
+        let unspent = Unspent::confirmed(status, chain);
+        debug!(
+            "UTXO snapshot of {}: {} UTXOs from {} blocks",
+            status.scripthash,
+            unspent.outpoints.len(),
+            history_blocks
+        );
+        Some(Self {
+            scripthash: status.scripthash,
+            tip: status.tip,
+            unspent,
+            history_blocks,
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.unspent.outpoints.len()
+    }
+
+    /// Applies the blocks after `tip`. Returns `false` when the snapshot must
+    /// be rebuilt instead: its tip is no longer in the chain, or there are more
+    /// new blocks than the history had.
+    pub(crate) fn update(&mut self, index: &Index, daemon: &Daemon, cache: &Cache) -> Result<bool> {
+        let chain = index.chain();
+        if self.tip == chain.tip() {
+            return Ok(true);
+        }
+        let Some(height) = chain.get_block_height(&self.tip) else {
+            return Ok(false); // reorg below the snapshot
+        };
+        let new_blocks = chain.height() - height;
+        if new_blocks > self.history_blocks {
+            return Ok(false);
+        }
+        let blockhashes: Vec<BlockHash> = (height + 1..=chain.height())
+            .map(|h| chain.get_block_hash(h).expect("height within the chain"))
+            .collect();
+        let params = chain.params();
+        let scripthash = self.scripthash;
+        let unspent = &mut self.unspent;
+        let mut outpoints: HashSet<OutPoint> = unspent.outpoints.keys().copied().collect();
+        // Every new block, in chain order: its outputs to the scripthash first,
+        // then its inputs spending them (a transaction can only spend outputs of
+        // the transactions before it).
+        daemon.for_blocks(blockhashes, |blockhash, block| {
+            let height = chain.get_block_height(&blockhash).expect("requested block");
+            let fork = params.fork_active(height);
+            for funding in filter_block_txs_outputs(&block, scripthash, params, fork) {
+                let entry = TxEntry {
+                    txid: funding.txid,
+                    outputs: funding.result,
+                    spent: Vec::new(),
+                };
+                outpoints.extend(entry.funding_outpoints());
+                unspent.insert(&entry, height);
+                cache.add_tx(funding.txid, move || funding.tx_bytes);
+            }
+            for spending in filter_block_txs_inputs(&block, &outpoints, params) {
+                for outpoint in &spending.result {
+                    unspent.outpoints.remove(outpoint);
+                    outpoints.remove(outpoint);
+                }
+                cache.add_tx(spending.txid, move || spending.tx_bytes);
+            }
+        })?;
+        debug!(
+            "UTXO snapshot of {}: {} UTXOs after {} new blocks",
+            scripthash,
+            unspent.outpoints.len(),
+            new_blocks
+        );
+        self.tip = chain.tip();
+        Ok(true)
+    }
+
+    /// Unspent outputs, balance and mempool history, with the current mempool.
+    pub(crate) fn unspent_status(&self, mempool: &Mempool, cache: &Cache) -> UnspentStatus {
+        let mut outpoints: HashSet<OutPoint> = self.unspent.outpoints.keys().copied().collect();
+        let entries = mempool_entries(self.scripthash, mempool, cache, &mut outpoints);
+        UnspentStatus {
+            unspent: self.unspent.clone().with_mempool(&entries),
+            mempool_history: mempool_history(&entries, mempool),
+        }
+    }
+}
+
+/// `UtxoSnapshot`s, the least recently used dropped first beyond
+/// `max_snapshots` snapshots or `max_outpoints` UTXOs.
+pub(crate) struct UtxoSnapshots {
+    entries: HashMap<ScriptHash, (u64, UtxoSnapshot)>,
+    clock: u64,
+    outpoints: usize,
+    max_snapshots: usize,
+    max_outpoints: usize,
+}
+
+impl Default for UtxoSnapshots {
+    fn default() -> Self {
+        Self::new(MAX_UTXO_SNAPSHOTS, MAX_UTXO_SNAPSHOT_OUTPOINTS)
+    }
+}
+
+impl UtxoSnapshots {
+    fn new(max_snapshots: usize, max_outpoints: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            clock: 0,
+            outpoints: 0,
+            max_snapshots,
+            max_outpoints,
+        }
+    }
+
+    /// Takes the snapshot of `scripthash` out (`put` it back once updated).
+    pub(crate) fn take(&mut self, scripthash: &ScriptHash) -> Option<UtxoSnapshot> {
+        let (_, snapshot) = self.entries.remove(scripthash)?;
+        self.outpoints -= snapshot.len();
+        Some(snapshot)
+    }
+
+    pub(crate) fn put(&mut self, snapshot: UtxoSnapshot) {
+        if snapshot.len() > self.max_outpoints {
+            return;
+        }
+        self.clock += 1;
+        self.outpoints += snapshot.len();
+        let previous = self
+            .entries
+            .insert(snapshot.scripthash, (self.clock, snapshot));
+        if let Some((_, previous)) = previous {
+            self.outpoints -= previous.len();
+        }
+        while self.outpoints > self.max_outpoints || self.entries.len() > self.max_snapshots {
+            // never the snapshot just put: it is the most recent one, and fits alone
+            let oldest = *self
+                .entries
+                .iter()
+                .min_by_key(|(_, (used, _))| *used)
+                .map(|(scripthash, _)| scripthash)
+                .expect("over the bounds, so not empty");
+            self.take(&oldest);
+        }
     }
 }
 
@@ -703,7 +917,7 @@ struct FilteredTx<T> {
 }
 
 fn filter_block_txs_outputs(
-    block: SerBlock,
+    block: &[u8],
     scripthash: ScriptHash,
     params: &'static NetworkParams,
     fork: bool,
@@ -756,7 +970,7 @@ fn filter_block_txs_outputs(
         pos: 0,
     };
     // never stops early
-    let _ = tx::visit_block(&block, params, &mut find_outputs).expect("core returned invalid block");
+    let _ = tx::visit_block(block, params, &mut find_outputs).expect("core returned invalid block");
     find_outputs.result
 }
 
@@ -854,7 +1068,7 @@ mod tests {
             .assume_checked();
         let scripthash = ScriptHash::new(&addr.script_pubkey());
 
-        let result = &super::filter_block_txs_outputs(block, scripthash, params, false)[0];
+        let result = &super::filter_block_txs_outputs(&block, scripthash, params, false)[0];
         // The matching output is in transaction index 8 (see
         // `test_filters_attribute_matches_to_their_own_tx` for a full cross-check).
         assert_eq!(
@@ -900,7 +1114,7 @@ mod tests {
                     out.script_pubkey.as_bytes(),
                     false,
                 ));
-                let found = super::filter_block_txs_outputs(block_bytes.to_vec(), sh, params, false);
+                let found = super::filter_block_txs_outputs(block_bytes, sh, params, false);
                 assert!(
                     found.iter().any(|f| f.txid == txid
                         && f.pos == pos
@@ -934,7 +1148,7 @@ mod tests {
 
         // tx #2 vout 0 pays this P2PKH and nothing else in the block does.
         let spk = Vec::<u8>::from_hex("76a914528f02193798914da2e61e5ab15b2c516436a29f88ac").unwrap();
-        let found = super::filter_block_txs_outputs(block, ScriptHash::hash(&spk), params, false);
+        let found = super::filter_block_txs_outputs(&block, ScriptHash::hash(&spk), params, false);
         assert_eq!(found.len(), 1);
         assert_eq!(
             found[0].txid.to_string(),
@@ -1097,5 +1311,97 @@ mod tests {
         });
         let out = super::asset_tx_output_of(&reissue).unwrap();
         assert_eq!(out.amount, 1_000);
+    }
+
+    fn outpoint(n: u8, vout: u32) -> bitcoin::OutPoint {
+        use bitcoin::hashes::Hash;
+        bitcoin::OutPoint::new(bitcoin::Txid::from_byte_array([n; 32]), vout)
+    }
+
+    fn native_entry(n: u8, values: &[u64], spent: &[bitcoin::OutPoint]) -> super::TxEntry {
+        use bitcoin::hashes::Hash;
+        super::TxEntry {
+            txid: bitcoin::Txid::from_byte_array([n; 32]),
+            outputs: values
+                .iter()
+                .zip(0u32..)
+                .map(|(&value, index)| super::TxOutput {
+                    index,
+                    value: Amount::from_sat(value),
+                    asset: None,
+                })
+                .collect(),
+            spent: spent.to_vec(),
+        }
+    }
+
+    #[test]
+    fn unspent_with_mempool_keeps_the_confirmed_unspent() {
+        let mut confirmed = super::Unspent::default();
+        confirmed.insert(&native_entry(1, &[1_000], &[]), 10);
+        confirmed.insert(&native_entry(2, &[2_000, 0], &[]), 11);
+        // spends the output of tx 1, pays 500 back
+        let mempool = [native_entry(3, &[500], &[outpoint(1, 0)])];
+
+        let unspent = confirmed.clone().with_mempool(&mempool);
+        let native = unspent.balance.native();
+        assert_eq!((native.confirmed, native.unconfirmed), (3_000, -1_000 + 500));
+        let listed: Vec<_> = unspent
+            .into_entries()
+            .into_iter()
+            .map(|e| (e.tx_hash, e.tx_pos, e.height, e.value))
+            .collect();
+        assert_eq!(
+            listed,
+            [(outpoint(2, 0).txid, 0, 11, 2_000), (outpoint(3, 0).txid, 0, 0, 500)]
+        );
+        // the snapshot's own outputs are untouched
+        assert_eq!(confirmed.outpoints.len(), 3);
+        assert!(confirmed.outpoints.contains_key(&outpoint(1, 0)));
+    }
+
+    fn snapshot(n: u8, utxos: u32) -> super::UtxoSnapshot {
+        use bitcoin::hashes::Hash;
+        let mut unspent = super::Unspent::default();
+        unspent.insert(&native_entry(n, &vec![1; utxos as usize], &[]), 1);
+        super::UtxoSnapshot {
+            scripthash: ScriptHash::hash(&[n]),
+            tip: bitcoin::BlockHash::all_zeros(),
+            unspent,
+            history_blocks: super::UTXO_SNAPSHOT_MIN_BLOCKS,
+        }
+    }
+
+    #[test]
+    fn utxo_snapshots_drop_the_least_recently_used() {
+        use bitcoin::hashes::Hash;
+        let key = |n: u8| ScriptHash::hash(&[n]);
+        let mut snapshots = super::UtxoSnapshots::new(3, 10);
+        for n in 1..=3 {
+            snapshots.put(snapshot(n, 2));
+        }
+        // using 1 makes 2 the least recently used
+        let one = snapshots.take(&key(1)).unwrap();
+        snapshots.put(one);
+        snapshots.put(snapshot(4, 2)); // 4 snapshots > 3
+        assert!(snapshots.take(&key(2)).is_none());
+        assert_eq!(snapshots.entries.len(), 3);
+        assert_eq!(snapshots.outpoints, 6);
+
+        snapshots.put(snapshot(5, 7)); // 13 UTXOs > 10: drops 3 and 1
+        assert!(snapshots.take(&key(3)).is_none());
+        assert!(snapshots.take(&key(1)).is_none());
+        assert_eq!(snapshots.outpoints, 9);
+
+        snapshots.put(snapshot(6, 11)); // larger than the bound: not kept
+        assert!(snapshots.take(&key(6)).is_none());
+        assert_eq!(snapshots.outpoints, 9);
+
+        let five = snapshots.take(&key(5)).unwrap();
+        assert_eq!(five.len(), 7);
+        assert_eq!(snapshots.outpoints, 2);
+        snapshots.put(snapshot(4, 3)); // replaces 4
+        assert_eq!(snapshots.outpoints, 3);
+        assert_eq!(snapshots.entries.len(), 1);
     }
 }
