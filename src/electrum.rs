@@ -595,6 +595,38 @@ fn parse_report_services(spec: &str, listeners: &[(Service, SocketAddr)]) -> Res
 /// `(bucketed block target, mode)`
 type EstimateFeeKey = (u64, Option<String>);
 
+/// UTXO snapshots saved by the previous run (see `Rpc::drop`).
+fn load_utxo_snapshots(tracker: &Tracker) -> UtxoSnapshots {
+    let mut snapshots = UtxoSnapshots::default();
+    let rows = tracker.index().store().utxo_snapshots();
+    let count = rows.len();
+    for (scripthash, value) in rows {
+        match UtxoSnapshot::from_bytes(ScriptHash::from_byte_array(scripthash), &value) {
+            Some(snapshot) => snapshots.put(snapshot),
+            None => warn!("ignoring an unreadable UTXO snapshot"),
+        }
+    }
+    if count > 0 {
+        info!("loaded {} UTXO snapshots", count);
+    }
+    snapshots
+}
+
+/// Saves the UTXO snapshots for the next run, which then only reads the
+/// blocks found since. Runs on every exit of `server::serve`.
+impl Drop for Rpc {
+    fn drop(&mut self) {
+        let snapshots = self.utxo_snapshots.lock();
+        let store = self.tracker.index().store();
+        store.set_utxo_snapshots(
+            snapshots
+                .iter()
+                .map(|s| (s.scripthash().to_byte_array(), s.to_bytes())),
+        );
+        info!("saved {} UTXO snapshots", snapshots.iter().count());
+    }
+}
+
 /// Electrum RPC handler
 pub struct Rpc {
     pub(crate) tracker: Tracker,
@@ -648,6 +680,7 @@ impl Rpc {
 
         let tracker = Tracker::new(config, metrics, genesis_hash)?;
         let cache = Cache::new(tracker.metrics());
+        let utxo_snapshots = load_utxo_snapshots(&tracker);
         Ok(Self {
             tracker,
             cache,
@@ -659,7 +692,7 @@ impl Rpc {
             services,
             estimatefee_cache: Mutex::new(HashMap::new()),
             broadcast_checks: Mutex::new(HashMap::new()),
-            utxo_snapshots: Mutex::new(UtxoSnapshots::default()),
+            utxo_snapshots: Mutex::new(utxo_snapshots),
         })
     }
 
@@ -920,10 +953,15 @@ impl Rpc {
     /// Unspent outputs, balance and mempool history of an unsubscribed
     /// scripthash. Those of long histories are kept in `utxo_snapshots`, so
     /// that the next queries only read the blocks found since.
-    fn unspent_status_of(&self, client: &Client, scripthash: ScriptHash, method: &str) -> Result<UnspentStatus> {
+    fn unspent_status_of(
+        &self,
+        client: &Client,
+        scripthash: ScriptHash,
+        method: &str,
+    ) -> Result<UnspentStatus> {
         let snapshot = self.utxo_snapshots.lock().take(&scripthash);
         if let Some(mut snapshot) = snapshot {
-            if snapshot.update(self.tracker.index(), &self.daemon, &self.cache)? {
+            if snapshot.update(self.tracker.index(), &self.daemon)? {
                 let status = snapshot.unspent_status(self.tracker.mempool(), &self.cache);
                 self.utxo_snapshots.lock().put(snapshot);
                 return Ok(status);
@@ -932,6 +970,12 @@ impl Rpc {
         let status = self.status_of(client, scripthash, method)?;
         let chain = self.tracker.chain();
         if let Some(snapshot) = UtxoSnapshot::of_long_history(&status, chain) {
+            // saved now too, so that a crash does not lose it
+            let key = snapshot.scripthash().to_byte_array();
+            self.tracker
+                .index()
+                .store()
+                .put_utxo_snapshot(&key, &snapshot.to_bytes());
             self.utxo_snapshots.lock().put(snapshot);
         }
         Ok(status.unspent_status(chain, self.tracker.mempool()))

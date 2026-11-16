@@ -142,6 +142,10 @@ impl Index {
         &self.chain
     }
 
+    pub(crate) fn store(&self) -> &DBStore {
+        &self.store
+    }
+
     pub(crate) fn limit_result<T>(&self, entries: impl Iterator<Item = T>) -> Result<Vec<T>> {
         let mut entries = entries.fuse();
         let result: Vec<T> = match self.lookup_limit {

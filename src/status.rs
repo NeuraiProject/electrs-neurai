@@ -526,13 +526,19 @@ impl ScriptHashStatus {
         let mut result = HashMap::<BlockHash, HashMap<usize, TxEntry>>::new();
 
         let funding_blockhashes = index.limit_result(index.filter_by_funding(self.scripthash))?;
+        // Nobody asks for the transactions of a long history one by one: they
+        // would only push the others out of the cache. Known before downloading
+        // anything, the blocks paying the scripthash tell about it.
+        let cache_txs = funding_blockhashes.len() < LONG_HISTORY_BLOCKS;
         self.for_new_blocks(funding_blockhashes, daemon, |blockhash, block| {
             let block_entries = result.entry(blockhash).or_default();
 
             let fork = fork_active(&blockhash);
             for filtered_outputs in filter_block_txs_outputs(&block, self.scripthash, params, fork)
             {
-                cache.add_tx(filtered_outputs.txid, move || filtered_outputs.tx_bytes);
+                if cache_txs {
+                    cache.add_tx(filtered_outputs.txid, move || filtered_outputs.tx_bytes);
+                }
                 outpoints.extend(make_outpoints(
                     filtered_outputs.txid,
                     &filtered_outputs.result,
@@ -551,7 +557,9 @@ impl ScriptHashStatus {
             let block_entries = result.entry(blockhash).or_default();
 
             for filtered_inputs in filter_block_txs_inputs(&block, outpoints, params) {
-                cache.add_tx(filtered_inputs.txid, move || filtered_inputs.tx_bytes);
+                if cache_txs {
+                    cache.add_tx(filtered_inputs.txid, move || filtered_inputs.tx_bytes);
+                }
                 block_entries
                     .entry(filtered_inputs.pos)
                     .or_insert_with(|| TxEntry::new(filtered_inputs.txid))
@@ -687,11 +695,50 @@ impl UnspentStatus {
     }
 }
 
-/// Histories of at least this many blocks get a `UtxoSnapshot`.
-const UTXO_SNAPSHOT_MIN_BLOCKS: usize = 10_000;
+/// Histories in at least this many blocks get a `UtxoSnapshot`. The
+/// transactions of a scripthash paid in that many blocks are not cached.
+const LONG_HISTORY_BLOCKS: usize = 10_000;
 /// Bounds of `UtxoSnapshots`.
 const MAX_UTXO_SNAPSHOTS: usize = 1_000;
 const MAX_UTXO_SNAPSHOT_OUTPOINTS: usize = 1_000_000;
+/// Version of `UtxoSnapshot::to_bytes`.
+const UTXO_SNAPSHOT_FORMAT: u8 = 1;
+/// Serialized size of a native UTXO: txid, vout, height, value, seq, asset tag.
+const MIN_UTXO_BYTES: usize = 32 + 4 + 8 + 8 + 8 + 1;
+
+/// Reads little-endian fields of `UtxoSnapshot::to_bytes`.
+struct Reader<'a>(&'a [u8]);
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        if self.0.len() < n {
+            return None;
+        }
+        let (head, tail) = self.0.split_at(n);
+        self.0 = tail;
+        Some(head)
+    }
+
+    fn array<const N: usize>(&mut self) -> Option<[u8; N]> {
+        self.take(N)?.try_into().ok()
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.array::<1>()?[0])
+    }
+
+    fn u16(&mut self) -> Option<u16> {
+        Some(u16::from_le_bytes(self.array()?))
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.array()?))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.array()?))
+    }
+}
 
 /// Confirmed unspent outputs of a scripthash with a long history, kept between
 /// queries so that `listunspent`, `get_balance` and `get_mempool` only read the
@@ -708,7 +755,7 @@ impl UtxoSnapshot {
     /// Snapshot of a synced `status`, if its history is long enough to keep one.
     pub(crate) fn of_long_history(status: &ScriptHashStatus, chain: &Chain) -> Option<Self> {
         let history_blocks = status.confirmed_blocks();
-        if history_blocks < UTXO_SNAPSHOT_MIN_BLOCKS {
+        if history_blocks < LONG_HISTORY_BLOCKS {
             return None;
         }
         let unspent = Unspent::confirmed(status, chain);
@@ -730,10 +777,83 @@ impl UtxoSnapshot {
         self.unspent.outpoints.len()
     }
 
+    pub(crate) fn scripthash(&self) -> ScriptHash {
+        self.scripthash
+    }
+
+    /// Serialized to keep it in the DB (`from_bytes` reads it back).
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + 32 + 3 * 8 + self.len() * MIN_UTXO_BYTES);
+        out.push(UTXO_SNAPSHOT_FORMAT);
+        out.extend_from_slice(self.tip.as_byte_array());
+        out.extend_from_slice(&(self.history_blocks as u64).to_le_bytes());
+        out.extend_from_slice(&(self.unspent.next_seq as u64).to_le_bytes());
+        out.extend_from_slice(&(self.len() as u64).to_le_bytes());
+        for (outpoint, info) in &self.unspent.outpoints {
+            out.extend_from_slice(outpoint.txid.as_byte_array());
+            out.extend_from_slice(&outpoint.vout.to_le_bytes());
+            out.extend_from_slice(&(info.height as u64).to_le_bytes());
+            out.extend_from_slice(&info.value.to_le_bytes());
+            out.extend_from_slice(&(info.seq as u64).to_le_bytes());
+            match &info.asset {
+                None => out.push(0),
+                Some(name) => {
+                    out.push(1);
+                    out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                    out.extend_from_slice(name.as_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    /// `None` if `bytes` are not a snapshot of this format.
+    pub(crate) fn from_bytes(scripthash: ScriptHash, bytes: &[u8]) -> Option<Self> {
+        let mut r = Reader(bytes);
+        if r.u8()? != UTXO_SNAPSHOT_FORMAT {
+            return None;
+        }
+        let tip = BlockHash::from_byte_array(r.array()?);
+        let history_blocks = usize::try_from(r.u64()?).ok()?;
+        let next_seq = usize::try_from(r.u64()?).ok()?;
+        let count = usize::try_from(r.u64()?).ok()?;
+        let mut outpoints = HashMap::with_capacity(count.min(bytes.len() / MIN_UTXO_BYTES));
+        for _ in 0..count {
+            let outpoint = OutPoint::new(Txid::from_byte_array(r.array()?), r.u32()?);
+            let info = OutputInfo {
+                height: usize::try_from(r.u64()?).ok()?,
+                value: r.u64()?,
+                seq: usize::try_from(r.u64()?).ok()?,
+                asset: match r.u8()? {
+                    0 => None,
+                    1 => {
+                        let len = r.u16()?.into();
+                        Some(String::from_utf8(r.take(len)?.to_vec()).ok()?)
+                    }
+                    _ => return None,
+                },
+            };
+            outpoints.insert(outpoint, info);
+        }
+        if !r.0.is_empty() || outpoints.len() != count {
+            return None;
+        }
+        Some(Self {
+            scripthash,
+            tip,
+            unspent: Unspent {
+                outpoints,
+                balance: Balance::default(),
+                next_seq,
+            },
+            history_blocks,
+        })
+    }
+
     /// Applies the blocks after `tip`. Returns `false` when the snapshot must
     /// be rebuilt instead: its tip is no longer in the chain, or there are more
     /// new blocks than the history had.
-    pub(crate) fn update(&mut self, index: &Index, daemon: &Daemon, cache: &Cache) -> Result<bool> {
+    pub(crate) fn update(&mut self, index: &Index, daemon: &Daemon) -> Result<bool> {
         let chain = index.chain();
         if self.tip == chain.tip() {
             return Ok(true);
@@ -766,14 +886,12 @@ impl UtxoSnapshot {
                 };
                 outpoints.extend(entry.funding_outpoints());
                 unspent.insert(&entry, height);
-                cache.add_tx(funding.txid, move || funding.tx_bytes);
             }
             for spending in filter_block_txs_inputs(&block, &outpoints, params) {
                 for outpoint in &spending.result {
                     unspent.outpoints.remove(outpoint);
                     outpoints.remove(outpoint);
                 }
-                cache.add_tx(spending.txid, move || spending.tx_bytes);
             }
         })?;
         debug!(
@@ -822,6 +940,10 @@ impl UtxoSnapshots {
             max_snapshots,
             max_outpoints,
         }
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &UtxoSnapshot> {
+        self.entries.values().map(|(_, snapshot)| snapshot)
     }
 
     /// Takes the snapshot of `scripthash` out (`put` it back once updated).
@@ -1345,7 +1467,10 @@ mod tests {
 
         let unspent = confirmed.clone().with_mempool(&mempool);
         let native = unspent.balance.native();
-        assert_eq!((native.confirmed, native.unconfirmed), (3_000, -1_000 + 500));
+        assert_eq!(
+            (native.confirmed, native.unconfirmed),
+            (3_000, -1_000 + 500)
+        );
         let listed: Vec<_> = unspent
             .into_entries()
             .into_iter()
@@ -1368,7 +1493,7 @@ mod tests {
             scripthash: ScriptHash::hash(&[n]),
             tip: bitcoin::BlockHash::all_zeros(),
             unspent,
-            history_blocks: super::UTXO_SNAPSHOT_MIN_BLOCKS,
+            history_blocks: super::LONG_HISTORY_BLOCKS,
         }
     }
 
@@ -1403,5 +1528,50 @@ mod tests {
         snapshots.put(snapshot(4, 3)); // replaces 4
         assert_eq!(snapshots.outpoints, 3);
         assert_eq!(snapshots.entries.len(), 1);
+    }
+
+    #[test]
+    fn utxo_snapshot_bytes_round_trip() {
+        use bitcoin::hashes::Hash;
+        let mut original = snapshot(7, 3);
+        original.tip = bitcoin::BlockHash::from_byte_array([9; 32]);
+        let asset = super::TxEntry {
+            outputs: vec![super::TxOutput {
+                index: 2,
+                value: Amount::from_sat(0),
+                asset: Some(super::AssetTxOutput {
+                    name: "TOKEN/SUB".to_owned(),
+                    amount: 5 * 100_000_000,
+                }),
+            }],
+            ..native_entry(8, &[], &[])
+        };
+        original.unspent.insert(&asset, 1_870_000);
+
+        let bytes = original.to_bytes();
+        let read = super::UtxoSnapshot::from_bytes(original.scripthash, &bytes).unwrap();
+        assert_eq!(read.tip, original.tip);
+        assert_eq!(read.history_blocks, original.history_blocks);
+        assert_eq!(read.unspent.next_seq, original.unspent.next_seq);
+        let entries = |s: super::UtxoSnapshot| -> Vec<_> {
+            s.unspent
+                .with_mempool(&[])
+                .into_entries()
+                .into_iter()
+                .map(|e| (e.tx_hash, e.tx_pos, e.height, e.value, e.asset))
+                .collect()
+        };
+        let listed = entries(read);
+        assert_eq!(listed.len(), 4);
+        assert_eq!(listed[3].4.as_deref(), Some("TOKEN/SUB"));
+        assert_eq!(listed, entries(original));
+
+        // truncated, longer, or of another format
+        let read = |b: &[u8]| super::UtxoSnapshot::from_bytes(ScriptHash::hash(&[7]), b);
+        assert!(read(&bytes[..bytes.len() - 1]).is_none());
+        assert!(read(&[&bytes[..], &[0]].concat()).is_none());
+        let mut other = bytes.clone();
+        other[0] = 2;
+        assert!(read(&other).is_none());
     }
 }

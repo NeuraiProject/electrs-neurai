@@ -77,6 +77,13 @@ const COLUMN_FAMILIES: &[&str] = &[
 
 const CONFIG_KEY: &str = "C";
 const TIP_KEY: &[u8] = b"T";
+/// UTXO snapshots are kept in the config CF, keyed by this byte and the
+/// scripthash: a new CF would stop older versions from opening the DB.
+const UTXO_SNAPSHOT_KEY: u8 = b'U';
+
+fn utxo_snapshot_key(scripthash: &[u8; 32]) -> Vec<u8> {
+    [&[UTXO_SNAPSHOT_KEY][..], scripthash].concat()
+}
 
 // Taken from https://github.com/facebook/rocksdb/blob/master/include/rocksdb/db.h#L654-L689
 const DB_PROPERTIES: &[&str] = &[
@@ -413,6 +420,45 @@ impl DBStore {
         rows
     }
 
+    /// Stored UTXO snapshots, by scripthash (see `status::UtxoSnapshot`).
+    pub(crate) fn utxo_snapshots(&self) -> Vec<([u8; 32], Box<[u8]>)> {
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.set_total_order_seek(true);
+        let mut raw = self.db.raw_iterator_cf_opt(self.config_cf(), opts);
+        raw.seek([UTXO_SNAPSHOT_KEY]);
+        let mut rows = Vec::new();
+        while let (Some(key), Some(value)) = (raw.key(), raw.value()) {
+            if key.first() != Some(&UTXO_SNAPSHOT_KEY) {
+                break;
+            }
+            if let Ok(scripthash) = key[1..].try_into() {
+                rows.push((scripthash, value.into()));
+            }
+            raw.next();
+        }
+        raw.status().expect("UTXO snapshots scan failed");
+        rows
+    }
+
+    pub(crate) fn put_utxo_snapshot(&self, scripthash: &[u8; 32], value: &[u8]) {
+        self.db
+            .put_cf(self.config_cf(), utxo_snapshot_key(scripthash), value)
+            .expect("DB::put failed");
+    }
+
+    /// Replaces the stored UTXO snapshots.
+    pub(crate) fn set_utxo_snapshots(&self, snapshots: impl Iterator<Item = ([u8; 32], Vec<u8>)>) {
+        let cf = self.config_cf();
+        let mut batch = rocksdb::WriteBatch::default();
+        for (scripthash, _) in self.utxo_snapshots() {
+            batch.delete_cf(cf, utxo_snapshot_key(&scripthash));
+        }
+        for (scripthash, value) in snapshots {
+            batch.put_cf(cf, utxo_snapshot_key(&scripthash), value);
+        }
+        self.db.write(batch).expect("DB::write failed");
+    }
+
     fn scan_prefix_cf(&self, cf: &rocksdb::ColumnFamily, prefix: HashPrefix) -> Vec<KeyValue> {
         let mut opts = rocksdb::ReadOptions::default();
         opts.set_prefix_same_as_start(true);
@@ -670,6 +716,29 @@ mod tests {
             let config = store.get_config().unwrap();
             assert_eq!(config.format, CURRENT_FORMAT);
         }
+    }
+
+    #[test]
+    fn test_utxo_snapshots_are_kept_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = DBStore::open(dir.path(), None, true, 1).unwrap();
+            assert!(store.utxo_snapshots().is_empty());
+            store.put_utxo_snapshot(&[2; 32], b"two");
+            store.put_utxo_snapshot(&[1; 32], b"one");
+            let rows = store.utxo_snapshots();
+            assert_eq!(rows.len(), 2);
+            assert_eq!((rows[0].0, &rows[0].1[..]), ([1; 32], &b"one"[..]));
+
+            store.set_utxo_snapshots([([3; 32], b"three".to_vec())].into_iter());
+            let rows = store.utxo_snapshots();
+            assert_eq!(rows.len(), 1);
+            assert_eq!((rows[0].0, &rows[0].1[..]), ([3; 32], &b"three"[..]));
+        }
+        // the DB config is untouched, and the snapshots are still there
+        let store = DBStore::open(dir.path(), None, false, 1).unwrap();
+        assert_eq!(store.get_config().unwrap().format, CURRENT_FORMAT);
+        assert_eq!(store.utxo_snapshots().len(), 1);
     }
 
     #[test]
