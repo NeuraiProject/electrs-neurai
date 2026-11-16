@@ -64,13 +64,29 @@ per query, while every other client waited:
   1,000,000 UTXOs). The next queries only read the blocks found since: 60 ms
   instead of 65–85 s for that address. A reorg below the kept tip rebuilds it.
   They are saved in the DB (config CF, so older versions still open it) when
-  built and on shutdown: after a restart, the first query is fast too.
+  built, every 1,000 new blocks and on shutdown: after a restart, the first
+  query is fast too.
+* When the index shows the address paid in 10,000 blocks or more, its
+  snapshot is built from its outputs alone (read, then the spent ones
+  removed), not from its whole history: +70 MB instead of +755 MB for that
+  address.
 * `get_mempool` answers whatever the size of the confirmed history, like
   ElectrumX.
 * The cache of raw transactions (for `blockchain.transaction.get`) is bounded
   to 128 MB, oldest out first, and no longer takes the transactions of
   addresses paid in 10,000 blocks or more. It used to grow forever: one query of
   that address added ~950,000 transactions (430 MB).
+* At every block, a subscription only looks up the spends of its unspent
+  outputs, not of every output it ever received (one index lookup each).
+
+**Memory at start.** Loading mainnet's 1.87M headers peaked at ~1.6 GB (a map
+of the headers and two intermediate copies of the chain); they are now indexed
+by position, hashed in parallel, and the chain is written once: 646 MB at the
+peak, and 2.6 s instead of 9.4 s.
+
+**Scanners.** A connection whose first line is an HTTP request is closed, and
+the errors of clients (invalid JSON, binary data on `tcp://`, reset
+connections) are logged at debug level instead of as warnings.
 
 **Neurai 2.0 / DePIN-Test.** electrs-neurai works with the DePIN-Test testnet
 (checked against `/Neurai:2.0.0/` on testnet and on a regtest that uses every

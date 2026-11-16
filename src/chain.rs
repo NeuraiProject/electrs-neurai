@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::{BlockHash, TxMerkleNode};
+use rayon::prelude::*;
 
 use crate::neurai::block::NeuraiBlockHeader;
 use crate::neurai::NetworkParams;
@@ -75,7 +76,13 @@ impl Chain {
         self.update(vec![NewHeader::new(header, hash, new_height)]);
     }
 
-    /// Load the chain from a collection of headers, up to the given tip
+    /// Load the chain from a collection of headers, up to the given tip.
+    ///
+    /// The headers come in DB order, stale ones included, so they are indexed
+    /// by hash to follow `prev_blockhash` back from the tip. Only their
+    /// positions are indexed, and the chain is written once: on mainnet (1.87M
+    /// headers) a map of the headers and two intermediate copies of the chain
+    /// made the start peak at ~1.6 GB.
     pub(crate) fn load(
         &mut self,
         headers: impl Iterator<Item = NeuraiBlockHeader>,
@@ -84,34 +91,54 @@ impl Chain {
         let genesis_hash = self.headers[0].0;
         let params = self.params;
 
-        let header_map: HashMap<BlockHash, NeuraiBlockHeader> = headers
+        let headers: Vec<NeuraiBlockHeader> = headers.collect();
+        let hashes: Vec<BlockHash> = headers
+            .par_iter()
             .map(|h| {
-                let hash = h
-                    .block_hash(params)
-                    .expect("all stored headers must have a computable hash");
-                (hash, h)
+                h.block_hash(params)
+                    .expect("all stored headers must have a computable hash")
             })
             .collect();
+        let mut positions: HashMap<BlockHash, u32> = HashMap::with_capacity(hashes.len());
+        for (position, hash) in hashes.iter().enumerate() {
+            let position = u32::try_from(position).expect("too many headers");
+            positions.insert(*hash, position);
+        }
 
+        // positions from the tip down to the genesis
+        let mut chain: Vec<u32> = Vec::new();
         let mut blockhash = tip;
-        let mut new_headers: Vec<(NeuraiBlockHeader, BlockHash)> =
-            Vec::with_capacity(header_map.len());
         while blockhash != genesis_hash {
-            let header = match header_map.get(&blockhash) {
-                Some(h) => *h,
+            let position = match positions.get(&blockhash) {
+                Some(&position) => position,
                 None => panic!("missing header {} while loading from DB", blockhash),
             };
-            new_headers.push((header, blockhash));
-            blockhash = header.prev_blockhash;
+            chain.push(position);
+            blockhash = headers[position as usize].prev_blockhash;
         }
-        info!("loading {} headers, tip={}", new_headers.len(), tip);
-        let new_headers: Vec<NewHeader> = new_headers
-            .into_iter()
-            .rev()
-            .enumerate()
-            .map(|(i, (h, hash))| NewHeader::new(h, hash, i + 1))
-            .collect();
-        self.update(new_headers);
+        drop(positions);
+        info!("loading {} headers, tip={}", chain.len(), tip);
+
+        for (hash, _header) in self.headers.drain(1..) {
+            self.heights.remove(&hash);
+        }
+        self.headers.reserve_exact(chain.len());
+        self.headers.extend(
+            chain
+                .iter()
+                .rev()
+                .map(|&position| (hashes[position as usize], headers[position as usize])),
+        );
+        drop((chain, hashes, headers));
+        self.heights.reserve(self.headers.len());
+        for (height, (hash, _header)) in self.headers.iter().enumerate().skip(1) {
+            self.heights.insert(*hash, height);
+        }
+        info!(
+            "chain updated: tip={}, height={}",
+            self.tip(),
+            self.height()
+        );
     }
 
     /// Get the block hash at specified height (if exists)
@@ -259,5 +286,44 @@ mod tests {
         chain.drop_last_headers(10); // safe to drop more than available
         assert_eq!(chain.height(), 0);
         assert_eq!(chain.tip(), genesis_hash);
+    }
+
+    #[test]
+    fn test_load_follows_the_tip_among_shuffled_and_stale_headers() {
+        let params = regtest_params();
+        let genesis_hash = Chain::new(params).tip();
+        // a chain of 6 blocks, and a stale branch of 2 off block 3
+        let mut main = vec![];
+        let mut prev = genesis_hash;
+        for i in 1u32..=6 {
+            let h = make_header(prev, 1_700_000_000 + i, i);
+            prev = h.sha256d_hash();
+            main.push(h);
+        }
+        let mut stale = vec![];
+        let mut prev = main[2].sha256d_hash();
+        for i in 1u32..=2 {
+            let h = make_header(prev, 1_800_000_000 + i, 100 + i);
+            prev = h.sha256d_hash();
+            stale.push(h);
+        }
+        let mut stored: Vec<NeuraiBlockHeader> = main.iter().chain(&stale).copied().collect();
+        stored.reverse();
+        stored.swap(0, 3);
+
+        let mut chain = Chain::new(params);
+        chain.load(stored.into_iter(), main[5].sha256d_hash());
+        assert_eq!(chain.height(), 6);
+        assert_eq!(chain.get_block_height(&genesis_hash), Some(0));
+        for (i, header) in main.iter().enumerate() {
+            let hash = header.sha256d_hash();
+            assert_eq!(chain.get_block_hash(i + 1), Some(hash));
+            assert_eq!(chain.get_block_height(&hash), Some(i + 1));
+            let stored = chain.get_block_header(i + 1).map(|h| h.sha256d_hash());
+            assert_eq!(stored, Some(hash));
+        }
+        for header in &stale {
+            assert_eq!(chain.get_block_height(&header.sha256d_hash()), None);
+        }
     }
 }

@@ -443,11 +443,21 @@ impl ScriptHashStatus {
             .flat_map(|(_height, entries)| entries)
     }
 
-    /// Collect all funded and confirmed outpoints (as a set).
-    fn confirmed_outpoints(&self, chain: &Chain) -> HashSet<OutPoint> {
-        self.confirmed_entries(chain)
+    /// Funded and confirmed outpoints that no confirmed entry spends: only
+    /// those can be spent by new blocks or the mempool (looking up the spends
+    /// of all of them took one index lookup per output ever received, at every
+    /// block, for every subscription).
+    fn confirmed_unspent_outpoints(&self, chain: &Chain) -> HashSet<OutPoint> {
+        let mut outpoints: HashSet<OutPoint> = self
+            .confirmed_entries(chain)
             .flat_map(TxEntry::funding_outpoints)
-            .collect()
+            .collect();
+        for entry in self.confirmed_entries(chain) {
+            for spent in &entry.spent {
+                outpoints.remove(spent);
+            }
+        }
+        outpoints
     }
 
     /// Collect unspent transaction entries
@@ -556,7 +566,9 @@ impl ScriptHashStatus {
         self.for_new_blocks(spending_blockhashes, daemon, |blockhash, block| {
             let block_entries = result.entry(blockhash).or_default();
 
-            for filtered_inputs in filter_block_txs_inputs(&block, outpoints, params) {
+            for filtered_inputs in
+                filter_block_txs_inputs(&block, |o| outpoints.contains(o), params)
+            {
                 if cache_txs {
                     cache.add_tx(filtered_inputs.txid, move || filtered_inputs.tx_bytes);
                 }
@@ -589,7 +601,7 @@ impl ScriptHashStatus {
         daemon: &Daemon,
         cache: &Cache,
     ) -> Result<()> {
-        let mut outpoints: HashSet<OutPoint> = self.confirmed_outpoints(index.chain());
+        let mut outpoints: HashSet<OutPoint> = self.confirmed_unspent_outpoints(index.chain());
 
         let new_tip = index.chain().tip();
         if self.tip != new_tip {
@@ -701,6 +713,8 @@ const LONG_HISTORY_BLOCKS: usize = 10_000;
 /// Bounds of `UtxoSnapshots`.
 const MAX_UTXO_SNAPSHOTS: usize = 1_000;
 const MAX_UTXO_SNAPSHOT_OUTPOINTS: usize = 1_000_000;
+/// New blocks after which an updated `UtxoSnapshot` is saved again.
+const UTXO_SNAPSHOT_SAVE_BLOCKS: usize = 1_000;
 /// Version of `UtxoSnapshot::to_bytes`.
 const UTXO_SNAPSHOT_FORMAT: u8 = 1;
 /// Serialized size of a native UTXO: txid, vout, height, value, seq, asset tag.
@@ -749,9 +763,80 @@ pub(crate) struct UtxoSnapshot {
     unspent: Unspent,
     /// Blocks read to build it: past that many new blocks, rebuilding is cheaper.
     history_blocks: usize,
+    /// New blocks applied since it was last saved in the DB.
+    unsaved_blocks: usize,
+}
+
+/// Whether the index shows `scripthash` paid in at least `LONG_HISTORY_BLOCKS`
+/// blocks: then `UtxoSnapshot::build` is the way to get its UTXOs.
+pub(crate) fn has_long_history(index: &Index, scripthash: ScriptHash) -> bool {
+    let height = index.chain().height();
+    index
+        .funding_heights(scripthash)
+        .filter(|&h| h <= height)
+        .take(LONG_HISTORY_BLOCKS)
+        .count()
+        >= LONG_HISTORY_BLOCKS
 }
 
 impl UtxoSnapshot {
+    /// Reads the blocks of `scripthash` keeping only its outputs, then removes
+    /// the spent ones: much less memory than a `ScriptHashStatus`, which keeps
+    /// every transaction of the history (a ~950,000 one took ~700 MB).
+    pub(crate) fn build(scripthash: ScriptHash, index: &Index, daemon: &Daemon) -> Result<Self> {
+        let chain = index.chain();
+        let params = chain.params();
+        let tip = chain.tip();
+        let mut heights = index.limit_result(index.funding_heights(scripthash))?;
+        heights.sort_unstable();
+        heights.dedup();
+        let funding: Vec<BlockHash> = heights
+            .into_iter()
+            .filter_map(|h| chain.get_block_hash(h))
+            .collect();
+        let mut unspent = Unspent::default();
+        // In chain order: `Unspent::insert` numbers the outputs in that order.
+        daemon.for_blocks(funding.iter().copied(), |blockhash, block| {
+            let height = chain.get_block_height(&blockhash).expect("requested block");
+            let fork = params.fork_active(height);
+            for funding in filter_block_txs_outputs(&block, scripthash, params, fork) {
+                let entry = TxEntry {
+                    txid: funding.txid,
+                    outputs: funding.result,
+                    spent: Vec::new(),
+                };
+                unspent.insert(&entry, height);
+            }
+        })?;
+        let spending: HashSet<BlockHash> = unspent
+            .outpoints
+            .par_iter()
+            .flat_map_iter(|(outpoint, _)| index.filter_by_spending(*outpoint))
+            .collect();
+        let history_blocks = funding.len() + spending.len();
+        daemon.for_blocks(spending, |_, block| {
+            let spent =
+                filter_block_txs_inputs(&block, |o| unspent.outpoints.contains_key(o), params);
+            for outpoint in spent.iter().flat_map(|tx| &tx.result) {
+                unspent.outpoints.remove(outpoint);
+            }
+        })?;
+        unspent.outpoints.shrink_to_fit();
+        debug!(
+            "UTXO snapshot of {}: {} UTXOs from {} blocks",
+            scripthash,
+            unspent.outpoints.len(),
+            history_blocks
+        );
+        Ok(Self {
+            scripthash,
+            tip,
+            unspent,
+            history_blocks,
+            unsaved_blocks: 0,
+        })
+    }
+
     /// Snapshot of a synced `status`, if its history is long enough to keep one.
     pub(crate) fn of_long_history(status: &ScriptHashStatus, chain: &Chain) -> Option<Self> {
         let history_blocks = status.confirmed_blocks();
@@ -770,7 +855,18 @@ impl UtxoSnapshot {
             tip: status.tip,
             unspent,
             history_blocks,
+            unsaved_blocks: 0,
         })
+    }
+
+    /// Whether enough new blocks were applied since it was last saved: saving
+    /// it then spares reading them again after a crash.
+    pub(crate) fn save_due(&self) -> bool {
+        self.unsaved_blocks >= UTXO_SNAPSHOT_SAVE_BLOCKS
+    }
+
+    pub(crate) fn mark_saved(&mut self) {
+        self.unsaved_blocks = 0;
     }
 
     fn len(&self) -> usize {
@@ -847,6 +943,7 @@ impl UtxoSnapshot {
                 next_seq,
             },
             history_blocks,
+            unsaved_blocks: 0,
         })
     }
 
@@ -871,7 +968,6 @@ impl UtxoSnapshot {
         let params = chain.params();
         let scripthash = self.scripthash;
         let unspent = &mut self.unspent;
-        let mut outpoints: HashSet<OutPoint> = unspent.outpoints.keys().copied().collect();
         // Every new block, in chain order: its outputs to the scripthash first,
         // then its inputs spending them (a transaction can only spend outputs of
         // the transactions before it).
@@ -884,14 +980,12 @@ impl UtxoSnapshot {
                     outputs: funding.result,
                     spent: Vec::new(),
                 };
-                outpoints.extend(entry.funding_outpoints());
                 unspent.insert(&entry, height);
             }
-            for spending in filter_block_txs_inputs(&block, &outpoints, params) {
-                for outpoint in &spending.result {
-                    unspent.outpoints.remove(outpoint);
-                    outpoints.remove(outpoint);
-                }
+            let spent =
+                filter_block_txs_inputs(&block, |o| unspent.outpoints.contains_key(o), params);
+            for outpoint in spent.iter().flat_map(|tx| &tx.result) {
+                unspent.outpoints.remove(outpoint);
             }
         })?;
         debug!(
@@ -901,6 +995,7 @@ impl UtxoSnapshot {
             new_blocks
         );
         self.tip = chain.tip();
+        self.unsaved_blocks += new_blocks;
         Ok(true)
     }
 
@@ -1096,21 +1191,22 @@ fn filter_block_txs_outputs(
     find_outputs.result
 }
 
+/// Transactions of `block` with inputs spending outpoints for which `relevant` is true.
 fn filter_block_txs_inputs(
-    block: &SerBlock,
-    outpoints: &HashSet<OutPoint>,
+    block: &[u8],
+    relevant: impl Fn(&OutPoint) -> bool,
     params: &'static NetworkParams,
 ) -> Vec<FilteredTx<OutPoint>> {
     // Same visiting order as in `filter_block_txs_outputs`: inputs first, then
     // `visit_transaction` for the transaction that owns them.
-    struct FindInputs<'a> {
-        outpoints: &'a HashSet<OutPoint>,
+    struct FindInputs<F> {
+        relevant: F,
         result: Vec<FilteredTx<OutPoint>>,
         buffer: Vec<OutPoint>,
         pos: usize,
     }
 
-    impl tx::Visitor for FindInputs<'_> {
+    impl<F: Fn(&OutPoint) -> bool> tx::Visitor for FindInputs<F> {
         fn visit_transaction(&mut self, tx: &tx::Transaction) -> ControlFlow<()> {
             if !self.buffer.is_empty() {
                 self.result.push(FilteredTx::<OutPoint> {
@@ -1125,7 +1221,7 @@ fn filter_block_txs_inputs(
         }
         fn visit_tx_in(&mut self, _vin: usize, tx_in: &tx::TxIn) -> ControlFlow<()> {
             let current: OutPoint = tx_in.prevout();
-            if self.outpoints.contains(&current) {
+            if (self.relevant)(&current) {
                 self.buffer.push(current);
             }
             ControlFlow::Continue(())
@@ -1133,7 +1229,7 @@ fn filter_block_txs_inputs(
     }
 
     let mut find_inputs = FindInputs {
-        outpoints,
+        relevant,
         result: vec![],
         buffer: vec![],
         pos: 0,
@@ -1213,7 +1309,7 @@ mod tests {
         let mut outpoints = HashSet::new();
         outpoints.insert(outpoint);
 
-        let result = &super::filter_block_txs_inputs(&block, &outpoints, params)[0];
+        let result = &super::filter_block_txs_inputs(&block, |o| outpoints.contains(o), params)[0];
         assert_eq!(
             result.txid.to_string(),
             "7bcdcb44422da5a99daad47d6ba1c3d6f2e48f961a75e42c4fa75029d4b0ef49"
@@ -1246,7 +1342,8 @@ mod tests {
             }
             for input in tx.input.iter().filter(|i| !i.previous_output.is_null()) {
                 let outpoints = HashSet::from([input.previous_output]);
-                let found = super::filter_block_txs_inputs(&block_bytes.to_vec(), &outpoints, params);
+                let found =
+                    super::filter_block_txs_inputs(block_bytes, |o| outpoints.contains(o), params);
                 assert_eq!(found.len(), 1);
                 assert_eq!((found[0].txid, found[0].pos), (txid, pos));
             }
@@ -1494,6 +1591,7 @@ mod tests {
             tip: bitcoin::BlockHash::all_zeros(),
             unspent,
             history_blocks: super::LONG_HISTORY_BLOCKS,
+            unsaved_blocks: 0,
         }
     }
 

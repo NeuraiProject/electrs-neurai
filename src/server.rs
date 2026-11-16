@@ -282,20 +282,57 @@ fn recv_loop(peer_id: usize, mut conn: Connection, server_tx: Sender<Event>) -> 
     let msg = Message::New(conn.writer.clone());
     server_tx.send(Event { peer_id, msg })?;
 
-    let result = loop {
+    let mut first = true;
+    loop {
         match conn.recv() {
             Ok(Some(request)) => {
                 debug!("{}: recv {}", peer_id, request);
+                if first && is_http_request(&request) {
+                    // web scanners: no Electrum client sends HTTP here
+                    debug!("{}: HTTP request, disconnecting", peer_id);
+                    break;
+                }
+                first = false;
                 let msg = Message::Request(request);
                 server_tx.send(Event { peer_id, msg })?;
             }
-            Ok(None) => break Ok(()),
-            Err(e) => break Err(e.context(format!("{}: recv failed", peer_id))),
+            Ok(None) => break,
+            Err(e) => {
+                // the client's doing: a reset connection, or binary data
+                // (TLS or other protocols sent to tcp://, scanners)
+                debug!("{}: recv failed: {:#}", peer_id, e);
+                break;
+            }
         }
-    };
+    }
 
     debug!("{}: disconnected", peer_id);
     let msg = Message::Done;
     server_tx.send(Event { peer_id, msg })?;
-    result
+    Ok(())
+}
+
+/// An HTTP request line (`GET / HTTP/1.1`, the HTTP/2 preface...).
+fn is_http_request(line: &str) -> bool {
+    const METHODS: &[&str] = &[
+        "GET ", "HEAD ", "POST ", "PUT ", "DELETE ", "OPTIONS ", "CONNECT ", "TRACE ", "PATCH ",
+        "PRI ",
+    ];
+    METHODS.iter().any(|method| line.starts_with(method)) && line.contains(" HTTP/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_http_request;
+
+    #[test]
+    fn http_request_lines() {
+        assert!(is_http_request("GET / HTTP/1.1"));
+        assert!(is_http_request("POST /api HTTP/1.0\r"));
+        assert!(is_http_request("PRI * HTTP/2.0"));
+        let request = r#"{"id":1,"method":"server.version","params":[]}"#;
+        assert!(!is_http_request(request));
+        assert!(!is_http_request("GET"));
+        assert!(!is_http_request(r#"GET {"id":1}"#));
+    }
 }

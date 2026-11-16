@@ -24,8 +24,8 @@ use crate::{
     metrics::{self, Histogram, Metrics},
     signals::Signal,
     status::{
-        Balance, ScriptHashStatus, UnspentEntry, UnspentStatus, UtxoSnapshot, UtxoSnapshots,
-        NATIVE_ASSET_KEY,
+        has_long_history, Balance, ScriptHashStatus, UnspentEntry, UnspentStatus, UtxoSnapshot,
+        UtxoSnapshots, NATIVE_ASSET_KEY,
     },
     tracker::Tracker,
     transport::Service,
@@ -959,26 +959,48 @@ impl Rpc {
         scripthash: ScriptHash,
         method: &str,
     ) -> Result<UnspentStatus> {
+        let index = self.tracker.index();
+        let mempool = self.tracker.mempool();
         let snapshot = self.utxo_snapshots.lock().take(&scripthash);
         if let Some(mut snapshot) = snapshot {
-            if snapshot.update(self.tracker.index(), &self.daemon)? {
-                let status = snapshot.unspent_status(self.tracker.mempool(), &self.cache);
+            if snapshot.update(index, &self.daemon)? {
+                let status = snapshot.unspent_status(mempool, &self.cache);
+                if snapshot.save_due() {
+                    self.save_utxo_snapshot(&mut snapshot);
+                }
                 self.utxo_snapshots.lock().put(snapshot);
                 return Ok(status);
             }
         }
+        if has_long_history(index, scripthash) {
+            info!(
+                "{} {} called for unsubscribed scripthash",
+                UNSUBSCRIBED_QUERY_MESSAGE, method
+            );
+            let mut snapshot = UtxoSnapshot::build(scripthash, index, &self.daemon)?;
+            let status = snapshot.unspent_status(mempool, &self.cache);
+            self.save_utxo_snapshot(&mut snapshot);
+            self.utxo_snapshots.lock().put(snapshot);
+            return Ok(status);
+        }
         let status = self.status_of(client, scripthash, method)?;
         let chain = self.tracker.chain();
-        if let Some(snapshot) = UtxoSnapshot::of_long_history(&status, chain) {
-            // saved now too, so that a crash does not lose it
-            let key = snapshot.scripthash().to_byte_array();
-            self.tracker
-                .index()
-                .store()
-                .put_utxo_snapshot(&key, &snapshot.to_bytes());
+        if let Some(mut snapshot) = UtxoSnapshot::of_long_history(&status, chain) {
+            self.save_utxo_snapshot(&mut snapshot);
             self.utxo_snapshots.lock().put(snapshot);
         }
-        Ok(status.unspent_status(chain, self.tracker.mempool()))
+        Ok(status.unspent_status(chain, mempool))
+    }
+
+    /// Saved when built too, and every `UTXO_SNAPSHOT_SAVE_BLOCKS`: a crash
+    /// then only loses the blocks applied since.
+    fn save_utxo_snapshot(&self, snapshot: &mut UtxoSnapshot) {
+        let key = snapshot.scripthash().to_byte_array();
+        self.tracker
+            .index()
+            .store()
+            .put_utxo_snapshot(&key, &snapshot.to_bytes());
+        snapshot.mark_saved();
     }
 
     fn scripthash_list_unspent(&self, client: &Client, args: &Args) -> Result<Value> {
@@ -1645,12 +1667,13 @@ fn parse_requests(line: &str) -> Result<Requests, StandardError> {
             // parse RPC from JSON
             Ok(requests) => Ok(requests),
             Err(err) => {
-                warn!("invalid RPC request ({:?}): {}", line, err);
+                // errors of the client, answered as such: not worth a warning
+                debug!("invalid RPC request ({:?}): {}", line, err);
                 Err(StandardError::InvalidRequest)
             }
         },
         Err(err) => {
-            warn!("invalid JSON ({:?}): {}", line, err);
+            debug!("invalid JSON ({:?}): {}", line, err);
             Err(StandardError::ParseError)
         }
     }
