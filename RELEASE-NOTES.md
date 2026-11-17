@@ -123,11 +123,36 @@ in `server.features`. No existing method changes.
   about 5 s; ten clients at once took 18–24 s, the server under 230 MB.
 * Afterwards, only the changes since the wallet's block: the UTXO snapshot of
   a long history keeps a journal of the UTXOs each block added and removed
-  (about 30 days of blocks), saved with it (format 2; format 1 is still read).
+  (about 30 days of blocks), saved with it (from format 2; format 1 is still read).
   It also undoes reorgs, and keeps the blocks they took out of the chain, so a
   wallet on such a block gets back to the chain with ordinary changes.
 * `blockchain.scripthash.utxo_subscribe`: notifications for addresses of any
   size, which `blockchain.scripthash.subscribe` refuses beyond `MAX_HISTORY`.
+
+**Recent history of long histories.** `get_history` answers "history too
+large" for the addresses above, so wallets showed no transactions for them.
+`blockchain.scripthash.get_recent_history(scripthash, offset, limit)` (in
+[doc/utxo-chunks.md](doc/utxo-chunks.md), advertised as `"recent_history": 1`)
+gives, for an address with a UTXO snapshot, its last 1,000 confirmed
+transactions and its mempool ones, newest first, each with its height and its
+net change in XNA (`value`) and in each asset (`assets`), so a wallet lists
+them without downloading them. Pages of up to 500 entries (about 65 KB, 6.6 KB
+for 50), answered in milliseconds. Other addresses get error 11 and keep using
+`get_history`.
+
+* The entries come from the blocks read for the snapshot: while reading them,
+  only the latest 1,000 transactions paying the address and the latest 1,000
+  spending its coins are kept, then put together by transaction (one that
+  spends and pays change back is one entry). For the mining pool address
+  (955,362 blocks read), the snapshot was built in 88 s against 87 s without
+  it, with the same memory. The amounts of its 20 spends and of 14 other
+  entries are the node's.
+* Each new block adds its transactions and drops the oldest; a reorg takes
+  out those of the blocks it undoes.
+* Saved with the snapshot (format 3). Snapshots of formats 1 and 2 are still
+  read; the first `get_recent_history` of such an address reads its blocks
+  again (88 s for the pool address, once) and keeps its journal. Older versions
+  ignore format 3 snapshots (with a warning) and build them again.
 
 **Memory at start.** Loading mainnet's 1.87M headers peaked at ~1.6 GB (a map
 of the headers and two intermediate copies of the chain); they are now indexed

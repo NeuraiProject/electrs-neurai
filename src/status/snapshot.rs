@@ -1,6 +1,7 @@
 //! UTXO snapshots of the scripthashes with long histories: their confirmed
-//! UTXOs and a journal of the last blocks' changes, shared by every client
-//! (`listunspent`, `get_balance`, `get_mempool`, `utxo_sync`, `utxo_subscribe`).
+//! UTXOs, a journal of the last blocks' changes and their latest
+//! transactions, shared by every client (`listunspent`, `get_balance`,
+//! `get_mempool`, `utxo_sync`, `utxo_subscribe`, `get_recent_history`).
 
 use anyhow::Result;
 use bitcoin::{hashes::Hash, BlockHash, OutPoint, Txid};
@@ -8,7 +9,7 @@ use parking_lot::Mutex;
 use rayon::prelude::*;
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
@@ -17,8 +18,13 @@ use std::{
 
 use super::{
     filter_block_txs_inputs, filter_block_txs_outputs, filter_outputs, listed, mempool_entries,
-    mempool_history, mempool_utxo, utxo_of, Balance, OutputInfo, ScriptHashStatus, TxEntry,
-    Unspent, UnspentStatus, LONG_HISTORY_BLOCKS,
+    mempool_history, mempool_utxo,
+    recent::{
+        self, Delta, HistoryItem, Latest, RecentEntry, RecentHistory, RecentHistoryPage,
+        RECENT_HISTORY_LEN,
+    },
+    utxo_of, Balance, OutputInfo, ScriptHashStatus, TxEntry, TxOutput, Unspent, UnspentStatus,
+    LONG_HISTORY_BLOCKS,
 };
 use crate::{
     cache::Cache,
@@ -26,6 +32,7 @@ use crate::{
     daemon::Daemon,
     index::Index,
     mempool::Mempool,
+    neurai::NetworkParams,
     types::ScriptHash,
     utxo::{Changes, MempoolPart, Sum256, Utxo},
 };
@@ -35,8 +42,9 @@ const MAX_UTXO_SNAPSHOTS: usize = 1_000;
 const MAX_UTXO_SNAPSHOT_OUTPOINTS: usize = 2_000_000;
 /// New blocks after which an updated `UtxoSnapshot` is saved again.
 const UTXO_SNAPSHOT_SAVE_BLOCKS: usize = 1_000;
-/// Version of `UtxoSnapshot::to_bytes` (1: without the journal).
-const UTXO_SNAPSHOT_FORMAT: u8 = 2;
+/// Version of `UtxoSnapshot::to_bytes` (1: without the journal, 2: without
+/// the recent history).
+const UTXO_SNAPSHOT_FORMAT: u8 = 3;
 /// Serialized size of a native UTXO: txid, vout, height, value, seq, asset tag.
 const MIN_UTXO_BYTES: usize = 32 + 4 + 8 + 8 + 8 + 1;
 /// Blocks of changes kept in the journal of a `UtxoSnapshot`: about 30 days
@@ -80,6 +88,15 @@ impl<'a> Reader<'a> {
         Some(u64::from_le_bytes(self.array()?))
     }
 
+    fn i64(&mut self) -> Option<i64> {
+        Some(i64::from_le_bytes(self.array()?))
+    }
+
+    fn string(&mut self) -> Option<String> {
+        let len = self.u16()?.into();
+        String::from_utf8(self.take(len)?.to_vec()).ok()
+    }
+
     fn usize(&mut self) -> Option<usize> {
         usize::try_from(self.u64()?).ok()
     }
@@ -92,10 +109,7 @@ impl<'a> Reader<'a> {
             seq: self.usize()?,
             asset: match self.u8()? {
                 0 => None,
-                1 => {
-                    let len = self.u16()?.into();
-                    Some(String::from_utf8(self.take(len)?.to_vec()).ok()?)
-                }
+                1 => Some(self.string()?),
                 _ => return None,
             },
         };
@@ -120,7 +134,47 @@ impl<'a> Reader<'a> {
             removed: self.utxos(bytes)?,
         })
     }
+
+    fn history_item(&mut self) -> Option<HistoryItem> {
+        let mut item = HistoryItem::new(
+            Txid::from_byte_array(self.array()?),
+            self.usize()?,
+            self.usize()?,
+        );
+        item.delta.value = self.i64()?;
+        for _ in 0..self.u32()? {
+            let name = self.string()?;
+            let amount = self.i64()?;
+            if amount == 0 || item.delta.assets.insert(name, amount).is_some() {
+                return None;
+            }
+        }
+        Some(item)
+    }
+
+    /// `RecentHistory::write`, after a flag (0: none).
+    fn recent_history(&mut self, bytes: usize) -> Option<Option<RecentHistory>> {
+        match self.u8()? {
+            0 => return Some(None),
+            1 => (),
+            _ => return None,
+        }
+        let complete = match self.u8()? {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        let count = self.usize()?;
+        let mut items = Vec::with_capacity(count.min(bytes / MIN_HISTORY_ITEM_BYTES));
+        for _ in 0..count {
+            items.push(self.history_item()?);
+        }
+        RecentHistory::from_sorted(items, complete).map(Some)
+    }
 }
+
+/// Serialized size of a `HistoryItem` without assets.
+const MIN_HISTORY_ITEM_BYTES: usize = 32 + 8 + 8 + 8 + 4;
 
 fn write_utxo(out: &mut Vec<u8>, outpoint: &OutPoint, info: &OutputInfo) {
     out.extend_from_slice(outpoint.txid.as_byte_array());
@@ -215,6 +269,83 @@ fn mempool_part(
     };
     part.sort();
     part
+}
+
+/// The mempool transactions paying `scripthash` or spending its `confirmed`
+/// UTXOs (or the outputs of the former), with what they change in its
+/// balance, newest first: the reverse of the order of `get_history` (those
+/// spending unconfirmed outputs first, then by txid). Like in `mempool_part`,
+/// those already confirmed (`recent` has them, or their outputs are in
+/// `confirmed`) are left out.
+fn mempool_txs(
+    scripthash: ScriptHash,
+    mempool: &Mempool,
+    confirmed: &HashMap<OutPoint, OutputInfo>,
+    recent: &RecentHistory,
+) -> Vec<RecentEntry> {
+    let mut txs: HashMap<Txid, Delta> = HashMap::new();
+    // outputs of the mempool transactions
+    let mut added: HashMap<OutPoint, OutputInfo> = HashMap::new();
+    for entry in mempool.filter_by_funding(&scripthash) {
+        let outputs = filter_outputs(&entry.tx, scripthash, entry.fork);
+        let outpoint = |output: &TxOutput| OutPoint::new(entry.txid, output.index);
+        if outputs.is_empty()
+            || recent.contains(&entry.txid)
+            || outputs.iter().any(|o| confirmed.contains_key(&outpoint(o)))
+        {
+            continue;
+        }
+        let delta = txs.entry(entry.txid).or_default();
+        for output in &outputs {
+            delta.receive(output);
+            let mut info = OutputInfo::default();
+            match &output.asset {
+                Some(a) => (info.value, info.asset) = (a.amount, Some(a.name.clone())),
+                None => info.value = output.value.to_sat(),
+            }
+            added.insert(outpoint(output), info);
+        }
+    }
+    let known =
+        |outpoint: &OutPoint| confirmed.contains_key(outpoint) || added.contains_key(outpoint);
+    // the fewest lookups: the spends of the mempool, or the outputs of the scripthash
+    let spends: Vec<(OutPoint, Txid)> = if confirmed.len() + added.len() > mempool.spends_count() {
+        mempool
+            .spends()
+            .filter(|(outpoint, _)| known(outpoint))
+            .copied()
+            .collect()
+    } else {
+        confirmed
+            .keys()
+            .chain(added.keys())
+            .flat_map(|outpoint| {
+                mempool
+                    .filter_by_spending(outpoint)
+                    .into_iter()
+                    .map(move |entry| (*outpoint, entry.txid))
+            })
+            .collect()
+    };
+    for (outpoint, txid) in spends {
+        let info = confirmed.get(&outpoint).or_else(|| added.get(&outpoint));
+        let info = info.expect("a known outpoint");
+        txs.entry(txid).or_default().spend(info);
+    }
+    let mut entries: Vec<(bool, Txid, Delta)> = txs
+        .into_iter()
+        .filter_map(|(txid, delta)| {
+            let entry = mempool.get(&txid)?;
+            Some((entry.has_unconfirmed_inputs, txid, delta))
+        })
+        .collect();
+    entries.sort_unstable_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
+    entries
+        .into_iter()
+        .map(|(unconfirmed_inputs, txid, delta)| {
+            RecentEntry::unconfirmed(txid, unconfirmed_inputs, delta)
+        })
+        .collect()
 }
 
 /// The UTXOs added and removed by a block, but those both added and spent in it.
@@ -313,6 +444,123 @@ pub(crate) struct UtxoSnapshot {
     /// Hash and number of the listed UTXOs, computed when first needed (by
     /// `utxo_sync` or `utxo_subscribe`), then kept up to date.
     hashed: Option<(Sum256, usize)>,
+    /// The latest transactions, `None` when read from the DB in an older
+    /// format (built again when first asked for).
+    recent: Option<RecentHistory>,
+}
+
+/// What `UtxoSnapshot::build` reads from the blocks of a scripthash: its
+/// outputs, then the spent ones taken out, and its latest transactions.
+struct Builder {
+    scripthash: ScriptHash,
+    params: &'static NetworkParams,
+    unspent: Unspent,
+    /// Only the latest of the funding transactions and of the spending ones
+    /// are kept: see `RecentHistory::combine`.
+    funding: Latest,
+    spending: Latest,
+}
+
+impl Builder {
+    fn new(scripthash: ScriptHash, params: &'static NetworkParams, recent: usize) -> Self {
+        Self {
+            scripthash,
+            params,
+            unspent: Unspent::default(),
+            funding: Latest::new(recent),
+            spending: Latest::new(recent),
+        }
+    }
+
+    /// A block paying the scripthash. In chain order: `Unspent::insert`
+    /// numbers the outputs in that order.
+    fn funding_block(&mut self, height: usize, block: &[u8]) {
+        let fork = self.params.fork_active(height);
+        for funding in filter_block_txs_outputs(block, self.scripthash, self.params, fork) {
+            let mut item = HistoryItem::new(funding.txid, height, funding.pos);
+            funding.result.iter().for_each(|o| item.delta.receive(o));
+            self.funding.push(item);
+            let entry = TxEntry {
+                txid: funding.txid,
+                outputs: funding.result,
+                spent: Vec::new(),
+            };
+            self.unspent.insert(&entry, height);
+        }
+    }
+
+    /// A block spending outputs of the scripthash, after every funding block,
+    /// in any order.
+    fn spending_block(&mut self, height: usize, block: &[u8]) {
+        let outpoints = &self.unspent.outpoints;
+        let spent = filter_block_txs_inputs(block, |o| outpoints.contains_key(o), self.params);
+        for tx in spent {
+            let mut item = HistoryItem::new(tx.txid, height, tx.pos);
+            for outpoint in &tx.result {
+                if let Some(info) = self.unspent.outpoints.remove(outpoint) {
+                    item.delta.spend(&info);
+                }
+            }
+            self.spending.push(item);
+        }
+    }
+
+    fn finish(self) -> (Unspent, RecentHistory) {
+        (
+            self.unspent,
+            RecentHistory::combine(self.funding, self.spending),
+        )
+    }
+}
+
+/// The latest `limit` transactions of a synced `status`: the transactions of
+/// the scripthash in a block are numbered in their order.
+fn recent_of_status(status: &ScriptHashStatus, chain: &Chain, limit: usize) -> RecentHistory {
+    // the latest blocks with `limit` transactions
+    let mut blocks: BTreeMap<usize, &[TxEntry]> = BTreeMap::new();
+    let (mut kept, mut total) = (0, 0);
+    for (height, entries) in status.confirmed_height_entries(chain) {
+        total += entries.len();
+        kept += entries.len();
+        blocks.insert(height, entries);
+        while let Some((_, oldest)) = blocks.first_key_value() {
+            if kept - oldest.len() < limit {
+                break;
+            }
+            kept -= oldest.len();
+            blocks.pop_first();
+        }
+    }
+    // the outputs they spend, from the whole history
+    let spent: HashSet<OutPoint> = blocks
+        .values()
+        .flat_map(|entries| entries.iter())
+        .flat_map(|entry| entry.spent.iter().copied())
+        .collect();
+    let mut outputs: HashMap<OutPoint, &TxOutput> = HashMap::new();
+    for entry in status.confirmed_entries(chain) {
+        for output in &entry.outputs {
+            let outpoint = OutPoint::new(entry.txid, output.index);
+            if spent.contains(&outpoint) {
+                outputs.insert(outpoint, output);
+            }
+        }
+    }
+    let mut items = Vec::with_capacity(kept);
+    for (height, entries) in blocks {
+        for (pos, entry) in entries.iter().enumerate() {
+            let mut item = HistoryItem::new(entry.txid, height, pos);
+            entry.outputs.iter().for_each(|o| item.delta.receive(o));
+            for outpoint in &entry.spent {
+                if let Some(output) = outputs.get(outpoint) {
+                    item.delta.spend_output(output);
+                }
+            }
+            items.push(item);
+        }
+    }
+    items.drain(..items.len().saturating_sub(limit));
+    RecentHistory::from_sorted(items, total <= limit).expect("sorted by height and position")
 }
 
 /// Whether the index shows `scripthash` paid in at least `LONG_HISTORY_BLOCKS`
@@ -345,15 +593,21 @@ impl UtxoSnapshot {
             journal_utxos: 0,
             stale: Vec::new(),
             hashed: None,
+            recent: None,
         }
     }
 
-    /// Reads the blocks of `scripthash` keeping only its outputs, then removes
-    /// the spent ones: much less memory than a `ScriptHashStatus`, which keeps
-    /// every transaction of the history (a ~950,000 one took ~700 MB).
-    pub(crate) fn build(scripthash: ScriptHash, index: &Index, daemon: &Daemon) -> Result<Self> {
-        let chain = index.chain();
-        let params = chain.params();
+    /// Reads the blocks of `scripthash` in `chain` keeping only its outputs,
+    /// then removes the spent ones: much less memory than a
+    /// `ScriptHashStatus`, which keeps every transaction of the history (a
+    /// ~950,000 one took ~700 MB). Its latest transactions come from the same
+    /// blocks.
+    pub(crate) fn build(
+        scripthash: ScriptHash,
+        index: &Index,
+        chain: &Chain,
+        daemon: &Daemon,
+    ) -> Result<Self> {
         let tip = chain.tip();
         let mut heights = index.limit_result(index.funding_heights(scripthash))?;
         heights.sort_unstable();
@@ -362,21 +616,13 @@ impl UtxoSnapshot {
             .into_iter()
             .filter_map(|h| chain.get_block_hash(h))
             .collect();
-        let mut unspent = Unspent::default();
-        // In chain order: `Unspent::insert` numbers the outputs in that order.
+        let mut builder = Builder::new(scripthash, chain.params(), RECENT_HISTORY_LEN);
         daemon.for_blocks(funding.iter().copied(), |blockhash, block| {
             let height = chain.get_block_height(&blockhash).expect("requested block");
-            let fork = params.fork_active(height);
-            for funding in filter_block_txs_outputs(&block, scripthash, params, fork) {
-                let entry = TxEntry {
-                    txid: funding.txid,
-                    outputs: funding.result,
-                    spent: Vec::new(),
-                };
-                unspent.insert(&entry, height);
-            }
+            builder.funding_block(height, &block);
         })?;
-        let spending: HashSet<BlockHash> = unspent
+        let spending: HashSet<BlockHash> = builder
+            .unspent
             .outpoints
             .par_iter()
             .flat_map_iter(|(outpoint, _)| {
@@ -387,22 +633,22 @@ impl UtxoSnapshot {
             })
             .collect();
         let history_blocks = funding.len() + spending.len();
-        daemon.for_blocks(spending, |_, block| {
-            let spent =
-                filter_block_txs_inputs(&block, |o| unspent.outpoints.contains_key(o), params);
-            for outpoint in spent.iter().flat_map(|tx| &tx.result) {
-                unspent.outpoints.remove(outpoint);
-            }
+        daemon.for_blocks(spending, |blockhash, block| {
+            let height = chain.get_block_height(&blockhash).expect("requested block");
+            builder.spending_block(height, &block);
         })?;
+        let (mut unspent, recent) = builder.finish();
         unspent.outpoints.shrink_to_fit();
         debug!(
-            "UTXO snapshot of {}: {} UTXOs from {} blocks",
+            "UTXO snapshot of {}: {} UTXOs and {} recent transactions from {} blocks",
             scripthash,
             unspent.outpoints.len(),
+            recent.len(),
             history_blocks
         );
         let mut snapshot = Self::new(scripthash, tip, unspent, history_blocks);
         snapshot.tip_height = chain.height();
+        snapshot.recent = Some(recent);
         Ok(snapshot)
     }
 
@@ -415,15 +661,35 @@ impl UtxoSnapshot {
         // its blocks must all be in `chain`
         let tip_height = chain.get_block_height(&status.tip)?;
         let unspent = Unspent::confirmed(status, chain);
+        let recent = recent_of_status(status, chain, RECENT_HISTORY_LEN);
         debug!(
-            "UTXO snapshot of {}: {} UTXOs from {} blocks",
+            "UTXO snapshot of {}: {} UTXOs and {} recent transactions from {} blocks",
             status.scripthash,
             unspent.outpoints.len(),
+            recent.len(),
             history_blocks
         );
         let mut snapshot = Self::new(status.scripthash, status.tip, unspent, history_blocks);
         snapshot.tip_height = tip_height;
+        snapshot.recent = Some(recent);
         Some(snapshot)
+    }
+
+    /// Whether it has its latest transactions: not when read from the DB in
+    /// an older format.
+    pub(crate) fn has_recent_history(&self) -> bool {
+        self.recent.is_some()
+    }
+
+    /// Takes the latest transactions of `built`, a new snapshot of the same
+    /// scripthash: keeps its journal when they are at the same tip.
+    pub(crate) fn take_recent_history(&mut self, built: UtxoSnapshot) {
+        debug_assert_eq!(self.scripthash, built.scripthash);
+        if built.tip == self.tip {
+            self.recent = built.recent;
+        } else {
+            *self = built;
+        }
     }
 
     /// Whether enough new blocks were applied since it was last saved: saving
@@ -510,7 +776,8 @@ impl UtxoSnapshot {
 
     /// Serialized to keep it in the DB (`from_bytes` reads it back).
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1 + 32 + 3 * 8 + self.len() * MIN_UTXO_BYTES);
+        let recent = self.recent.as_ref().map_or(0, RecentHistory::size);
+        let mut out = Vec::with_capacity(1 + 32 + 5 * 8 + self.len() * MIN_UTXO_BYTES + 1 + recent);
         out.push(UTXO_SNAPSHOT_FORMAT);
         out.extend_from_slice(self.tip.as_byte_array());
         out.extend_from_slice(&(self.history_blocks as u64).to_le_bytes());
@@ -520,15 +787,23 @@ impl UtxoSnapshot {
         self.journal.iter().for_each(|block| block.write(&mut out));
         out.extend_from_slice(&(self.stale.len() as u64).to_le_bytes());
         self.stale.iter().for_each(|block| block.write(&mut out));
+        match &self.recent {
+            None => out.push(0),
+            Some(recent) => {
+                out.push(1);
+                recent.write(&mut out);
+            }
+        }
         out
     }
 
-    /// `None` if `bytes` are not a snapshot of this format (or of format 1,
-    /// read without a journal).
+    /// `None` if `bytes` are not a snapshot of this format, or of an older
+    /// one: format 1 is read without a journal, formats 1 and 2 without the
+    /// recent history.
     pub(crate) fn from_bytes(scripthash: ScriptHash, bytes: &[u8]) -> Option<Self> {
         let mut r = Reader(bytes);
         let format = r.u8()?;
-        if format != 1 && format != UTXO_SNAPSHOT_FORMAT {
+        if !(1..=UTXO_SNAPSHOT_FORMAT).contains(&format) {
             return None;
         }
         let tip = BlockHash::from_byte_array(r.array()?);
@@ -542,7 +817,7 @@ impl UtxoSnapshot {
         }
         let mut journal = VecDeque::new();
         let mut stale = Vec::new();
-        if format == UTXO_SNAPSHOT_FORMAT {
+        if format >= 2 {
             for _ in 0..r.usize()? {
                 journal.push_back(r.journal_block(bytes.len())?);
             }
@@ -550,6 +825,10 @@ impl UtxoSnapshot {
                 stale.push(r.journal_block(bytes.len())?);
             }
         }
+        let recent = match format {
+            3.. => r.recent_history(bytes.len())?,
+            _ => None,
+        };
         if !r.0.is_empty() {
             return None;
         }
@@ -568,37 +847,22 @@ impl UtxoSnapshot {
         snapshot.journal_utxos = journal.iter().map(JournalBlock::len).sum();
         snapshot.journal = journal;
         snapshot.stale = stale;
+        snapshot.recent = recent;
         Some(snapshot)
     }
 
-    /// Applies the blocks after `tip`, undoing first those a reorg took out of
-    /// the chain. Returns `false` when the snapshot must be rebuilt instead:
-    /// its journal doesn't go back to the reorg, or there are more new blocks
-    /// than the history had.
-    pub(crate) fn update(&mut self, index: &Index, daemon: &Daemon) -> Result<bool> {
-        let chain = index.chain();
-        self.update_to(&chain, daemon)
-    }
-
-    fn update_to(&mut self, chain: &Chain, daemon: &Daemon) -> Result<bool> {
+    /// Applies the blocks of `chain` after `tip`, undoing first those a reorg
+    /// took out of it. Returns `false` when the snapshot must be rebuilt
+    /// instead: its journal doesn't go back to the reorg, or there are more
+    /// new blocks than the history had.
+    pub(crate) fn update(&mut self, chain: &Chain, daemon: &Daemon) -> Result<bool> {
         if self.tip == chain.tip() {
             self.tip_height = chain.height();
             return Ok(true);
         }
         while chain.get_block_height(&self.tip).is_none() {
-            match self.journal.pop_back() {
-                Some(block) if block.hash == self.tip => {
-                    debug!(
-                        "UTXO snapshot of {}: undoing block {} (reorg)",
-                        self.scripthash, block.hash
-                    );
-                    self.undo(&block);
-                    self.journal_utxos -= block.len();
-                    self.tip = block.prev;
-                    self.unsaved_blocks += 1;
-                    self.stale.push(block);
-                }
-                _ => return Ok(false), // reorg below the journal
+            if !self.undo_tip() {
+                return Ok(false); // reorg below the journal
             }
         }
         let height = chain.get_block_height(&self.tip).expect("in the chain");
@@ -610,63 +874,107 @@ impl UtxoSnapshot {
             .map(|h| chain.get_block_hash(h).expect("height within the chain"))
             .collect();
         let params = chain.params();
-        let scripthash = self.scripthash;
-        let mut prev = self.tip;
-        // Every new block, in chain order: its outputs to the scripthash first,
-        // then its inputs spending them (a transaction can only spend outputs of
-        // the transactions before it).
         daemon.for_blocks(blockhashes, |blockhash, block| {
             let height = chain.get_block_height(&blockhash).expect("requested block");
-            let fork = params.fork_active(height);
-            let mut added: HashMap<OutPoint, OutputInfo> = HashMap::new();
-            for funding in filter_block_txs_outputs(&block, scripthash, params, fork) {
-                let entry = TxEntry {
-                    txid: funding.txid,
-                    outputs: funding.result,
-                    spent: Vec::new(),
-                };
-                self.unspent.insert(&entry, height);
-                for outpoint in entry.funding_outpoints() {
-                    let info = self.unspent.outpoints[&outpoint].clone();
-                    // `Unspent::insert` doesn't hash: do it as `add_utxo` does
-                    self.hash_in(&outpoint, &info);
-                    added.insert(outpoint, info);
-                }
-            }
-            let spent =
-                filter_block_txs_inputs(&block, |o| self.unspent.outpoints.contains_key(o), params);
-            let mut removed = Vec::new();
-            for outpoint in spent.iter().flat_map(|tx| &tx.result) {
-                if let Some(info) = self.remove_utxo(outpoint) {
-                    if added.remove(outpoint).is_none() {
-                        removed.push((*outpoint, info));
-                    }
-                }
-            }
-            let block = JournalBlock {
-                hash: blockhash,
-                prev,
-                height,
-                added: added.into_iter().collect(),
-                removed,
-            };
-            prev = blockhash;
-            self.journal_utxos += block.len();
-            self.journal.push_back(block);
-            // consistent even if a later block fails to come
-            self.tip = blockhash;
-            self.tip_height = height;
-            self.unsaved_blocks += 1;
+            self.apply_block(blockhash, height, &block, params);
         })?;
         debug!(
             "UTXO snapshot of {}: {} UTXOs after {} new blocks",
-            scripthash,
+            self.scripthash,
             self.unspent.outpoints.len(),
             new_blocks
         );
         debug_assert_eq!(self.tip, chain.tip());
         self.trim_journal(chain.height());
         Ok(true)
+    }
+
+    /// Applies the block after `tip`: its outputs to the scripthash first,
+    /// then its inputs spending them (a transaction can only spend outputs of
+    /// the transactions before it). Its transactions go to the recent history.
+    fn apply_block(
+        &mut self,
+        blockhash: BlockHash,
+        height: usize,
+        block: &[u8],
+        params: &'static NetworkParams,
+    ) {
+        let fork = params.fork_active(height);
+        let mut added: HashMap<OutPoint, OutputInfo> = HashMap::new();
+        let mut txs: BTreeMap<usize, HistoryItem> = BTreeMap::new();
+        for funding in filter_block_txs_outputs(block, self.scripthash, params, fork) {
+            let item = txs
+                .entry(funding.pos)
+                .or_insert_with(|| HistoryItem::new(funding.txid, height, funding.pos));
+            funding.result.iter().for_each(|o| item.delta.receive(o));
+            let entry = TxEntry {
+                txid: funding.txid,
+                outputs: funding.result,
+                spent: Vec::new(),
+            };
+            self.unspent.insert(&entry, height);
+            for outpoint in entry.funding_outpoints() {
+                let info = self.unspent.outpoints[&outpoint].clone();
+                // `Unspent::insert` doesn't hash: do it as `add_utxo` does
+                self.hash_in(&outpoint, &info);
+                added.insert(outpoint, info);
+            }
+        }
+        let outpoints = &self.unspent.outpoints;
+        let spent = filter_block_txs_inputs(block, |o| outpoints.contains_key(o), params);
+        let mut removed = Vec::new();
+        for tx in spent {
+            let item = txs
+                .entry(tx.pos)
+                .or_insert_with(|| HistoryItem::new(tx.txid, height, tx.pos));
+            for outpoint in &tx.result {
+                if let Some(info) = self.remove_utxo(outpoint) {
+                    item.delta.spend(&info);
+                    if added.remove(outpoint).is_none() {
+                        removed.push((*outpoint, info));
+                    }
+                }
+            }
+        }
+        if let Some(recent) = self.recent.as_mut() {
+            recent.push_block(txs.into_values());
+        }
+        let block = JournalBlock {
+            hash: blockhash,
+            prev: self.tip,
+            height,
+            added: added.into_iter().collect(),
+            removed,
+        };
+        self.journal_utxos += block.len();
+        self.journal.push_back(block);
+        // consistent even if a later block fails to come
+        self.tip = blockhash;
+        self.tip_height = height;
+        self.unsaved_blocks += 1;
+    }
+
+    /// Undoes the block at `tip`, which a reorg took out of the chain: `false`
+    /// if the journal doesn't have it.
+    fn undo_tip(&mut self) -> bool {
+        match self.journal.pop_back() {
+            Some(block) if block.hash == self.tip => {
+                debug!(
+                    "UTXO snapshot of {}: undoing block {} (reorg)",
+                    self.scripthash, block.hash
+                );
+                self.undo(&block);
+                if let Some(recent) = self.recent.as_mut() {
+                    recent.undo_from(block.height);
+                }
+                self.journal_utxos -= block.len();
+                self.tip = block.prev;
+                self.unsaved_blocks += 1;
+                self.stale.push(block);
+                true
+            }
+            _ => false,
+        }
     }
 
     fn trim_journal(&mut self, tip_height: usize) {
@@ -750,6 +1058,27 @@ impl UtxoSnapshot {
 
     pub(crate) fn mempool_part(&self, mempool: &Mempool) -> MempoolPart {
         mempool_part(self.scripthash, mempool, &self.unspent.outpoints)
+    }
+
+    /// Entries `offset..offset + limit` of its latest transactions with the
+    /// current mempool (newest first), or `None` without them (read from the
+    /// DB in an older format).
+    pub(crate) fn recent_history(
+        &self,
+        mempool: &Mempool,
+        offset: usize,
+        limit: usize,
+    ) -> Option<RecentHistoryPage> {
+        let recent = self.recent.as_ref()?;
+        let unconfirmed = mempool_txs(self.scripthash, mempool, &self.unspent.outpoints, recent);
+        let (total, entries) = recent::page(unconfirmed, recent, offset, limit);
+        Some(RecentHistoryPage {
+            height: self.tip_height,
+            block_hash: self.tip,
+            total,
+            complete: recent.complete(),
+            entries,
+        })
     }
 
     /// Unspent outputs, balance and mempool history, with the current mempool.
@@ -1001,15 +1330,23 @@ mod tests {
         assert!(read(&bytes[..bytes.len() - 1]).is_none());
         assert!(read(&[&bytes[..], &[0]].concat()).is_none());
         let mut other = bytes.clone();
-        other[0] = 3;
+        other[0] = 4;
         assert!(read(&other).is_none());
 
-        // format 1: the same without the journal and stale blocks
-        let mut v1 = bytes[..bytes.len() - 16].to_vec();
+        // format 2: the same without the recent history (one byte: none)
+        let mut v2 = bytes[..bytes.len() - 1].to_vec();
+        v2[0] = 2;
+        let mut old = read(&v2).unwrap();
+        assert_eq!((old.set_hash(), old.count()), (hash, count));
+        assert!(!old.has_recent_history());
+
+        // format 1: also without the journal and stale blocks
+        let mut v1 = bytes[..bytes.len() - 17].to_vec();
         v1[0] = 1;
         let mut old = read(&v1).unwrap();
         assert_eq!((old.set_hash(), old.count()), (hash, count));
         assert!(old.journal.is_empty());
+        assert!(!old.has_recent_history());
     }
 
     /// A block of the test journal: `added` outputs of a new transaction
@@ -1190,6 +1527,558 @@ mod tests {
         assert_eq!(s.journal.front().unwrap().height, 6);
         assert_eq!(s.journal_utxos, 4);
         assert!(!s.knows(&s.journal_start().to_owned().clone()) || s.journal_start() != s.tip);
+    }
+
+    // ─── recent history, from blocks read by the same filters ──────────────
+
+    use super::super::recent::RecentHistory;
+    use crate::neurai::asset::{effective_script, parse_asset_script, AssetData};
+    use bitcoin::{
+        absolute::LockTime, transaction::Version, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
+        TxOut, Txid, Witness,
+    };
+    use std::collections::{BTreeMap, HashMap};
+
+    fn params() -> &'static crate::neurai::NetworkParams {
+        crate::neurai::NetworkParams::for_network(crate::neurai::NeuraiNetwork::Testnet)
+    }
+
+    const OURS: [u8; 20] = [0x11; 20];
+    const OTHER: [u8; 20] = [0x22; 20];
+
+    fn p2pkh(h160: [u8; 20]) -> Vec<u8> {
+        [&[0x76, 0xa9, 0x14][..], &h160, &[0x88, 0xac]].concat()
+    }
+
+    fn ours() -> ScriptHash {
+        ScriptHash::hash(&p2pkh(OURS))
+    }
+
+    /// A transfer of `amount` of the asset `name` to `h160`.
+    fn asset_script(h160: [u8; 20], name: &str, amount: i64) -> Vec<u8> {
+        use crate::neurai::asset::{ASSET_MAGIC, OP_DROP, OP_XNA_ASSET, TYPE_TRANSFER};
+        let mut payload = ASSET_MAGIC.to_vec();
+        payload.push(TYPE_TRANSFER);
+        payload.push(name.len() as u8);
+        payload.extend_from_slice(name.as_bytes());
+        payload.extend_from_slice(&amount.to_le_bytes());
+        let mut script = p2pkh(h160);
+        script.push(OP_XNA_ASSET);
+        script.push(payload.len() as u8);
+        script.extend(payload);
+        script.push(OP_DROP);
+        script
+    }
+
+    /// A transaction spending `inputs` (or an outpoint of nobody) to `outputs`.
+    fn tx(salt: u32, inputs: &[OutPoint], outputs: &[(Vec<u8>, u64)]) -> Transaction {
+        let input = |previous_output| TxIn {
+            previous_output,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        };
+        let mut inputs: Vec<TxIn> = inputs.iter().copied().map(input).collect();
+        if inputs.is_empty() {
+            inputs.push(input(OutPoint::new(
+                Txid::from_byte_array([0xee; 32]),
+                salt,
+            )));
+        }
+        Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::from_consensus(salt),
+            input: inputs,
+            output: outputs
+                .iter()
+                .map(|(script, value)| TxOut {
+                    value: Amount::from_sat(*value),
+                    script_pubkey: ScriptBuf::from_bytes(script.clone()),
+                })
+                .collect(),
+        }
+    }
+
+    fn out(tx: &Transaction, vout: u32) -> OutPoint {
+        OutPoint::new(tx.compute_txid(), vout)
+    }
+
+    /// A block as the daemon sends it: an 80-byte header (time 0), its transactions.
+    fn block_bytes(txs: &[Transaction]) -> Vec<u8> {
+        let mut bytes = vec![0u8; 80];
+        if txs.len() < 0xfd {
+            bytes.push(txs.len() as u8);
+        } else {
+            bytes.push(0xfd);
+            bytes.extend((txs.len() as u16).to_le_bytes());
+        }
+        for tx in txs {
+            bytes.extend(bitcoin::consensus::serialize(tx));
+        }
+        bytes
+    }
+
+    fn block_hash(height: usize, n: u8) -> bitcoin::BlockHash {
+        let mut bytes = [n; 32];
+        bytes[..8].copy_from_slice(&(height as u64).to_le_bytes());
+        bitcoin::BlockHash::from_byte_array(bytes)
+    }
+
+    type Blocks = Vec<(usize, Vec<Transaction>)>;
+
+    /// Paid, spends with change, assets sent back, a zero-value output, and
+    /// transactions of others.
+    fn scenario() -> Blocks {
+        let a = tx(
+            1,
+            &[],
+            &[(p2pkh(OURS), 1000), (p2pkh(OURS), 2000), (p2pkh(OTHER), 5)],
+        );
+        let b = tx(2, &[], &[(p2pkh(OTHER), 7)]);
+        let c = tx(3, &[], &[(asset_script(OURS, "TOKEN", 7), 0)]);
+        // spends 1000, 300 back
+        let d = tx(4, &[out(&a, 0)], &[(p2pkh(OURS), 300), (p2pkh(OTHER), 700)]);
+        let e = tx(5, &[out(&b, 0)], &[(p2pkh(OURS), 0)]);
+        // the asset back to itself: nets to zero
+        let f = tx(
+            6,
+            &[out(&c, 0), out(&a, 1)],
+            &[(asset_script(OURS, "TOKEN", 7), 0), (p2pkh(OTHER), 2000)],
+        );
+        let g = tx(7, &[out(&d, 0), out(&e, 0)], &[(p2pkh(OTHER), 300)]);
+        // paid and spent in the same block
+        let h = tx(
+            8,
+            &[],
+            &[(p2pkh(OURS), 50), (asset_script(OURS, "GOLD", 4), 0)],
+        );
+        let i = tx(9, &[out(&h, 0)], &[(p2pkh(OTHER), 50)]);
+        vec![
+            (1, vec![a, b, c]),
+            (2, vec![d, e]),
+            (3, vec![f]),
+            (4, vec![g, h, i]),
+        ]
+    }
+
+    /// `(txid, height, value, assets)`.
+    type Entry = (Txid, usize, i64, BTreeMap<String, i64>);
+    /// `(value, asset)` by outpoint.
+    type Utxos = HashMap<OutPoint, (u64, Option<String>)>;
+
+    /// Every transaction of `ours` in `blocks` with what it changes, worked
+    /// out from the whole transactions: what the recent history is the end
+    /// of. Also the UTXOs at the end.
+    fn whole_history(blocks: &[(usize, Vec<Transaction>)]) -> (Vec<Entry>, Utxos) {
+        let mut utxos = Utxos::new();
+        let mut history = vec![];
+        for (height, txs) in blocks {
+            let fork = params().fork_active(*height);
+            for tx in txs {
+                let txid = tx.compute_txid();
+                let (mut touched, mut value, mut assets) = (false, 0i64, BTreeMap::new());
+                let mut add = |asset: &Option<String>, amount: i64| match asset {
+                    None => value += amount,
+                    Some(name) => *assets.entry(name.clone()).or_insert(0) += amount,
+                };
+                for input in &tx.input {
+                    if let Some((amount, asset)) = utxos.remove(&input.previous_output) {
+                        touched = true;
+                        add(&asset, -(amount as i64));
+                    }
+                }
+                for (vout, output) in (0u32..).zip(&tx.output) {
+                    let bytes = output.script_pubkey.as_bytes();
+                    if ScriptHash::hash(&effective_script(bytes, fork)) != ours() {
+                        continue;
+                    }
+                    touched = true;
+                    let (amount, asset) = match parse_asset_script(bytes, fork).map(|a| a.data) {
+                        Some(AssetData::Transfer(t)) => (t.amount as u64, Some(t.name)),
+                        Some(_) => unreachable!("transfers only"),
+                        None => (output.value.to_sat(), None),
+                    };
+                    add(&asset, amount as i64);
+                    utxos.insert(OutPoint::new(txid, vout), (amount, asset));
+                }
+                assets.retain(|_, amount| *amount != 0);
+                if touched {
+                    history.push((txid, *height, value, assets));
+                }
+            }
+        }
+        (history, utxos)
+    }
+
+    fn entries(recent: &RecentHistory) -> Vec<Entry> {
+        let mut entries: Vec<Entry> = recent
+            .newest_first()
+            .map(|i| (i.txid, i.height, i.delta.value, i.delta.assets.clone()))
+            .collect();
+        entries.reverse();
+        entries
+    }
+
+    fn last(history: &[Entry], n: usize) -> &[Entry] {
+        &history[history.len().saturating_sub(n)..]
+    }
+
+    /// What `UtxoSnapshot::build` reads: the funding blocks in chain order,
+    /// then the spending ones in any order (here backwards).
+    fn build(
+        blocks: &[(usize, Vec<Transaction>)],
+        limit: usize,
+    ) -> (super::super::Unspent, RecentHistory) {
+        let bytes: Vec<(usize, Vec<u8>)> = blocks
+            .iter()
+            .map(|(h, txs)| (*h, block_bytes(txs)))
+            .collect();
+        let mut builder = super::Builder::new(ours(), params(), limit);
+        bytes.iter().for_each(|(h, b)| builder.funding_block(*h, b));
+        bytes
+            .iter()
+            .rev()
+            .for_each(|(h, b)| builder.spending_block(*h, b));
+        builder.finish()
+    }
+
+    fn snapshot_of_blocks(blocks: &[(usize, Vec<Transaction>)]) -> super::UtxoSnapshot {
+        let (unspent, recent) = build(blocks, super::RECENT_HISTORY_LEN);
+        let height = blocks.last().map_or(0, |(h, _)| *h);
+        let mut s = super::UtxoSnapshot::new(
+            ours(),
+            block_hash(height, 0),
+            unspent,
+            super::super::LONG_HISTORY_BLOCKS,
+        );
+        s.tip_height = height;
+        s.recent = Some(recent);
+        s
+    }
+
+    fn utxo_values(s: &super::UtxoSnapshot) -> Utxos {
+        s.unspent
+            .outpoints
+            .iter()
+            .map(|(o, info)| (*o, (info.value, info.asset.clone())))
+            .collect()
+    }
+
+    #[test]
+    fn recent_history_is_built_with_the_utxos() {
+        let blocks = scenario();
+        let (whole, utxos) = whole_history(&blocks);
+        assert_eq!(whole.len(), 8);
+        // spends with change are one entry; zero changes stay listed
+        assert_eq!((whole[2].2, whole[2].3.len()), (-700, 0));
+        assert_eq!((whole[3].2, whole[3].3.len()), (0, 0));
+        assert_eq!((whole[4].2, whole[4].3.len()), (-2000, 0));
+        assert_eq!(whole[6].3, BTreeMap::from([("GOLD".to_string(), 4)]));
+        assert_eq!(whole[7].2, -50);
+        for limit in 1..=10 {
+            let (unspent, recent) = build(&blocks, limit);
+            assert_eq!(entries(&recent), last(&whole, limit), "limit {limit}");
+            assert_eq!(recent.complete(), limit >= whole.len());
+            let built: Utxos = unspent
+                .outpoints
+                .iter()
+                .map(|(o, info)| (*o, (info.value, info.asset.clone())))
+                .collect();
+            assert_eq!(built, utxos);
+        }
+
+        // a long history: only the latest RECENT_HISTORY_LEN
+        let mut long = blocks.clone();
+        let payments: Vec<Transaction> = (0..1_200)
+            .map(|n| tx(100 + n, &[], &[(p2pkh(OURS), 1 + n as u64)]))
+            .collect();
+        let spends = vec![tx(
+            5000,
+            &[out(&payments[1_199], 0), out(&payments[3], 0)],
+            &[(p2pkh(OURS), 1)],
+        )];
+        long.push((5, payments));
+        long.push((6, spends));
+        let (whole, _) = whole_history(&long);
+        let (_, recent) = build(&long, super::RECENT_HISTORY_LEN);
+        assert_eq!(recent.len(), super::RECENT_HISTORY_LEN);
+        assert_eq!(entries(&recent), last(&whole, super::RECENT_HISTORY_LEN));
+        assert_eq!(entries(&recent).last().unwrap().2, 1 - 1_200 - 4);
+        assert!(!recent.complete());
+    }
+
+    #[test]
+    fn recent_history_of_a_synced_status() {
+        let blocks = scenario();
+        let (whole, _) = whole_history(&blocks);
+        let mut chain = crate::chain::Chain::new(params());
+        let mut status = super::super::ScriptHashStatus::new(ours());
+        let mut ours_unspent = std::collections::HashSet::new();
+        for (height, txs) in &blocks {
+            let fork = params().fork_active(*height);
+            let hash = block_hash(*height, 0);
+            let header = crate::neurai::block::NeuraiBlockHeader::pre_kawpow(
+                2,
+                chain.tip(),
+                bitcoin::TxMerkleNode::all_zeros(),
+                *height as u32,
+                0,
+                0,
+            );
+            chain.update(vec![crate::chain::NewHeader::new(header, hash, *height)]);
+            let mut entries = vec![];
+            for tx in txs {
+                let txid = tx.compute_txid();
+                let outputs = super::super::filter_outputs(tx, ours(), fork);
+                let spent: Vec<OutPoint> = tx
+                    .input
+                    .iter()
+                    .map(|i| i.previous_output)
+                    .filter(|o| ours_unspent.remove(o))
+                    .collect();
+                ours_unspent.extend(outputs.iter().map(|o| OutPoint::new(txid, o.index)));
+                if !outputs.is_empty() || !spent.is_empty() {
+                    entries.push(super::super::TxEntry {
+                        txid,
+                        outputs,
+                        spent,
+                    });
+                }
+            }
+            status.confirmed.insert(hash, entries);
+            status.tip = hash;
+        }
+        // a stale block is left out
+        status
+            .confirmed
+            .insert(block_hash(9, 9), vec![native_entry(9, &[5], &[])]);
+        for limit in 1..=10 {
+            let recent = super::recent_of_status(&status, &chain, limit);
+            assert_eq!(entries(&recent), last(&whole, limit), "limit {limit}");
+            assert_eq!(recent.complete(), limit >= whole.len());
+        }
+    }
+
+    #[test]
+    fn new_blocks_and_reorgs_update_the_recent_history() {
+        let blocks = scenario();
+        let mut s = snapshot_of_blocks(&blocks[..2]);
+        s.hashes();
+        let (at_2, utxos_at_2) = whole_history(&blocks[..2]);
+        assert_eq!(entries(s.recent.as_ref().unwrap()), at_2);
+        // blocks 3 and 4
+        for (height, txs) in &blocks[2..] {
+            s.apply_block(block_hash(*height, 0), *height, &block_bytes(txs), params());
+        }
+        let (whole, utxos) = whole_history(&blocks);
+        assert_eq!(entries(s.recent.as_ref().unwrap()), whole);
+        assert_eq!(utxo_values(&s), utxos);
+        assert_eq!(s.count(), s.utxos().len());
+
+        // a reorg replaces blocks 3 and 4 by another block 3
+        assert!(s.undo_tip() && s.undo_tip());
+        assert_eq!(s.tip, block_hash(2, 0));
+        assert_eq!(entries(s.recent.as_ref().unwrap()), at_2);
+        assert_eq!(utxo_values(&s), utxos_at_2);
+        assert!(!s.undo_tip(), "block 2 is not in the journal");
+        let other = tx(77, &[out(&blocks[1].1[0], 0)], &[(p2pkh(OURS), 299)]);
+        s.apply_block(
+            block_hash(3, 1),
+            3,
+            &block_bytes(&[other.clone()]),
+            params(),
+        );
+        let mut fork = blocks[..2].to_vec();
+        fork.push((3, vec![other]));
+        let (whole, utxos) = whole_history(&fork);
+        assert_eq!(entries(s.recent.as_ref().unwrap()), whole);
+        assert_eq!(entries(s.recent.as_ref().unwrap()).last().unwrap().2, -1);
+        assert_eq!(utxo_values(&s), utxos);
+        assert_eq!(s.set_hash(), crate::utxo::set_hash(s.utxos().values()));
+
+        // a block of more than RECENT_HISTORY_LEN transactions
+        let payments: Vec<Transaction> = (0..1_001)
+            .map(|n| tx(100 + n, &[], &[(p2pkh(OURS), 1)]))
+            .collect();
+        s.apply_block(block_hash(4, 1), 4, &block_bytes(&payments), params());
+        let recent = s.recent.as_ref().unwrap();
+        assert_eq!(recent.len(), super::RECENT_HISTORY_LEN);
+        assert!(!recent.complete());
+        assert_eq!(
+            recent.newest_first().next().unwrap().txid,
+            payments[1_000].compute_txid()
+        );
+        assert_eq!(
+            recent.newest_first().last().unwrap().txid,
+            payments[1].compute_txid()
+        );
+
+        // without a recent history (an older format), blocks only update the UTXOs
+        let mut old = snapshot_of_blocks(&blocks[..2]);
+        old.recent = None;
+        s = old;
+        s.apply_block(block_hash(3, 0), 3, &block_bytes(&blocks[2].1), params());
+        assert!(!s.has_recent_history());
+    }
+
+    #[test]
+    fn recent_history_bytes_round_trip() {
+        let blocks = scenario();
+        let mut s = snapshot_of_blocks(&blocks[..3]);
+        s.apply_block(block_hash(4, 0), 4, &block_bytes(&blocks[3].1), params());
+        let bytes = s.to_bytes();
+        let read = super::UtxoSnapshot::from_bytes(ours(), &bytes).unwrap();
+        assert_eq!(read.recent, s.recent);
+        assert_eq!(read.journal.len(), 1);
+        let (whole, _) = whole_history(&blocks);
+        assert_eq!(entries(read.recent.as_ref().unwrap()), whole);
+
+        // the recent history is the last part: format 2 is the rest
+        let recent = s.recent.as_ref().unwrap();
+        let mut section = vec![1];
+        recent.write(&mut section);
+        assert!(bytes.ends_with(&section));
+        let mut v2 = bytes[..bytes.len() - section.len()].to_vec();
+        v2[0] = 2;
+        let old = super::UtxoSnapshot::from_bytes(ours(), &v2).unwrap();
+        assert!(!old.has_recent_history());
+        assert_eq!(old.journal.len(), 1);
+        assert_eq!(utxo_values(&old), utxo_values(&s));
+
+        // a broken section: the snapshot is not read
+        let mut broken = bytes.clone();
+        let at = bytes.len() - section.len();
+        broken[at + 1] = 7; // `complete` is 0 or 1
+        assert!(super::UtxoSnapshot::from_bytes(ours(), &broken).is_none());
+        assert!(super::UtxoSnapshot::from_bytes(ours(), &bytes[..bytes.len() - 3]).is_none());
+
+        // a snapshot rebuilt for its recent history keeps its journal
+        let mut old = old;
+        old.tip = s.tip;
+        let built = snapshot_of_blocks(&blocks);
+        let mut built_at_tip = built;
+        built_at_tip.tip = s.tip;
+        old.take_recent_history(built_at_tip);
+        assert_eq!(old.recent, s.recent);
+        assert_eq!(old.journal.len(), 1);
+    }
+
+    #[test]
+    fn recent_history_pages_with_the_mempool() {
+        use crate::mempool::{Entry, Mempool};
+        let blocks = scenario();
+        let s = snapshot_of_blocks(&blocks[..3]); // UTXOs: d:0 (300), e:0 (0), f:0 (7 TOKEN)
+        let (d, a) = (&blocks[1].1[0], &blocks[0].1[0]);
+        // spends 300, 100 back
+        let m1 = tx(
+            201,
+            &[out(d, 0)],
+            &[(p2pkh(OURS), 100), (p2pkh(OTHER), 200)],
+        );
+        // spends the change of m1
+        let m2 = tx(202, &[out(&m1, 0)], &[(p2pkh(OTHER), 100)]);
+        let m3 = tx(
+            203,
+            &[],
+            &[(p2pkh(OURS), 5000), (asset_script(OURS, "TOKEN", 3), 0)],
+        );
+        let m4 = a.clone(); // confirmed already: the mempool is older than the snapshot
+        let m5 = tx(205, &[], &[(p2pkh(OTHER), 1)]);
+        let mut mempool = Mempool::new(&crate::metrics::Metrics::dummy());
+        for (tx, unconfirmed_inputs) in [
+            (&m1, false),
+            (&m2, true),
+            (&m3, false),
+            (&m4, false),
+            (&m5, false),
+        ] {
+            mempool.add_for_test(Entry {
+                txid: tx.compute_txid(),
+                tx: tx.clone(),
+                raw: bitcoin::consensus::serialize(tx).into(),
+                fork: false,
+                fee: Amount::from_sat(1000),
+                vsize: 200,
+                has_unconfirmed_inputs: unconfirmed_inputs,
+            });
+        }
+        let (whole, _) = whole_history(&blocks[..3]);
+        let check = |mempool: &Mempool| {
+            let page = s.recent_history(mempool, 0, 50).unwrap();
+            assert_eq!(page.total, 3 + whole.len());
+            assert!(page.complete);
+            assert_eq!((page.height, page.block_hash), (3, s.tip));
+            let mut zero = [
+                (m1.compute_txid(), -200, BTreeMap::new()),
+                (
+                    m3.compute_txid(),
+                    5000,
+                    BTreeMap::from([("TOKEN".to_string(), 3)]),
+                ),
+            ];
+            zero.sort_by(|a, b| b.0.cmp(&a.0));
+            let expected: Vec<(Txid, i64, i64, BTreeMap<String, i64>)> =
+                [(m2.compute_txid(), -1, -100, BTreeMap::new())]
+                    .into_iter()
+                    .chain(zero.into_iter().map(|(t, v, a)| (t, 0, v, a)))
+                    .chain(
+                        whole
+                            .iter()
+                            .rev()
+                            .map(|(t, h, v, a)| (*t, *h as i64, *v, a.clone())),
+                    )
+                    .collect();
+            let got: Vec<_> = page
+                .entries
+                .iter()
+                .map(|e| (e.tx_hash, e.height, e.value, e.assets.clone()))
+                .collect();
+            assert_eq!(got, expected);
+            // pages of 2
+            let paged: Vec<_> = (0..page.total)
+                .step_by(2)
+                .flat_map(|offset| s.recent_history(mempool, offset, 2).unwrap().entries)
+                .map(|e| e.tx_hash)
+                .collect();
+            assert_eq!(paged, got.iter().map(|e| e.0).collect::<Vec<_>>());
+        };
+        // from the spends of the mempool (fewer than the outputs)
+        assert!(s.unspent.outpoints.len() + 3 > mempool.spends_count());
+        check(&mempool);
+        // from the outputs of the address (fewer than the spends of the mempool)
+        let many: Vec<OutPoint> = (0..30)
+            .map(|n| OutPoint::new(Txid::from_byte_array([0xdd; 32]), n))
+            .collect();
+        let busy = tx(206, &many, &[(p2pkh(OTHER), 1)]);
+        mempool.add_for_test(Entry {
+            txid: busy.compute_txid(),
+            tx: busy.clone(),
+            raw: bitcoin::consensus::serialize(&busy).into(),
+            fork: false,
+            fee: Amount::from_sat(1000),
+            vsize: 200,
+            has_unconfirmed_inputs: false,
+        });
+        assert!(s.unspent.outpoints.len() + 3 < mempool.spends_count());
+        check(&mempool);
+
+        // the reply
+        let page = s.recent_history(&mempool, 4, 1).unwrap();
+        let json = serde_json::to_value(&page).unwrap();
+        assert_eq!(json["total"], 3 + whole.len());
+        assert_eq!(json["complete"], true);
+        assert_eq!(json["height"], 3);
+        assert_eq!(json["block_hash"], s.tip.to_string());
+        assert_eq!(json["entries"].as_array().unwrap().len(), 1);
+        let (t, h, v, _) = &whole[whole.len() - 2];
+        assert_eq!(
+            json["entries"][0],
+            serde_json::json!({"tx_hash": t.to_string(), "height": h, "value": v, "assets": {}})
+        );
+        // without a recent history
+        let mut old = snapshot_of_blocks(&blocks[..3]);
+        old.recent = None;
+        assert!(old.recent_history(&mempool, 0, 50).is_none());
     }
 
     #[test]

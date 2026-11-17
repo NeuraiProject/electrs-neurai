@@ -391,6 +391,11 @@ impl Mempool {
         self.apply_sync_update(update);
     }
 
+    #[cfg(test)]
+    pub(crate) fn add_for_test(&mut self, entry: Entry) {
+        self.add_entry(entry);
+    }
+
     /// Add a transaction entry to the mempool and update the fee histogram.
     fn add_entry(&mut self, entry: Entry) {
         for txi in &entry.tx.input {

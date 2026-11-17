@@ -830,6 +830,7 @@ fn mempool_utxo(txid: Txid, output: &TxOutput) -> Utxo {
     }
 }
 
+pub(crate) mod recent;
 mod snapshot;
 
 pub(crate) use snapshot::{has_long_history, SnapshotSlot, UtxoSnapshot, UtxoSnapshots};

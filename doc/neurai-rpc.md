@@ -144,6 +144,16 @@ most 128 KB with a hash each, then only what changed since the wallet's block,
 and notifications work whatever the size of the address. `server.features`
 advertises them as `"utxo_chunks": 1`. See [utxo-chunks.md](utxo-chunks.md).
 
+### `blockchain.scripthash.get_recent_history`
+
+`get_recent_history(scripthash, offset=0, limit=50)`: the last 1,000 confirmed
+transactions and the mempool transactions of an address whose history is too
+large for `get_history` (paid in 10,000 blocks or more), newest first, each with
+its height and its net change in XNA (`value`, satoshis) and in each asset
+(`assets`, smallest units), in pages of at most 500. Other addresses get error
+11 and use `get_history`. `server.features` advertises it as
+`"recent_history": 1`. See [utxo-chunks.md](utxo-chunks.md#blockchainscripthashget_recent_historyscripthash-offset0-limit50).
+
 ## Concurrency and limits
 
 Each connection handles its requests in its own thread, in order; the

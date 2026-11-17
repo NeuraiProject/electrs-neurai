@@ -1,7 +1,7 @@
 # Chunked UTXO sets
 
-**Status:** version 1, implemented by electrs-neurai. An extension: no existing
-method changes.
+**Status:** version 1, implemented by electrs-neurai, and version 1 of
+`get_recent_history`. An extension: no existing method changes.
 
 ## Motivation
 
@@ -18,14 +18,17 @@ The methods below let a wallet:
    most 128 KB, and check that it got the whole set from a single snapshot;
 2. later ask only for what changed after the block it has, even days later;
 3. be notified when the set or the mempool changes, whatever the size of the
-   address.
+   address;
+4. show the last 1,000 transactions of such an address, with what each one
+   changed in its balance, without downloading them.
 
 ## Compatibility
 
 * No existing method changes its parameters, results or errors. Wallets that
   don't know these methods see no difference.
 * A server that supports them advertises `"utxo_chunks": 1` (the version of this
-  document) in `server.features`. Clients check it before using them; other
+  document) in `server.features`, and `"recent_history": 1` for
+  `get_recent_history`. Clients check them before using the methods; other
   servers answer "method not found".
 * Small addresses get everything in a single reply, so a wallet can use these
   methods for every address, not only the large ones.
@@ -190,6 +193,65 @@ Unlike `blockchain.scripthash.subscribe`, it works for addresses of any size.
 `true` when the scripthash was subscribed with `utxo_subscribe`, otherwise
 `false`.
 
+### `blockchain.scripthash.get_recent_history(scripthash, offset=0, limit=50)`
+
+The latest transactions of an address too large for `get_history`, with what
+each one changes in its balance: its last 1,000 confirmed transactions and
+those of the mempool. Only for the addresses whose UTXOs the server keeps in a
+snapshot (in electrs-neurai, those paid in 10,000 blocks or more); for the
+others it answers error 11 and the wallet uses `blockchain.scripthash.get_history`.
+Advertised as `"recent_history": 1` in `server.features`.
+
+```json
+{
+  "height": 1872100,
+  "block_hash": "…",
+  "total": 1004,
+  "complete": false,
+  "entries": [
+    {"tx_hash": "…", "height": 0, "value": -150000000, "assets": {"TOKEN": 100000000}},
+    {"tx_hash": "…", "height": 1872099, "value": 300000000000, "assets": {}}
+  ]
+}
+```
+
+| Key | Value |
+|-----|-------|
+| `height`, `block_hash` | the tip the confirmed entries are of |
+| `total` | number of entries in the whole list: the confirmed ones (at most 1,000) and those of the mempool |
+| `complete` | `true` when the list has every transaction of the address |
+| `entries` | entries `offset` to `offset + limit − 1` of the list (fewer at its end) |
+
+The list is newest first: the mempool transactions, with `height` 0, or -1 when
+they spend unconfirmed outputs (like `get_history`), in the reverse of the order
+of `get_history` (-1 first, then by `tx_hash`); then the confirmed ones by
+height and position in the block, descending.
+
+* `value` is the net change of the address in XNA satoshis: what the
+  transaction pays to it minus the coins of it that it spends. Like in the
+  UTXOs, the XNA of asset outputs is not counted.
+* `assets` is the net change of each asset, in its smallest units; assets whose
+  change is zero are left out.
+* A transaction that spends coins of the address and pays change back to it is
+  a single entry with the net change. An entry can have no change at all (an
+  asset sent to itself, a zero-value output): it is still listed.
+
+`offset` and `limit` are non-negative integers, `limit` at most 500 (larger is
+error 1). An `offset` at or past `total` gives no entries. 500 entries are
+about 60 KB: a reply stays under 128 KB unless its transactions move many
+assets.
+
+Each reply is of the moment it is asked for: new blocks add their transactions
+(dropping the oldest past 1,000) and the mempool changes, so the pages of the
+list can overlap or skip entries when `block_hash` or `total` change between
+them. Entries are identified by `tx_hash`; a transaction moves from the mempool
+part to the confirmed one when mined. A reorg takes out the transactions of the
+blocks it undoes (the list can then hold fewer than 1,000 until the server
+reads the history again).
+
+The amounts are the server's word, like `listunspent`: a wallet can download a
+transaction (`blockchain.transaction.get`) to check them.
+
 ## Wallet
 
 * Apply the chunks of a reply, in order, to a copy of the set: the removed
@@ -208,15 +270,18 @@ Unlike `blockchain.scripthash.subscribe`, it works for addresses of any size.
 * A wallet that follows its addresses by their history can follow by their
   UTXOs only those whose `blockchain.scripthash.subscribe` answers "history too
   large": electrum-neurai does so when the server advertises `utxo_chunks`.
-  Their transactions are not known, so they have no history in the wallet;
-  spending a UTXO only needs its address, value and asset (asset scripts are
-  rebuilt from them), and its transaction can be fetched when needed.
+  Spending a UTXO only needs its address, value and asset (asset scripts are
+  rebuilt from them), and its transaction can be fetched when needed. Their
+  history is not downloaded: when the server advertises `recent_history`, the
+  wallet lists their last 1,000 transactions from `get_recent_history`, with
+  the amounts it gives, and downloads a transaction only to show it.
 
 ## Errors
 
 | Code | Message | What the client does |
 |------|---------|----------------------|
 | 10 | `snapshot expired` | call `utxo_sync` again with the `block_hash` of its set |
+| 11 | `no recent history: …` | the address has no snapshot (a short history): use `blockchain.scripthash.get_history` |
 
 Other errors are the usual ones (`1` for bad requests, `-32603` while the index
 is being built).
@@ -261,7 +326,7 @@ by the network when broadcast.
 * The `UtxoSnapshot` of an address paid in 10,000 blocks or more reads every
   new block once for all clients, and writes down, block by block, the UTXOs
   added and removed (with all their data): its journal, stored in the DB with
-  the snapshot (format 2). It answers `utxo_sync` from an old block, undoes
+  the snapshot (from format 2). It answers `utxo_sync` from an old block, undoes
   reorgs without rebuilding the snapshot, and keeps the blocks that left the
   active chain. Its set hash is computed when first needed, then kept up to
   date.
@@ -276,6 +341,17 @@ by the network when broadcast.
 * The mempool part is found from the mempool's spends or from the address'
   UTXOs, whichever are fewer. Outputs of mempool transactions that are already
   confirmed (the mempool is polled after a new block is indexed) are not listed.
+* The snapshot also keeps the last 1,000 transactions of the address with
+  their changes (saved with it, format 3). They come from the same blocks as
+  its UTXOs: while reading them, only the latest 1,000 transactions paying the
+  address and the latest 1,000 spending its coins are kept, then put together
+  by transaction (a transaction among the latest 1,000 is among the latest
+  1,000 of both kinds it is of), so a history of millions of transactions
+  needs a few hundred KB more. Each new block adds its transactions, a reorg
+  takes them out. Snapshots saved in formats 1 and 2 have none: the first
+  `get_recent_history` of such an address reads its blocks again, like a first
+  `listunspent` (one of the 2 heavy queries at once), and keeps its journal.
+  Its mempool part is found like that of `utxo_sync`.
 * `utxo_subscribe` keeps no history per client for long histories: each block
   updates their shared snapshot once for all subscribers. Short histories are
   kept per subscription, like `blockchain.scripthash.subscribe`.
@@ -285,5 +361,6 @@ by the network when broadcast.
 
 ## Not in this version
 
-* The history in chunks, which needs an index of the history by address.
+* The whole history in chunks, which needs an index of the history by address:
+  `get_recent_history` only has the last 1,000 transactions.
 * Resuming a first download whose chunks expired: the wallet starts it again.

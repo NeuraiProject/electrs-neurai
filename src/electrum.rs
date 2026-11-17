@@ -26,8 +26,8 @@ use crate::{
     signals::Signal,
     limits::{waiting, Semaphore},
     status::{
-        has_long_history, Balance, ScriptHashStatus, SnapshotSlot, UnspentEntry, UnspentStatus,
-        UtxoSnapshot, UtxoSnapshots, NATIVE_ASSET_KEY,
+        has_long_history, recent, Balance, ScriptHashStatus, SnapshotSlot, UnspentEntry,
+        UnspentStatus, UtxoSnapshot, UtxoSnapshots, NATIVE_ASSET_KEY,
     },
     tracker::Tracker,
     transport::Service,
@@ -107,13 +107,44 @@ impl std::fmt::Display for CodedError {
 
 impl std::error::Error for CodedError {}
 
-/// Error 10 of `doc/utxo-chunks.md`: the client starts again with `utxo_sync`.
+/// Error codes of `doc/utxo-chunks.md`.
+const SNAPSHOT_EXPIRED: i64 = 10;
+const RECENT_HISTORY_UNAVAILABLE: i64 = 11;
+
+/// Error 10: the client starts again with `utxo_sync`.
 fn snapshot_expired() -> anyhow::Error {
     CodedError {
-        code: 10,
+        code: SNAPSHOT_EXPIRED,
         message: "snapshot expired".into(),
     }
     .into()
+}
+
+/// Error 11: the client uses `get_history`.
+fn recent_history_unavailable() -> anyhow::Error {
+    CodedError {
+        code: RECENT_HISTORY_UNAVAILABLE,
+        message: "no recent history: the address is paid in fewer than 10,000 blocks, use \
+                  blockchain.scripthash.get_history"
+            .into(),
+    }
+    .into()
+}
+
+/// `offset` and `limit` of `get_recent_history`.
+fn recent_history_range(args: &Args) -> Result<(usize, usize)> {
+    let arg = |i: usize, default: usize| -> Result<usize> {
+        match args.get(i) {
+            None | Some(Value::Null) => Ok(default),
+            Some(value) => Ok(usize::try_from(non_negative_integer(value)?).unwrap_or(usize::MAX)),
+        }
+    };
+    let offset = arg(1, 0)?;
+    let limit = arg(2, recent::DEFAULT_PAGE)?;
+    if limit > recent::MAX_PAGE {
+        bail!("limit {} is over {}", limit, recent::MAX_PAGE);
+    }
+    Ok((offset, limit))
 }
 
 /// What `Rpc::snapshot_of` found.
@@ -1088,6 +1119,18 @@ impl Rpc {
         method: &str,
         f: impl FnOnce(&mut UtxoSnapshot) -> T,
     ) -> Result<SnapshotOf<T>> {
+        self.snapshot_with(scripthash, wait, false, method, f)
+    }
+
+    /// `snapshot_of`, with its recent history when `recent_history`.
+    fn snapshot_with<T>(
+        &self,
+        scripthash: ScriptHash,
+        wait: bool,
+        recent_history: bool,
+        method: &str,
+        f: impl FnOnce(&mut UtxoSnapshot) -> T,
+    ) -> Result<SnapshotOf<T>> {
         let index = self.tracker.index();
         if !self.utxo_snapshots.contains(&scripthash) && !has_long_history(index, scripthash) {
             return Ok(SnapshotOf::Short);
@@ -1101,25 +1144,40 @@ impl Rpc {
                 None => return Ok(SnapshotOf::Busy),
             }
         };
-        if !self.refresh_snapshot(&slot, &mut guard, scripthash, method)? {
+        if !self.refresh_snapshot(&slot, &mut guard, scripthash, recent_history, method)? {
             return Ok(SnapshotOf::Short);
         }
         Ok(SnapshotOf::Done(f(guard.as_mut().expect("refreshed"))))
     }
 
-    /// Brings the snapshot of `slot` up to date, building it if needed.
-    /// `false` for a short history.
+    /// Brings the snapshot of `slot` up to date, building it if needed (or
+    /// its recent history, if `recent_history` and it has none). `false` for
+    /// a short history.
     fn refresh_snapshot(
         &self,
         slot: &SnapshotSlot,
         snapshot: &mut Option<UtxoSnapshot>,
         scripthash: ScriptHash,
+        recent_history: bool,
         method: &str,
     ) -> Result<bool> {
         let index = self.tracker.index();
         if let Some(current) = snapshot.as_mut() {
-            if current.update(index, &self.daemon)? {
-                if current.save_due() {
+            // read from the DB in an older format: its blocks are read again,
+            // at the tip it is updated to, and its journal is kept
+            let rebuild_recent = recent_history && !current.has_recent_history();
+            let _permit = rebuild_recent.then(|| self.heavy_queries.acquire());
+            let chain = index.chain();
+            if current.update(&chain, &self.daemon)? {
+                if rebuild_recent {
+                    info!(
+                        "{}: reading the history of {} again for its recent transactions",
+                        method, scripthash
+                    );
+                    let built = UtxoSnapshot::build(scripthash, index, &chain, &self.daemon)?;
+                    current.take_recent_history(built);
+                    self.save_utxo_snapshot(current);
+                } else if current.save_due() {
                     self.save_utxo_snapshot(current);
                 }
                 self.utxo_snapshots.update(slot, snapshot);
@@ -1137,7 +1195,7 @@ impl Rpc {
         );
         let mut built = {
             let _permit = self.heavy_queries.acquire();
-            UtxoSnapshot::build(scripthash, index, &self.daemon)?
+            UtxoSnapshot::build(scripthash, index, &index.chain(), &self.daemon)?
         };
         self.save_utxo_snapshot(&mut built);
         *snapshot = Some(built);
@@ -1317,6 +1375,24 @@ impl Rpc {
         let status = subscription.last;
         client.utxo_subscriptions.insert(scripthash, subscription);
         Ok(json!(status.to_hex()))
+    }
+
+    /// `blockchain.scripthash.get_recent_history`: the latest transactions of
+    /// an address with a UTXO snapshot, with what they change in its balance.
+    fn scripthash_get_recent_history(&self, args: &Args) -> Result<Value> {
+        let scripthash = parse_scripthash(args.req(0))?;
+        let (offset, limit) = recent_history_range(args)?;
+        let method = "blockchain.scripthash.get_recent_history";
+        let found = self.snapshot_with(scripthash, true, true, method, |snapshot| {
+            snapshot.recent_history(&self.tracker.mempool(), offset, limit)
+        })?;
+        match found {
+            SnapshotOf::Done(Some(page)) => Ok(json!(page)),
+            // a snapshot without it is built again above: not likely
+            SnapshotOf::Done(None) | SnapshotOf::Short | SnapshotOf::Busy => {
+                Err(recent_history_unavailable())
+            }
+        }
     }
 
     fn scripthash_utxo_unsubscribe(&self, client: &mut Client, args: &Args) -> Result<Value> {
@@ -1757,8 +1833,9 @@ impl Rpc {
             "genesis_hash": self.tracker.chain().get_block_hash(0),
             "hash_function": "sha256",
             "services": services,
-            // electrs-neurai extension (doc/utxo-chunks.md)
+            // electrs-neurai extensions (doc/utxo-chunks.md)
             "utxo_chunks": utxo::PROTOCOL_VERSION,
+            "recent_history": recent::PROTOCOL_VERSION,
         }))
     }
 
@@ -1859,6 +1936,7 @@ impl Rpc {
                 Method::ScriptHashUtxoChunk => self.scripthash_utxo_chunk(args),
                 Method::ScriptHashUtxoSubscribe => self.scripthash_utxo_subscribe(client, args),
                 Method::ScriptHashUtxoUnsubscribe => self.scripthash_utxo_unsubscribe(client, args),
+                Method::ScriptHashGetRecentHistory => self.scripthash_get_recent_history(args),
                 Method::TransactionBroadcast => self.transaction_broadcast(args),
                 Method::TransactionGet => self.transaction_get(args),
                 Method::TransactionGetMerkle => self.transaction_get_merkle(args),
@@ -1906,6 +1984,7 @@ pub(crate) enum Method {
     ScriptHashUtxoChunk,
     ScriptHashUtxoSubscribe,
     ScriptHashUtxoUnsubscribe,
+    ScriptHashGetRecentHistory,
     Asset(crate::electrum_assets::AssetMethod),
 }
 
@@ -1975,6 +2054,11 @@ impl Method {
             "blockchain.scripthash.utxo_unsubscribe" => {
                 (Method::ScriptHashUtxoUnsubscribe, &["scripthash"], 1)
             }
+            "blockchain.scripthash.get_recent_history" => (
+                Method::ScriptHashGetRecentHistory,
+                &["scripthash", "offset", "limit"],
+                1,
+            ),
             other => {
                 let (method, names, required) = AssetMethod::lookup(other)?;
                 (Method::Asset(method), names, required)
@@ -2327,5 +2411,35 @@ mod tests {
         // electrs-neurai extensions are kept
         assert!(Method::lookup("blockchain.address.get_scripthash").is_some());
         assert!(Method::lookup("blockchain.asset.get_history").is_some());
+        assert!(Method::lookup("blockchain.scripthash.get_recent_history").is_some());
+    }
+
+    #[test]
+    fn recent_history_range_validation() {
+        let names = &["scripthash", "offset", "limit"];
+        let range = |params: Value| {
+            let args = Args::parse(params, names, 1).ok().unwrap();
+            recent_history_range(&args).map_err(|e| e.to_string())
+        };
+        assert_eq!(range(json!(["aa"])), Ok((0, 50)));
+        assert_eq!(range(json!(["aa", null, null])), Ok((0, 50)));
+        assert_eq!(range(json!(["aa", 950, 500])), Ok((950, 500)));
+        assert_eq!(range(json!({"scripthash": "aa", "limit": 0})), Ok((0, 0)));
+        assert_eq!(
+            range(json!(["aa", 0, 501])),
+            Err("limit 501 is over 500".into())
+        );
+        assert_eq!(
+            range(json!(["aa", -1])),
+            Err("-1 should be a non-negative integer".into())
+        );
+        assert_eq!(
+            range(json!(["aa", 0, "x"])),
+            Err("x should be a non-negative integer".into())
+        );
+        // the error codes of doc/utxo-chunks.md
+        let code = |e: anyhow::Error| e.downcast_ref::<CodedError>().unwrap().code;
+        assert_eq!(code(recent_history_unavailable()), 11);
+        assert_eq!(code(snapshot_expired()), 10);
     }
 }
