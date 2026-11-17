@@ -202,6 +202,15 @@ Unlike `blockchain.scripthash.subscribe`, it works for addresses of any size.
 * On error 10, call `utxo_sync` again with the `block_hash` of the set.
 * A check that fails means a broken reply: start again with `utxo_sync(sh, null)`
   or ask another server.
+* UTXOs don't say whether they are coinbase outputs, which can only be spent
+  after 100 blocks. Among the UTXOs of the last 100 blocks, those whose
+  `tx_hash` is `blockchain.transaction.id_from_pos(height, 0)` are.
+* A wallet that follows its addresses by their history can follow by their
+  UTXOs only those whose `blockchain.scripthash.subscribe` answers "history too
+  large": electrum-neurai does so when the server advertises `utxo_chunks`.
+  Their transactions are not known, so they have no history in the wallet;
+  spending a UTXO only needs its address, value and asset (asset scripts are
+  rebuilt from them), and its transaction can be fetched when needed.
 
 ## Errors
 

@@ -719,15 +719,18 @@ impl Rpc {
         // where it is epoch-based (testnet, regtest).
         let daemon = Daemon::connect(config, signal.exit_flag(), &metrics)?;
 
-        let genesis_hash = {
+        let (genesis_hash, genesis_header) = {
             use crate::neurai::NetworkParams;
             let params = NetworkParams::for_network(config.network);
             MAX_ASSET_NAME_LEN.store(params.max_asset_name_len(), Ordering::Relaxed);
             if params.genesis_hash_le == [0u8; 32] {
                 // Dynamic genesis (testnet / regtest): fetch from daemon.
-                daemon.get_genesis_hash()?
+                daemon.get_genesis(params)?
             } else {
-                BlockHash::from_raw_hash(sha256d::Hash::from_byte_array(params.genesis_hash_le))
+                (
+                    BlockHash::from_raw_hash(sha256d::Hash::from_byte_array(params.genesis_hash_le)),
+                    crate::chain::Chain::params_genesis_header(params),
+                )
             }
         };
 
@@ -737,7 +740,7 @@ impl Rpc {
         )
         .context("invalid report_services")?;
 
-        let tracker = Tracker::new(config, metrics, genesis_hash)?;
+        let tracker = Tracker::new(config, metrics, genesis_hash, genesis_header)?;
         let cache = Cache::new(tracker.metrics());
         let utxo_snapshots = load_utxo_snapshots(&tracker);
         Ok(Self {

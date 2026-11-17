@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 
 use bitcoin::hashes::hex::FromHex;
 use bitcoin::{Amount, BlockHash, Transaction, Txid};
@@ -467,12 +467,34 @@ impl Daemon {
         self.p2p.lock().new_block_notification()
     }
 
-    /// Fetch the genesis block hash (height 0) from the daemon RPC.
-    /// Used for testnet/regtest where the genesis is epoch-based.
-    pub(crate) fn get_genesis_hash(&self) -> Result<BlockHash> {
-        self.rpc
+    /// Fetch the genesis block (height 0) hash and header from the daemon RPC.
+    /// Used for testnet/regtest, whose genesis is mined when the daemon starts:
+    /// the header served to clients must be the daemon's, not one built from
+    /// `NetworkParams`.
+    pub(crate) fn get_genesis(
+        &self,
+        params: &NetworkParams,
+    ) -> Result<(BlockHash, neurai::NeuraiBlockHeader)> {
+        let hash = self
+            .rpc
             .get_block_hash(0)
-            .context("failed to get genesis block hash")
+            .context("failed to get genesis block hash")?;
+        let hex: String = self
+            .rpc
+            .call("getblockheader", &[json!(hash), json!(false)])
+            .context("failed to get genesis block header")?;
+        let bytes = Vec::<u8>::from_hex(&hex).context("genesis header is not hex")?;
+        let header = neurai::block::decode_header(&mut &bytes[..], params)
+            .context("failed to decode genesis header")?;
+        if let Some(computed) = header.block_hash(params) {
+            ensure!(
+                computed == hash,
+                "genesis header hashes to {}, the daemon says {}",
+                computed,
+                hash
+            );
+        }
+        Ok((hash, header))
     }
 }
 

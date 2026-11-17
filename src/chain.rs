@@ -53,10 +53,10 @@ fn shard(hash: &BlockHash) -> usize {
 }
 
 impl Chain {
-    /// Build a chain with a specific genesis hash (used for testnet/regtest where the
-    /// genesis is epoch-based and fetched from the daemon RPC at startup).
-    pub fn new_with_genesis(params: &'static NetworkParams, genesis_hash: BlockHash) -> Self {
-        let genesis_header = NeuraiBlockHeader::pre_kawpow(
+    /// The genesis header described by `params` (exact on mainnet; the
+    /// networks whose genesis is mined at daemon start take it from the daemon).
+    pub fn params_genesis_header(params: &NetworkParams) -> NeuraiBlockHeader {
+        NeuraiBlockHeader::pre_kawpow(
             params.genesis_version,
             BlockHash::from_raw_hash(sha256d::Hash::all_zeros()),
             TxMerkleNode::from_raw_hash(sha256d::Hash::from_byte_array(
@@ -65,7 +65,16 @@ impl Chain {
             params.genesis_time,
             params.genesis_bits,
             params.genesis_nonce,
-        );
+        )
+    }
+
+    /// Build a chain from a given genesis block (testnet/regtest, where the
+    /// genesis is fetched from the daemon RPC at startup).
+    pub fn new_with_genesis(
+        params: &'static NetworkParams,
+        genesis_hash: BlockHash,
+        genesis_header: NeuraiBlockHeader,
+    ) -> Self {
         let mut chain = Self {
             chunks: Vec::new(),
             len: 0,
@@ -80,7 +89,7 @@ impl Chain {
     pub fn new(params: &'static NetworkParams) -> Self {
         let genesis_hash =
             BlockHash::from_raw_hash(sha256d::Hash::from_byte_array(params.genesis_hash_le));
-        Self::new_with_genesis(params, genesis_hash)
+        Self::new_with_genesis(params, genesis_hash, Self::params_genesis_header(params))
     }
 
     pub(crate) fn params(&self) -> &'static NetworkParams {

@@ -213,13 +213,13 @@ static TESTNET: LazyLock<NetworkParams> = LazyLock::new(|| NetworkParams {
     depin_assets_activation_height: Some(0),
     daemon_dir_subdir: Some("testnet"),
     db_subdir: "testnet",
-    // Testnet genesis is epoch-dependent and auto-mined at daemon start; hash is obtained
-    // via RPC (`getblockhash 0`) on first run, so we leave it as zeros here and fill it in
-    // at runtime.
+    // The genesis hash and header are taken from the daemon at startup
+    // (`Daemon::get_genesis`), so a testnet reset needs no new build. These
+    // fields describe the current testnet genesis (DePIN-Test, 2026-11-05).
     genesis_hash_le: [0u8; 32],
-    genesis_time: 1774828800,
+    genesis_time: 1793836800,
     genesis_bits: 0x1e00ffff,
-    genesis_nonce: 0,
+    genesis_nonce: 2915850,
     genesis_version: 2,
     genesis_merkle_root_le: hex_be_to_le(&MERKLE_ROOT_BE),
     header_anchors: &[],

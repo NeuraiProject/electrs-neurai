@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use bitcoin::{BlockHash, Txid};
 
-use crate::neurai::{tx, NetworkParams};
+use crate::neurai::{tx, NeuraiBlockHeader, NetworkParams};
 use bitcoin::Amount;
 
 use crate::{
@@ -79,7 +79,12 @@ pub(crate) enum Error {
 }
 
 impl Tracker {
-    pub fn new(config: &Config, metrics: Metrics, genesis_hash: BlockHash) -> Result<Self> {
+    pub fn new(
+        config: &Config,
+        metrics: Metrics,
+        genesis_hash: BlockHash,
+        genesis_header: NeuraiBlockHeader,
+    ) -> Result<Self> {
         let store = DBStore::open(
             &config.db_path,
             config.db_log_dir.as_deref(),
@@ -87,7 +92,7 @@ impl Tracker {
             config.db_parallelism,
         )?;
         let params = NetworkParams::for_network(config.network);
-        let chain = Chain::new_with_genesis(params, genesis_hash);
+        let chain = Chain::new_with_genesis(params, genesis_hash, genesis_header);
         Ok(Self {
             index: Index::load(
                 store,
